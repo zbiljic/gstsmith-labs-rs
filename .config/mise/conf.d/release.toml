@@ -1,0 +1,8 @@
+[tasks.build]
+description = "Build the project"
+alias = "b"
+depends = ["rust:build"]
+
+[tasks."package:check"]
+description = "Validate installable plugin packages"
+depends = ["rust:package:check"]
