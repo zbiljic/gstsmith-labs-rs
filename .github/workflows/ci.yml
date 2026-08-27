@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - renovate/**
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    if: >-
+      ${{ github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name != github.repository ||
+          !startsWith(github.head_ref, 'renovate/') }}
+    name: Run Checks
+    runs-on: ${{ vars.RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install GStreamer 1.24
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-tools \
+            libbz2-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
+          pkg-config --atleast-version=1.24 gstreamer-1.0
+          pkg-config --max-version=1.25.99 gstreamer-1.0
+          pkg-config --modversion gstreamer-1.0
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check dependency policy
+        run: mise run deps:check
+
+      - name: Check dependency ordering
+        run: mise run sort:crates:check
+
+      - name: Check formatting
+        run: mise run fmt:check
+
+      - name: Run clippy
+        run: mise run lint
+
+      - name: Check build
+        run: mise run check
+
+      - name: Run tests
+        run: mise run test
+
+      - name: Run NALSense all-feature gate
+        run: |
+          cargo test --locked --package gst-plugin-nalsense --all-targets --all-features
+          cargo clippy --locked --package gst-plugin-nalsense --all-targets --all-features -- -D warnings
+
+      - name: Build plugin
+        run: mise run build
+
+      - name: Validate cargo-c package
+        run: mise run package:check
+
+      - name: Inspect plugin and elements
+        env:
+          GST_PLUGIN_PATH: ${{ github.workspace }}/target/debug
+        run: |
+          gst-inspect-1.0 nalsense
+          gst-inspect-1.0 nalsenseactivity
+          gst-inspect-1.0 nalsensereplay
