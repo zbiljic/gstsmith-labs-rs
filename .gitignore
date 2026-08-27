@@ -13,3 +13,6 @@ target
 
 # Rust compiler crash reports
 rustc-ice-*.txt
+
+# Local caches
+.cache/
