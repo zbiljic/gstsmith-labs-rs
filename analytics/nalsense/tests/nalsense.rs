@@ -28,7 +28,7 @@ fn registers_nalsense_activity() {
 }
 
 #[test]
-fn exposes_only_au_aligned_annex_b_h264() {
+fn exposes_only_au_aligned_annex_b_h264_and_h265() {
     init();
     let element = gst::ElementFactory::make("nalsenseactivity")
         .build()
@@ -38,14 +38,19 @@ fn exposes_only_au_aligned_annex_b_h264() {
             .static_pad(pad_name)
             .expect("NALSense pad")
             .pad_template_caps();
-        let expected =
-            gst::Caps::from_str("video/x-h264,parsed=true,stream-format=byte-stream,alignment=au")
-                .expect("valid expected caps");
-        assert!(caps.can_intersect(&expected));
+        for supported in [
+            "video/x-h264,parsed=true,stream-format=byte-stream,alignment=au",
+            "video/x-h265,parsed=true,stream-format=byte-stream,alignment=au",
+        ] {
+            let supported = gst::Caps::from_str(supported).expect("valid supported caps");
+            assert!(caps.can_intersect(&supported));
+        }
         for unsupported in [
             "video/x-h264,parsed=true,stream-format=byte-stream,alignment=nal",
             "video/x-h264,parsed=true,stream-format=avc,alignment=au",
-            "video/x-h265,parsed=true,stream-format=byte-stream,alignment=au",
+            "video/x-h265,parsed=true,stream-format=byte-stream,alignment=nal",
+            "video/x-h265,parsed=true,stream-format=hvc1,alignment=au",
+            "video/x-h265,parsed=true,stream-format=hev1,alignment=au",
         ] {
             let unsupported = gst::Caps::from_str(unsupported).expect("valid unsupported caps");
             assert!(!caps.can_intersect(&unsupported));
@@ -74,9 +79,11 @@ fn exposes_documented_replay_contract() {
     let element = gst::ElementFactory::make("nalsensereplay")
         .build()
         .expect("constructing NALSense replay");
-    let expected =
-        gst::Caps::from_str("video/x-h264,parsed=true,stream-format=byte-stream,alignment=au")
-            .expect("valid expected caps");
+    let expected = gst::Caps::from_str(
+        "video/x-h264,parsed=true,stream-format=byte-stream,alignment=au;\
+         video/x-h265,parsed=true,stream-format=byte-stream,alignment=au",
+    )
+    .expect("valid expected caps");
     for pad_name in ["sink", "src"] {
         let caps = element
             .static_pad(pad_name)
@@ -135,6 +142,52 @@ fn passes_annex_b_access_units_and_metadata_unchanged() {
         output
             .map_readable()
             .expect("mapping pass-through buffer")
+            .as_slice(),
+        bytes
+    );
+    assert_eq!(output.pts(), Some(gst::ClockTime::from_seconds(5)));
+    assert_eq!(output.dts(), Some(gst::ClockTime::from_seconds(4)));
+    assert_eq!(output.duration(), Some(gst::ClockTime::from_mseconds(40)));
+    assert_eq!(output.offset(), 11);
+    assert_eq!(output.offset_end(), 19);
+    assert!(
+        output
+            .flags()
+            .contains(gst::BufferFlags::DISCONT | gst::BufferFlags::MARKER)
+    );
+    assert!(output.meta::<gst::ReferenceTimestampMeta>().is_some());
+}
+
+#[test]
+fn passes_h265_access_units_and_metadata_unchanged() {
+    init();
+    let element = gst::ElementFactory::make("nalsenseactivity")
+        .build()
+        .expect("constructing NALSense");
+    let mut harness = gst_check::Harness::with_element(&element, Some("sink"), Some("src"));
+    harness.set_src_caps_str("video/x-h265,parsed=true,stream-format=byte-stream,alignment=au");
+    harness.play();
+
+    let bytes = h265_annex_b_au(32, 20);
+    let mut input = gst::Buffer::from_slice(bytes.clone());
+    {
+        let input = input.get_mut().expect("writable input buffer");
+        input.set_pts(gst::ClockTime::from_seconds(5));
+        input.set_dts(gst::ClockTime::from_seconds(4));
+        input.set_duration(gst::ClockTime::from_mseconds(40));
+        input.set_offset(11);
+        input.set_offset_end(19);
+        input.set_flags(gst::BufferFlags::DISCONT | gst::BufferFlags::MARKER);
+        let reference = gst::Caps::builder("timestamp/x-test").build();
+        gst::ReferenceTimestampMeta::add(input, &reference, gst::ClockTime::from_seconds(42), None);
+    }
+
+    assert_eq!(harness.push(input), Ok(gst::FlowSuccess::Ok));
+    let output = harness.pull().expect("pulling H.265 pass-through buffer");
+    assert_eq!(
+        output
+            .map_readable()
+            .expect("mapping H.265 pass-through buffer")
             .as_slice(),
         bytes
     );
@@ -248,6 +301,62 @@ fn emits_configured_activity_transitions() {
 }
 
 #[test]
+fn emits_configured_h265_activity_transitions() {
+    init();
+    let element = gst::ElementFactory::make("nalsenseactivity")
+        .property("stream-id", "camera-hevc")
+        .property("activity-threshold", 1.0_f64)
+        .property("baseline-alpha", 0.1_f64)
+        .property("activity-min-frames", 2_u32)
+        .property("activity-clear-frames", 2_u32)
+        .property("warmup-frames", 1_u32)
+        .build()
+        .expect("constructing configured H.265 NALSense");
+    let bus = gst::Bus::new();
+    element.set_bus(Some(&bus));
+    let mut harness = gst_check::Harness::with_element(&element, Some("sink"), Some("src"));
+    harness.set_src_caps_str("video/x-h265,parsed=true,stream-format=byte-stream,alignment=au");
+    harness.play();
+
+    for (frame_number, size) in [
+        (0_u64, 100_u32),
+        (1, 100),
+        (2, 200),
+        (3, 200),
+        (4, 119),
+        (5, 119),
+    ] {
+        let mut input = gst::Buffer::from_mut_slice(h265_annex_b_au(size, 1));
+        let input = input.get_mut().expect("writable H.265 sample buffer");
+        input.set_pts(gst::ClockTime::from_useconds(
+            frame_number.saturating_mul(40_000),
+        ));
+        input.set_flags(gst::BufferFlags::DELTA_UNIT);
+        assert_eq!(harness.push(input.to_owned()), Ok(gst::FlowSuccess::Ok));
+        let _output = harness.pull().expect("pulling analyzed H.265 buffer");
+    }
+
+    for (expected_frame, expected_type) in [(3_u64, "activity-start"), (5, "activity-stop")] {
+        let message = bus
+            .timed_pop_filtered(gst::ClockTime::SECOND, &[gst::MessageType::Element])
+            .expect("receiving H.265 NALSense event");
+        let gst::MessageView::Element(element_message) = message.view() else {
+            panic!("expected H.265 activity element message");
+        };
+        let structure = element_message
+            .structure()
+            .expect("H.265 NALSense element message structure");
+        assert_eq!(
+            structure.get::<String>("type").as_deref(),
+            Ok(expected_type)
+        );
+        assert_eq!(structure.get::<u64>("frame-number"), Ok(expected_frame));
+        assert_eq!(structure.get::<String>("picture-type").as_deref(), Ok("P"));
+        assert_eq!(structure.get::<bool>("reference-picture"), Ok(true));
+    }
+}
+
+#[test]
 fn replay_buffers_from_idr_and_wakes_on_serialized_activity_event() {
     init();
     let element = gst::ElementFactory::make("nalsensereplay")
@@ -307,6 +416,41 @@ fn replay_buffers_from_idr_and_wakes_on_serialized_activity_event() {
         Ok("activity-event")
     );
     assert_eq!(structure.get::<u64>("replayed-frames"), Ok(2));
+}
+
+#[test]
+fn replay_buffers_h265_from_idr_and_ignores_cra_as_a_safe_boundary() {
+    init();
+    let element = gst::ElementFactory::make("nalsensereplay")
+        .build()
+        .expect("constructing H.265 NALSense replay");
+    let mut harness = gst_check::Harness::with_element(&element, Some("sink"), Some("src"));
+    harness.set_src_caps_str("video/x-h265,parsed=true,stream-format=byte-stream,alignment=au");
+    harness.play();
+
+    assert_eq!(
+        harness.push(h265_replay_buffer(10, 21)),
+        Ok(gst::FlowSuccess::Ok)
+    );
+    assert_eq!(element.property::<u64>("buffered-frames"), 0);
+    assert_eq!(
+        harness.push(h265_replay_buffer(11, 20)),
+        Ok(gst::FlowSuccess::Ok)
+    );
+    assert_eq!(
+        harness.push(h265_replay_buffer(12, 1)),
+        Ok(gst::FlowSuccess::Ok)
+    );
+    assert_eq!(element.property::<u64>("buffered-frames"), 2);
+
+    assert!(harness.push_event(activity_event("activity-start", 13)));
+    assert_eq!(harness.buffers_in_queue(), 2);
+    let idr = harness.pull().expect("replayed H.265 IDR");
+    let delta = harness.pull().expect("replayed H.265 dependent frame");
+    assert_eq!(idr.pts(), Some(gst::ClockTime::from_mseconds(440)));
+    assert_eq!(delta.pts(), Some(gst::ClockTime::from_mseconds(480)));
+    assert!(idr.flags().contains(gst::BufferFlags::DISCONT));
+    assert!(delta.flags().contains(gst::BufferFlags::DELTA_UNIT));
 }
 
 #[test]
@@ -740,16 +884,20 @@ fn replay_completes_a_pending_sleep_at_a_discontinuity() {
 #[test]
 fn rejects_non_annex_b_input_cleanly() {
     init();
-    let element = gst::ElementFactory::make("nalsenseactivity")
-        .build()
-        .expect("constructing NALSense");
-    let mut harness = gst_check::Harness::with_element(&element, Some("sink"), Some("src"));
-    harness.set_src_caps_str("video/x-h264,parsed=true,stream-format=byte-stream,alignment=au");
-    harness.play();
-    assert_eq!(
-        harness.push(gst::Buffer::from_slice([1_u8, 2, 3])),
-        Err(gst::FlowError::Error)
-    );
+    for media_type in ["video/x-h264", "video/x-h265"] {
+        let element = gst::ElementFactory::make("nalsenseactivity")
+            .build()
+            .expect("constructing NALSense");
+        let mut harness = gst_check::Harness::with_element(&element, Some("sink"), Some("src"));
+        harness.set_src_caps_str(&format!(
+            "{media_type},parsed=true,stream-format=byte-stream,alignment=au"
+        ));
+        harness.play();
+        assert_eq!(
+            harness.push(gst::Buffer::from_slice([1_u8, 2, 3])),
+            Err(gst::FlowError::Error)
+        );
+    }
 }
 
 #[expect(
@@ -775,8 +923,59 @@ fn annex_b_au(encoded_vcl_bytes: u32, keyframe: bool) -> Vec<u8> {
     bytes
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "the generated H.265 fixture has checked, bounded dimensions"
+)]
+fn h265_annex_b_au(encoded_vcl_bytes: u32, nal_type: u8) -> Vec<u8> {
+    let payload_size = usize::try_from(encoded_vcl_bytes).expect("fixture size fits usize");
+    assert!(
+        payload_size > 2,
+        "an H.265 VCL NAL requires a two-byte header and slice payload"
+    );
+    let mut bytes = Vec::with_capacity(
+        payload_size
+            .checked_add(11)
+            .expect("H.265 fixture allocation size"),
+    );
+    // PPS id 0, SPS id 0, no dependent segments/output flag/extra header bits.
+    bytes.extend_from_slice(&[0, 0, 0, 1, 0x44, 0x01, 0xc0]);
+    bytes.extend_from_slice(&[0, 0, 0, 1, nal_type << 1, 0x01]);
+    // first_slice_segment_in_pic_flag, optional IRAP flag, PPS id, slice_type.
+    bytes.push(if (16..=21).contains(&nal_type) {
+        0xac
+    } else {
+        0xd0
+    });
+    bytes.resize(
+        bytes
+            .len()
+            .checked_add(payload_size.saturating_sub(3))
+            .expect("H.265 fixture final size"),
+        0x55,
+    );
+    bytes
+}
+
 fn replay_buffer(frame: u64, is_idr: bool) -> gst::Buffer {
     replay_sized_buffer(frame, 32, is_idr)
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "a newly allocated H.265 test buffer has one writable owner"
+)]
+fn h265_replay_buffer(frame: u64, nal_type: u8) -> gst::Buffer {
+    let mut buffer = gst::Buffer::from_mut_slice(h265_annex_b_au(32, nal_type));
+    let buffer_ref = buffer
+        .get_mut()
+        .expect("unique H.265 replay fixture buffer");
+    buffer_ref.set_pts(gst::ClockTime::from_mseconds(frame.saturating_mul(40)));
+    buffer_ref.set_duration(gst::ClockTime::from_mseconds(40));
+    if !(16..=21).contains(&nal_type) {
+        buffer_ref.set_flags(gst::BufferFlags::DELTA_UNIT);
+    }
+    buffer
 }
 
 #[expect(

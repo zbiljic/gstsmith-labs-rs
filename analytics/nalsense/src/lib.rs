@@ -4,7 +4,9 @@ use gst::glib;
 
 mod activity;
 mod analyzer;
+mod codec;
 mod h264;
+mod h265;
 mod replay;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {

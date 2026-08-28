@@ -6,7 +6,7 @@ use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
 
 use crate::analyzer::{Analyzer, Config, Observation};
-use crate::h264;
+use crate::codec::{self, AccessUnitScanner, Codec};
 
 use super::event;
 
@@ -14,7 +14,7 @@ static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     gst::DebugCategory::new(
         "nalsenseactivity",
         gst::DebugColorFlags::empty(),
-        Some("Portable H.264 encoded-video activity analysis"),
+        Some("Portable H.264/H.265 encoded-video activity analysis"),
     )
 });
 
@@ -60,7 +60,7 @@ impl Settings {
 #[derive(Debug)]
 struct Runtime {
     analyzer: Analyzer,
-    access_unit_scanner: h264::AccessUnitScanner,
+    access_unit_scanner: AccessUnitScanner,
     stream_id: String,
     next_frame_number: u64,
 }
@@ -68,11 +68,12 @@ struct Runtime {
 impl Runtime {
     fn new(
         settings: &Settings,
+        codec: Codec,
         qp_diagnostics: bool,
     ) -> Result<Self, crate::analyzer::ConfigError> {
         Ok(Self {
             analyzer: Analyzer::new(settings.config())?,
-            access_unit_scanner: h264::AccessUnitScanner::new(qp_diagnostics),
+            access_unit_scanner: AccessUnitScanner::new(codec, qp_diagnostics),
             stream_id: settings.stream_id.clone(),
             next_frame_number: 0,
         })
@@ -80,6 +81,7 @@ impl Runtime {
 
     fn reset(&mut self) {
         self.analyzer.reset();
+        self.access_unit_scanner.reset();
         self.next_frame_number = 0;
     }
 }
@@ -261,9 +263,9 @@ impl ElementImpl for NalSenseActivity {
     fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
         static METADATA: LazyLock<gst::subclass::ElementMetadata> = LazyLock::new(|| {
             gst::subclass::ElementMetadata::new(
-                "NALSense H.264 Activity Analyzer",
+                "NALSense H.264/H.265 Activity Analyzer",
                 "Filter/Analysis/Video",
-                "Reports encoded-frame activity events while passing H.264 access units unchanged",
+                "Reports encoded-frame activity events while passing H.264/H.265 access units unchanged",
                 "Nemanja Zbiljic <nemanja.zbiljic@gmail.com>",
             )
         });
@@ -273,11 +275,7 @@ impl ElementImpl for NalSenseActivity {
     #[expect(clippy::expect_used, reason = "fixed static pad templates are valid")]
     fn pad_templates() -> &'static [gst::PadTemplate] {
         static TEMPLATES: LazyLock<Vec<gst::PadTemplate>> = LazyLock::new(|| {
-            let caps = gst::Caps::builder("video/x-h264")
-                .field("parsed", true)
-                .field("stream-format", "byte-stream")
-                .field("alignment", "au")
-                .build();
+            let caps = codec::parsed_au_caps();
             vec![
                 gst::PadTemplate::new(
                     "sink",
@@ -319,19 +317,15 @@ impl BaseTransformImpl for NalSenseActivity {
         let structure = incaps
             .structure(0)
             .ok_or_else(|| gst::loggable_error!(CAT, "missing input caps structure"))?;
-        if structure.name() != "video/x-h264" {
-            return Err(gst::loggable_error!(
-                CAT,
-                "unsupported media type {}",
-                structure.name()
-            ));
-        }
+        let codec = Codec::from_media_type(structure.name()).ok_or_else(|| {
+            gst::loggable_error!(CAT, "unsupported media type {}", structure.name())
+        })?;
         let settings = self
             .settings
             .lock()
             .map_err(|_poisoned| gst::loggable_error!(CAT, "NALSense settings lock is poisoned"))?
             .clone();
-        let runtime = Runtime::new(&settings, CAT.threshold() >= gst::DebugLevel::Trace)
+        let runtime = Runtime::new(&settings, codec, CAT.threshold() >= gst::DebugLevel::Trace)
             .map_err(|error| gst::loggable_error!(CAT, "invalid NALSense config: {error}"))?;
         *self
             .runtime
@@ -377,7 +371,7 @@ impl BaseTransformImpl for NalSenseActivity {
             gst::element_imp_error!(
                 self,
                 gst::ResourceError::Read,
-                ["Failed to map an H.264 access unit: {error}"]
+                ["Failed to map a compressed-video access unit: {error}"]
             );
             gst::FlowError::Error
         })?;
@@ -394,6 +388,7 @@ impl BaseTransformImpl for NalSenseActivity {
             if discontinuity {
                 runtime.reset();
             }
+            let codec = runtime.access_unit_scanner.codec();
             let access_unit = runtime
                 .access_unit_scanner
                 .scan(mapped.as_slice(), delta_unit)
@@ -401,7 +396,7 @@ impl BaseTransformImpl for NalSenseActivity {
                     gst::element_imp_error!(
                         self,
                         gst::StreamError::Format,
-                        ["Invalid H.264 access unit: {error}"]
+                        ["Invalid {} access unit: {error}", codec.name()]
                     );
                     gst::FlowError::Error
                 })?;
@@ -427,7 +422,8 @@ impl BaseTransformImpl for NalSenseActivity {
                 gst::trace!(
                     CAT,
                     imp = self,
-                    "nalsense-picture frame={frame_number} type={} reference={} idr={} bytes={} qp={luma_qp}",
+                    "nalsense-picture codec={} frame={frame_number} type={} reference={} idr={} bytes={} qp={luma_qp}",
+                    codec.name(),
                     access_unit.picture_type.name(),
                     access_unit.is_reference_picture,
                     access_unit.is_idr,
@@ -437,7 +433,8 @@ impl BaseTransformImpl for NalSenseActivity {
                 gst::trace!(
                     CAT,
                     imp = self,
-                    "nalsense-picture frame={frame_number} type={} reference={} idr={} bytes={} qp=na",
+                    "nalsense-picture codec={} frame={frame_number} type={} reference={} idr={} bytes={} qp=na",
+                    codec.name(),
                     access_unit.picture_type.name(),
                     access_unit.is_reference_picture,
                     access_unit.is_idr,

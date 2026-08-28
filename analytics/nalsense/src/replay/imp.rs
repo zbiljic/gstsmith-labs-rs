@@ -5,7 +5,7 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 
-use crate::h264::AccessUnitScanner;
+use crate::codec::{self, AccessUnitScanner, Codec};
 
 const DEFAULT_MAX_BUFFER_FRAMES: u32 = 300;
 const DEFAULT_MAX_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
@@ -14,7 +14,7 @@ static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     gst::DebugCategory::new(
         "nalsensereplay",
         gst::DebugColorFlags::empty(),
-        Some("Bounded H.264 IDR replay gate for NALSense wake events"),
+        Some("Bounded H.264/H.265 IDR replay gate for NALSense wake events"),
     )
 });
 
@@ -65,7 +65,7 @@ struct State {
     forced_wakes: u64,
     peak_buffered_frames: u64,
     peak_buffered_bytes: u64,
-    scanner: AccessUnitScanner,
+    scanner: Option<AccessUnitScanner>,
 }
 
 impl Default for State {
@@ -79,7 +79,7 @@ impl Default for State {
             forced_wakes: 0,
             peak_buffered_frames: 0,
             peak_buffered_bytes: 0,
-            scanner: AccessUnitScanner::new(false),
+            scanner: None,
         }
     }
 }
@@ -92,6 +92,7 @@ impl State {
             Mode::Dormant
         };
         self.clear_stream();
+        self.scanner = None;
         self.replayed_frames = 0;
         self.replayed_bytes = 0;
         self.forced_wakes = 0;
@@ -110,7 +111,19 @@ impl State {
     fn clear_stream(&mut self) {
         self.buffers.clear();
         self.buffered_bytes = 0;
-        self.scanner = AccessUnitScanner::new(false);
+        if let Some(scanner) = self.scanner.as_mut() {
+            scanner.reset();
+        }
+    }
+
+    fn set_codec(&mut self, codec: Codec) {
+        self.invalidate_stream();
+        self.scanner = Some(AccessUnitScanner::new(codec, false));
+    }
+
+    fn clear_codec(&mut self) {
+        self.invalidate_stream();
+        self.scanner = None;
     }
 
     fn is_active(&self) -> bool {
@@ -518,9 +531,9 @@ impl ElementImpl for NalSenseReplay {
     fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
         static METADATA: LazyLock<gst::subclass::ElementMetadata> = LazyLock::new(|| {
             gst::subclass::ElementMetadata::new(
-                "NALSense H.264 Replay Gate",
+                "NALSense H.264/H.265 Replay Gate",
                 "Filter/Analysis/Video",
-                "Buffers from an IDR and replays a decodable H.264 prefix on activity wake",
+                "Buffers from an IDR and replays a decodable H.264/H.265 prefix on activity wake",
                 "Nemanja Zbiljic <nemanja.zbiljic@gmail.com>",
             )
         });
@@ -530,11 +543,7 @@ impl ElementImpl for NalSenseReplay {
     #[expect(clippy::expect_used, reason = "fixed static pad templates are valid")]
     fn pad_templates() -> &'static [gst::PadTemplate] {
         static TEMPLATES: LazyLock<Vec<gst::PadTemplate>> = LazyLock::new(|| {
-            let caps = gst::Caps::builder("video/x-h264")
-                .field("parsed", true)
-                .field("stream-format", "byte-stream")
-                .field("alignment", "au")
-                .build();
+            let caps = codec::parsed_au_caps();
             vec![
                 gst::PadTemplate::new(
                     "sink",
@@ -584,11 +593,24 @@ impl NalSenseReplay {
         Ok(())
     }
 
-    fn invalidate_stream_state(&self) -> Result<(), gst::StateChangeError> {
+    fn invalidate_stream_state(&self, clear_codec: bool) -> Result<(), gst::StateChangeError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_poisoned| gst::StateChangeError)?;
+        if clear_codec {
+            state.clear_codec();
+        } else {
+            state.invalidate_stream();
+        }
+        Ok(())
+    }
+
+    fn set_codec(&self, codec: Codec) -> Result<(), gst::StateChangeError> {
         self.state
             .lock()
             .map_err(|_poisoned| gst::StateChangeError)?
-            .invalidate_stream();
+            .set_codec(codec);
         Ok(())
     }
 
@@ -633,7 +655,7 @@ impl NalSenseReplay {
                 gst::element_imp_error!(
                     self,
                     gst::ResourceError::Read,
-                    ["Failed to map a replay H.264 access unit: {error}"]
+                    ["Failed to map a replay compressed-video access unit: {error}"]
                 );
                 gst::FlowError::Error
             })?;
@@ -648,18 +670,21 @@ impl NalSenseReplay {
             if discontinuity {
                 state.invalidate_stream();
             }
-            let access_unit =
-                state
-                    .scanner
-                    .scan(mapped.as_slice(), delta_unit)
-                    .map_err(|error| {
-                        gst::element_imp_error!(
-                            self,
-                            gst::StreamError::Format,
-                            ["Invalid replay H.264 access unit: {error}"]
-                        );
-                        gst::FlowError::Error
-                    })?;
+            let scanner = state
+                .scanner
+                .as_mut()
+                .ok_or(gst::FlowError::NotNegotiated)?;
+            let codec = scanner.codec();
+            let access_unit = scanner
+                .scan(mapped.as_slice(), delta_unit)
+                .map_err(|error| {
+                    gst::element_imp_error!(
+                        self,
+                        gst::StreamError::Format,
+                        ["Invalid replay {} access unit: {error}", codec.name()]
+                    );
+                    gst::FlowError::Error
+                })?;
             drop(mapped);
             state.handle_buffer(
                 buffer,
@@ -676,18 +701,24 @@ impl NalSenseReplay {
     }
 
     fn sink_event(&self, _pad: &gst::Pad, event: gst::Event) -> bool {
-        if matches!(
-            event.view(),
-            gst::EventView::StreamStart(_)
-                | gst::EventView::Caps(_)
-                | gst::EventView::Segment(_)
-                | gst::EventView::FlushStop(_)
-        ) && self.invalidate_stream_state().is_err()
-        {
+        let stream_state_result = match event.view() {
+            gst::EventView::StreamStart(_) => self.invalidate_stream_state(true),
+            gst::EventView::Caps(caps_event) => caps_event
+                .caps()
+                .structure(0)
+                .and_then(|structure| Codec::from_media_type(structure.name()))
+                .ok_or(gst::StateChangeError)
+                .and_then(|codec| self.set_codec(codec)),
+            gst::EventView::Segment(_) | gst::EventView::FlushStop(_) => {
+                self.invalidate_stream_state(false)
+            }
+            _ => Ok(()),
+        };
+        if stream_state_result.is_err() {
             gst::error!(
                 CAT,
                 imp = self,
-                "failed to invalidate NALSense replay stream state"
+                "failed to configure NALSense replay stream state"
             );
             return false;
         }

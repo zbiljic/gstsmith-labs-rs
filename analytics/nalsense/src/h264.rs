@@ -13,16 +13,7 @@ use h264_reader::nal::sps::SeqParameterSet;
 use h264_reader::nal::{Nal, RefNal};
 
 use crate::analyzer::PictureType;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AccessUnit {
-    pub(crate) encoded_vcl_bytes: u32,
-    pub(crate) picture_type: PictureType,
-    pub(crate) is_reference_picture: bool,
-    pub(crate) luma_qp: Option<i32>,
-    pub(crate) is_keyframe: bool,
-    pub(crate) is_idr: bool,
-}
+use crate::codec::AccessUnit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScanError {
@@ -91,6 +82,11 @@ impl AccessUnitScanner {
             let _ = qp_diagnostics;
             Self {}
         }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        let qp_diagnostics = self.qp_diagnostics_enabled();
+        *self = Self::new(qp_diagnostics);
     }
 
     pub(crate) fn scan(
