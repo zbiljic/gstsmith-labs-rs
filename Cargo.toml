@@ -18,6 +18,7 @@ gst-base = { package = "gstreamer-base", version = "0.25.3", features = ["v1_24"
 gst-check = { package = "gstreamer-check", version = "0.25.0", features = ["v1_24"] }
 gst-plugin-version-helper = "0.8.4"
 h264-reader = "0.8.0"
+memchr = "2.8.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

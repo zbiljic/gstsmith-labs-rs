@@ -2,6 +2,7 @@ use std::error::Error as StdError;
 use std::fmt;
 
 use crate::analyzer::PictureType;
+use crate::annex_b::find_start_code;
 use crate::codec::AccessUnit;
 
 const MAX_PPS_ID: u32 = 63;
@@ -415,25 +416,6 @@ impl<'a> RbspBitReader<'a> {
             return Ok(byte);
         }
     }
-}
-
-fn find_start_code(input: &[u8], from: usize) -> Option<(usize, usize)> {
-    let mut offset = from;
-    while offset.checked_add(3)? <= input.len() {
-        if input.get(offset) == Some(&0) && input.get(offset + 1) == Some(&0) {
-            if input.get(offset + 2) == Some(&1) {
-                return Some((offset, 3));
-            }
-            if offset.checked_add(4)? <= input.len()
-                && input.get(offset + 2) == Some(&0)
-                && input.get(offset + 3) == Some(&1)
-            {
-                return Some((offset, 4));
-            }
-        }
-        offset = offset.checked_add(1)?;
-    }
-    None
 }
 
 #[cfg(test)]

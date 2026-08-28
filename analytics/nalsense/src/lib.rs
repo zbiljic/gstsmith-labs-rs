@@ -4,6 +4,7 @@ use gst::glib;
 
 mod activity;
 mod analyzer;
+mod annex_b;
 mod codec;
 mod h264;
 mod h265;

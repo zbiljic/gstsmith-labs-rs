@@ -395,6 +395,7 @@ dependencies = [
  "gstreamer-base",
  "gstreamer-check",
  "h264-reader",
+ "memchr",
 ]
 
 [[package]]

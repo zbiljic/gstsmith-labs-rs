@@ -27,6 +27,7 @@ requires_private = "gstreamer-1.0 >= 1.24, gstreamer-base-1.0 >= 1.24, gobject-2
 gst = { workspace = true }
 gst-base = { workspace = true }
 h264-reader = { workspace = true, optional = true }
+memchr = { workspace = true }
 
 [features]
 static = []
