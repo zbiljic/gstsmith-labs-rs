@@ -25,6 +25,13 @@ impl Codec {
             Self::H265 => "H.265",
         }
     }
+
+    pub(crate) fn is_idr_candidate(self, input: &[u8]) -> Result<bool, ScanError> {
+        match self {
+            Self::H264 => h264::is_idr_candidate(input).map_err(ScanError::H264),
+            Self::H265 => h265::is_idr_candidate(input).map_err(ScanError::H265),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

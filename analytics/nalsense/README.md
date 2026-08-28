@@ -33,7 +33,9 @@ video/x-h265,
 Place `h264parse` or `h265parse` before the plugin to assemble access units and
 convert the stream to Annex B framing. For bounded replay, use
 `config-interval=-1` so parameter sets accompany each IDR and are retained in
-the replay prefix.
+the replay prefix. `nalsensereplay` relies on parser-populated `DELTA_UNIT`
+flags to skip inspection of dependent access units; use the parser-produced
+buffers directly rather than synthesizing those flags upstream.
 
 ## Activity analysis
 
@@ -160,8 +162,8 @@ of a new dormant prefix. The element does not choose a sleep policy itself.
 
 If retaining another access unit would exceed either bound, replay wakes
 instead of keeping an undecodable partial prefix or allowing memory growth.
-Stream changes and discontinuities discard the retained prefix and reset codec
-scanner state. Active and pending-wake requests survive that invalidation; a
+Stream changes and discontinuities discard the retained prefix. Active and
+pending-wake requests survive that invalidation; a
 pending sleep becomes dormant because decoding continuity has already ended.
 Counters remain cumulative until a new PAUSED run begins.
 

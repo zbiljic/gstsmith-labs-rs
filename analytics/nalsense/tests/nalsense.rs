@@ -580,6 +580,131 @@ fn replay_sleep_waits_for_next_idr_boundary() {
 }
 
 #[test]
+fn active_replay_forwards_an_uninspected_h264_delta_buffer_with_metadata() {
+    init();
+    let element = gst::ElementFactory::make("nalsensereplay")
+        .property("start-active", true)
+        .build()
+        .expect("constructing active NALSense replay");
+    let mut harness = gst_check::Harness::with_element(&element, Some("sink"), Some("src"));
+    harness.set_src_caps_str("video/x-h264,parsed=true,stream-format=byte-stream,alignment=au");
+    harness.play();
+
+    // DELTA_UNIT is the parser-provided negative-candidate fast path, so this
+    // deliberately non-Annex-B payload must not be inspected by replay.
+    let bytes = vec![0xde, 0xad, 0xbe, 0xef];
+    let mut input = gst::Buffer::from_slice(bytes.clone());
+    {
+        let input = input.get_mut().expect("writable delta test buffer");
+        input.set_pts(gst::ClockTime::from_seconds(5));
+        input.set_dts(gst::ClockTime::from_seconds(4));
+        input.set_duration(gst::ClockTime::from_mseconds(40));
+        input.set_flags(gst::BufferFlags::DELTA_UNIT | gst::BufferFlags::MARKER);
+    }
+
+    assert_eq!(harness.push(input), Ok(gst::FlowSuccess::Ok));
+    let output = harness.pull().expect("forwarded active delta buffer");
+    assert_eq!(
+        output
+            .map_readable()
+            .expect("mapping forwarded delta buffer")
+            .as_slice(),
+        bytes
+    );
+    assert_eq!(output.pts(), Some(gst::ClockTime::from_seconds(5)));
+    assert_eq!(output.dts(), Some(gst::ClockTime::from_seconds(4)));
+    assert_eq!(output.duration(), Some(gst::ClockTime::from_mseconds(40)));
+    assert!(
+        output
+            .flags()
+            .contains(gst::BufferFlags::DELTA_UNIT | gst::BufferFlags::MARKER)
+    );
+}
+
+#[test]
+fn active_h265_replay_forwards_a_slice_only_delta_without_pps_state() {
+    init();
+    let element = gst::ElementFactory::make("nalsensereplay")
+        .property("start-active", true)
+        .build()
+        .expect("constructing active H.265 NALSense replay");
+    let mut harness = gst_check::Harness::with_element(&element, Some("sink"), Some("src"));
+    harness.set_src_caps_str("video/x-h265,parsed=true,stream-format=byte-stream,alignment=au");
+    harness.play();
+
+    // This valid H.265 delta slice has no preceding PPS in replay state. The
+    // active path must forward it without the activity parser's PPS lookup.
+    let bytes = vec![0, 0, 1, 0x02, 0x01, 0xd0];
+    let mut input = gst::Buffer::from_slice(bytes.clone());
+    input
+        .get_mut()
+        .expect("writable H.265 delta test buffer")
+        .set_flags(gst::BufferFlags::DELTA_UNIT);
+
+    assert_eq!(harness.push(input), Ok(gst::FlowSuccess::Ok));
+    assert_eq!(
+        harness
+            .pull()
+            .expect("forwarded H.265 delta slice")
+            .map_readable()
+            .expect("mapping forwarded H.265 delta slice")
+            .as_slice(),
+        bytes
+    );
+}
+
+#[test]
+fn dormant_replay_drops_an_uninspected_delta_without_an_idr_prefix() {
+    init();
+    let element = gst::ElementFactory::make("nalsensereplay")
+        .build()
+        .expect("constructing dormant NALSense replay");
+    let mut harness = gst_check::Harness::with_element(&element, Some("sink"), Some("src"));
+    harness.set_src_caps_str("video/x-h264,parsed=true,stream-format=byte-stream,alignment=au");
+    harness.play();
+
+    // DELTA_UNIT makes this malformed payload an uninspected negative
+    // candidate rather than accepted upstream Annex-B input.
+    assert_eq!(
+        harness.push(uninspected_delta_buffer(vec![0xff], 1)),
+        Ok(gst::FlowSuccess::Ok)
+    );
+    assert_eq!(harness.buffers_in_queue(), 0);
+    assert_eq!(element.property::<u64>("buffered-frames"), 0);
+}
+
+#[test]
+fn replay_sleep_forwards_uninspected_deltas_until_a_true_idr() {
+    init();
+    let element = gst::ElementFactory::make("nalsensereplay")
+        .property("start-active", true)
+        .build()
+        .expect("constructing active NALSense replay");
+    let mut harness = gst_check::Harness::with_element(&element, Some("sink"), Some("src"));
+    harness.set_src_caps_str("video/x-h264,parsed=true,stream-format=byte-stream,alignment=au");
+    harness.play();
+
+    element.emit_by_name::<()>("sleep", &[]);
+    // The parser-provided delta flag avoids inspecting this intentionally
+    // malformed payload while sleep waits for an actual IDR boundary.
+    assert_eq!(
+        harness.push(uninspected_delta_buffer(vec![0xff], 2)),
+        Ok(gst::FlowSuccess::Ok)
+    );
+    let _delta = harness
+        .pull()
+        .expect("forwarded delta before sleep boundary");
+    assert!(element.property::<bool>("active"));
+
+    assert_eq!(
+        harness.push(replay_buffer(3, true)),
+        Ok(gst::FlowSuccess::Ok)
+    );
+    assert!(!element.property::<bool>("active"));
+    assert_eq!(harness.buffers_in_queue(), 0);
+}
+
+#[test]
 fn replay_waits_for_idr_when_woken_without_a_decodable_prefix() {
     init();
     let element = gst::ElementFactory::make("nalsensereplay")
@@ -999,6 +1124,20 @@ fn replay_discontinuity_buffer(frame: u64, is_idr: bool) -> gst::Buffer {
     buffer
         .make_mut()
         .set_flags(flags | gst::BufferFlags::DISCONT);
+    buffer
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "a newly allocated delta test buffer has one writable owner"
+)]
+fn uninspected_delta_buffer(bytes: Vec<u8>, frame: u64) -> gst::Buffer {
+    let mut buffer = gst::Buffer::from_mut_slice(bytes);
+    let buffer_ref = buffer
+        .get_mut()
+        .expect("unique uninspected delta test buffer");
+    buffer_ref.set_pts(gst::ClockTime::from_mseconds(frame.saturating_mul(40)));
+    buffer_ref.set_flags(gst::BufferFlags::DELTA_UNIT);
     buffer
 }
 

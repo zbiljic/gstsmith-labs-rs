@@ -247,6 +247,45 @@ impl AccessUnitScanner {
     }
 }
 
+pub(crate) fn is_idr_candidate(input: &[u8]) -> Result<bool, ScanError> {
+    let Some((first_start, first_prefix)) = find_start_code(input, 0) else {
+        return Err(ScanError::MissingStartCode);
+    };
+    if input
+        .get(..first_start)
+        .is_some_and(|leading| leading.iter().any(|byte| *byte != 0))
+    {
+        return Err(ScanError::NonZeroLeadingBytes);
+    }
+
+    let mut current = (first_start, first_prefix);
+    let mut has_idr = false;
+    loop {
+        let nal_start = current
+            .0
+            .checked_add(current.1)
+            .ok_or(ScanError::AccessUnitTooLarge)?;
+        let next = find_start_code(input, nal_start);
+        let mut nal_end = next.map_or(input.len(), |(start, _prefix)| start);
+        while nal_end > nal_start && input.get(nal_end - 1) == Some(&0) {
+            nal_end -= 1;
+        }
+        let nal = input.get(nal_start..nal_end).ok_or(ScanError::EmptyNal)?;
+        let header = *nal.first().ok_or(ScanError::EmptyNal)?;
+        if header & 0x80 != 0 {
+            return Err(ScanError::ForbiddenBit);
+        }
+        has_idr |= header & 0x1f == 5;
+
+        let Some(next) = next else {
+            break;
+        };
+        current = next;
+    }
+
+    Ok(has_idr)
+}
+
 #[cfg(test)]
 fn scan_access_unit(input: &[u8], delta_unit: bool) -> Result<Option<AccessUnit>, ScanError> {
     AccessUnitScanner::new(false).scan(input, delta_unit)
@@ -405,6 +444,24 @@ mod tests {
                 is_keyframe: true,
                 is_idr: true,
             }))
+        );
+    }
+
+    #[test]
+    fn inspects_idr_candidates_without_parsing_slice_headers() {
+        assert_eq!(is_idr_candidate(&[0, 0, 1, 0x65]), Ok(true));
+        assert_eq!(is_idr_candidate(&[0, 0, 1, 0x41, 0xe0]), Ok(false));
+        assert_eq!(is_idr_candidate(&[0, 0, 1, 0x41, 0xb8]), Ok(false));
+        assert_eq!(is_idr_candidate(&[0, 0, 1, 0x67, 1, 2]), Ok(false));
+    }
+
+    #[test]
+    fn validates_every_nal_in_an_idr_candidate() {
+        assert_eq!(is_idr_candidate(&[]), Err(ScanError::MissingStartCode));
+        assert_eq!(is_idr_candidate(&[0, 0, 1]), Err(ScanError::EmptyNal));
+        assert_eq!(
+            is_idr_candidate(&[0, 0, 1, 0x65, 0, 0, 1, 0x80]),
+            Err(ScanError::ForbiddenBit)
         );
     }
 

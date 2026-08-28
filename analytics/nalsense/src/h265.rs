@@ -239,6 +239,48 @@ impl AccessUnitScanner {
     }
 }
 
+pub(crate) fn is_idr_candidate(input: &[u8]) -> Result<bool, ScanError> {
+    let Some((first_start, first_prefix)) = find_start_code(input, 0) else {
+        return Err(ScanError::MissingStartCode);
+    };
+    if input
+        .get(..first_start)
+        .is_some_and(|leading| leading.iter().any(|byte| *byte != 0))
+    {
+        return Err(ScanError::NonZeroLeadingBytes);
+    }
+
+    let mut current = (first_start, first_prefix);
+    let mut has_idr = false;
+    loop {
+        let nal_start = current
+            .0
+            .checked_add(current.1)
+            .ok_or(ScanError::AccessUnitTooLarge)?;
+        let next = find_start_code(input, nal_start);
+        let mut nal_end = next.map_or(input.len(), |(start, _prefix)| start);
+        while nal_end > nal_start && input.get(nal_end - 1) == Some(&0) {
+            nal_end -= 1;
+        }
+        let nal = input.get(nal_start..nal_end).ok_or(ScanError::EmptyNal)?;
+        let header = NalHeader::parse(nal)?;
+        if header.layer_id != 0 {
+            return Err(ScanError::UnsupportedLayer(header.layer_id));
+        }
+        if header.nal_type < 32 && !is_supported_vcl(header.nal_type) {
+            return Err(ScanError::UnsupportedVclNalType(header.nal_type));
+        }
+        has_idr |= is_idr(header.nal_type);
+
+        let Some(next) = next else {
+            break;
+        };
+        current = next;
+    }
+
+    Ok(has_idr)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct NalHeader {
     nal_type: u8,
@@ -433,6 +475,33 @@ mod tests {
                 is_keyframe: false,
                 is_idr: false,
             }))
+        );
+    }
+
+    #[test]
+    fn inspects_only_true_base_layer_idr_candidates() {
+        assert_eq!(is_idr_candidate(&slice(19, 0)), Ok(true));
+        assert_eq!(is_idr_candidate(&slice(20, 0)), Ok(true));
+        for nal_type in [16, 17, 18, 21] {
+            assert_eq!(is_idr_candidate(&slice(nal_type, 0)), Ok(false));
+        }
+    }
+
+    #[test]
+    fn validates_every_nal_in_an_idr_candidate() {
+        assert_eq!(is_idr_candidate(&[]), Err(ScanError::MissingStartCode));
+        assert_eq!(is_idr_candidate(&[0, 0, 1]), Err(ScanError::EmptyNal));
+        assert_eq!(
+            is_idr_candidate(&[0, 0, 1, 20 << 1, 1, 0, 0, 1, 0x82, 1]),
+            Err(ScanError::ForbiddenBit)
+        );
+        assert_eq!(
+            is_idr_candidate(&[0, 0, 1, 20 << 1]),
+            Err(ScanError::TruncatedNalHeader)
+        );
+        assert_eq!(
+            is_idr_candidate(&[0, 0, 1, 0x03, 0x09]),
+            Err(ScanError::UnsupportedLayer(33))
         );
     }
 

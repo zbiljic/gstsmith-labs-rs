@@ -5,7 +5,7 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 
-use crate::codec::{self, AccessUnitScanner, Codec};
+use crate::codec::{self, Codec};
 
 const DEFAULT_MAX_BUFFER_FRAMES: u32 = 300;
 const DEFAULT_MAX_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
@@ -65,7 +65,7 @@ struct State {
     forced_wakes: u64,
     peak_buffered_frames: u64,
     peak_buffered_bytes: u64,
-    scanner: Option<AccessUnitScanner>,
+    codec: Option<Codec>,
 }
 
 impl Default for State {
@@ -79,7 +79,7 @@ impl Default for State {
             forced_wakes: 0,
             peak_buffered_frames: 0,
             peak_buffered_bytes: 0,
-            scanner: None,
+            codec: None,
         }
     }
 }
@@ -92,7 +92,7 @@ impl State {
             Mode::Dormant
         };
         self.clear_stream();
-        self.scanner = None;
+        self.codec = None;
         self.replayed_frames = 0;
         self.replayed_bytes = 0;
         self.forced_wakes = 0;
@@ -111,19 +111,16 @@ impl State {
     fn clear_stream(&mut self) {
         self.buffers.clear();
         self.buffered_bytes = 0;
-        if let Some(scanner) = self.scanner.as_mut() {
-            scanner.reset();
-        }
     }
 
     fn set_codec(&mut self, codec: Codec) {
         self.invalidate_stream();
-        self.scanner = Some(AccessUnitScanner::new(codec, false));
+        self.codec = Some(codec);
     }
 
     fn clear_codec(&mut self) {
         self.invalidate_stream();
-        self.scanner = None;
+        self.codec = None;
     }
 
     fn is_active(&self) -> bool {
@@ -458,53 +455,62 @@ impl ObjectImpl for NalSenseReplay {
     }
 
     fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
-        let settings = self.settings.lock().ok();
-        let state = self.state.lock().ok();
         match pspec.name() {
-            "max-buffer-frames" => settings
-                .as_ref()
+            "max-buffer-frames" => self
+                .settings
+                .lock()
                 .map_or(DEFAULT_MAX_BUFFER_FRAMES, |value| value.max_buffer_frames)
                 .to_value(),
-            "max-buffer-bytes" => settings
-                .as_ref()
+            "max-buffer-bytes" => self
+                .settings
+                .lock()
                 .map_or(DEFAULT_MAX_BUFFER_BYTES, |value| value.max_buffer_bytes)
                 .to_value(),
-            "start-active" => settings
-                .as_ref()
-                .is_some_and(|value| value.start_active)
+            "start-active" => self
+                .settings
+                .lock()
+                .is_ok_and(|value| value.start_active)
                 .to_value(),
-            "active" => state
-                .as_ref()
-                .is_some_and(|value| value.is_active())
+            "active" => self
+                .state
+                .lock()
+                .is_ok_and(|value| value.is_active())
                 .to_value(),
-            "buffered-frames" => state
-                .as_ref()
+            "buffered-frames" => self
+                .state
+                .lock()
                 .map_or(0, |value| {
                     u64::try_from(value.buffers.len()).unwrap_or(u64::MAX)
                 })
                 .to_value(),
-            "buffered-bytes" => state
-                .as_ref()
+            "buffered-bytes" => self
+                .state
+                .lock()
                 .map_or(0, |value| value.buffered_bytes)
                 .to_value(),
-            "replayed-frames" => state
-                .as_ref()
+            "replayed-frames" => self
+                .state
+                .lock()
                 .map_or(0, |value| value.replayed_frames)
                 .to_value(),
-            "replayed-bytes" => state
-                .as_ref()
+            "replayed-bytes" => self
+                .state
+                .lock()
                 .map_or(0, |value| value.replayed_bytes)
                 .to_value(),
-            "forced-wakes" => state
-                .as_ref()
+            "forced-wakes" => self
+                .state
+                .lock()
                 .map_or(0, |value| value.forced_wakes)
                 .to_value(),
-            "peak-buffered-frames" => state
-                .as_ref()
+            "peak-buffered-frames" => self
+                .state
+                .lock()
                 .map_or(0, |value| value.peak_buffered_frames)
                 .to_value(),
-            "peak-buffered-bytes" => state
-                .as_ref()
+            "peak-buffered-bytes" => self
+                .state
+                .lock()
                 .map_or(0, |value| value.peak_buffered_bytes)
                 .to_value(),
             _ => pspec.default_value().clone(),
@@ -642,23 +648,7 @@ impl NalSenseReplay {
         let flags = buffer.flags();
         let delta_unit = flags.contains(gst::BufferFlags::DELTA_UNIT);
         let discontinuity = flags.contains(gst::BufferFlags::DISCONT);
-        let settings = *self.settings.lock().map_err(|_poisoned| {
-            gst::element_imp_error!(
-                self,
-                gst::LibraryError::Failed,
-                ["NALSense replay settings lock is poisoned"]
-            );
-            gst::FlowError::Error
-        })?;
         let action = {
-            let mapped = buffer.map_readable().map_err(|error| {
-                gst::element_imp_error!(
-                    self,
-                    gst::ResourceError::Read,
-                    ["Failed to map a replay compressed-video access unit: {error}"]
-                );
-                gst::FlowError::Error
-            })?;
             let mut state = self.state.lock().map_err(|_poisoned| {
                 gst::element_imp_error!(
                     self,
@@ -670,27 +660,41 @@ impl NalSenseReplay {
             if discontinuity {
                 state.invalidate_stream();
             }
-            let scanner = state
-                .scanner
-                .as_mut()
-                .ok_or(gst::FlowError::NotNegotiated)?;
-            let codec = scanner.codec();
-            let access_unit = scanner
-                .scan(mapped.as_slice(), delta_unit)
-                .map_err(|error| {
+
+            if state.mode == Mode::Active {
+                BufferAction::Push(buffer)
+            } else {
+                let is_idr = if delta_unit {
+                    false
+                } else {
+                    let codec = state.codec.ok_or(gst::FlowError::NotNegotiated)?;
+                    let mapped = buffer.map_readable().map_err(|error| {
+                        gst::element_imp_error!(
+                            self,
+                            gst::ResourceError::Read,
+                            ["Failed to map a replay compressed-video access unit: {error}"]
+                        );
+                        gst::FlowError::Error
+                    })?;
+                    codec.is_idr_candidate(mapped.as_slice()).map_err(|error| {
+                        gst::element_imp_error!(
+                            self,
+                            gst::StreamError::Format,
+                            ["Invalid replay {} access unit: {error}", codec.name()]
+                        );
+                        gst::FlowError::Error
+                    })?
+                };
+                let settings = *self.settings.lock().map_err(|_poisoned| {
                     gst::element_imp_error!(
                         self,
-                        gst::StreamError::Format,
-                        ["Invalid replay {} access unit: {error}", codec.name()]
+                        gst::LibraryError::Failed,
+                        ["NALSense replay settings lock is poisoned"]
                     );
                     gst::FlowError::Error
                 })?;
-            drop(mapped);
-            state.handle_buffer(
-                buffer,
-                access_unit.is_some_and(|access_unit| access_unit.is_idr),
-                settings,
-            )
+                state.handle_buffer(buffer, is_idr, settings)
+            }
         };
 
         match action {
