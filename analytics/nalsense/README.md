@@ -197,6 +197,19 @@ points cannot establish a dormant replay prefix; use an encoder/parser
 configuration that supplies periodic IDRs and repeats parameter sets with
 `config-interval=-1`.
 
+## Performance benchmarking
+
+Run the deterministic hot-path benchmarks from the repository root:
+
+```sh
+cargo bench -p gst-plugin-nalsense --bench hot_path -- --noplot
+```
+
+The benchmark generates H.264 and H.265 Annex-B access units in memory and does
+not require a camera, cached recording, or encoder plugin. Performance results
+are meaningful as before/after comparisons on the same host; do not compare
+absolute timings across different machines or environments.
+
 ## Development
 
 From the repository root:

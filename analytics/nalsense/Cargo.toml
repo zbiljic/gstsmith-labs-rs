@@ -42,8 +42,13 @@ path = "src/lib.rs"
 [build-dependencies]
 gst-plugin-version-helper = { workspace = true }
 
+[[bench]]
+name = "hot_path"
+harness = false
+
 [lints]
 workspace = true
 
 [dev-dependencies]
+criterion = { workspace = true }
 gst-check = { workspace = true }
