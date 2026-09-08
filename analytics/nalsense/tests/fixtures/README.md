@@ -27,3 +27,9 @@ SHA-256:
 ```text
 b2c3a2430d320c4ea9cb8e736d017534357ae609f17b926430b408da6a51376e  hevc-idr-64x64.h265
 ```
+
+## Replay streams
+
+Replay tests generate streams on demand using FFmpeg with libx264 and libx265.
+The ignored `.cache/nalsense/` directory caches them by encoder arguments;
+delete it to regenerate with a different FFmpeg version.

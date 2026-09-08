@@ -1153,6 +1153,142 @@ fn rejects_non_annex_b_input_cleanly() {
     }
 }
 
+#[test]
+fn replay_decodes_real_h264_and_h265_gops_after_sleep_and_wake() {
+    init();
+    for codec in ["h264", "h265"] {
+        let fixture = replay_fixture(codec);
+        let baseline = decode_replay_fixture(codec, &fixture, false);
+        assert_eq!(baseline.len(), 36, "{codec} baseline frame count");
+        let expected: Vec<_> = baseline
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, frame)| (!(12..24).contains(&index)).then_some(frame))
+            .collect();
+        let replayed = decode_replay_fixture(codec, &fixture, true);
+        assert_eq!(replayed.len(), expected.len(), "{codec} replay frame count");
+        for (index, (actual, expected)) in replayed.iter().zip(&expected).enumerate() {
+            assert!(actual == expected, "{codec} decoded frame {index} differs");
+        }
+    }
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "replay tests require FFmpeg and a writable fixture cache"
+)]
+fn replay_fixture(codec: &str) -> Vec<u8> {
+    use std::hash::{Hash, Hasher};
+
+    let (encoder, parameter_flag, parameters, format) = if codec == "h264" {
+        (
+            "libx264",
+            "-x264-params",
+            "keyint=12:min-keyint=12:scenecut=0:b-adapt=0:open-gop=0:repeat-headers=1:threads=1",
+            "h264",
+        )
+    } else {
+        (
+            "libx265",
+            "-x265-params",
+            "keyint=12:min-keyint=12:scenecut=0:b-adapt=0:open-gop=0:repeat-headers=1:pools=none:frame-threads=1:log-level=error",
+            "hevc",
+        )
+    };
+    let args = format!(
+        "-nostdin -hide_banner -loglevel error \
+         -f lavfi -i testsrc2=size=64x64:rate=25:duration=1.44 \
+         -frames:v 36 -an -c:v {encoder} -preset medium -pix_fmt yuv420p -g 12 -bf 2 \
+         {parameter_flag} {parameters} -f {format} pipe:1"
+    );
+    let mut hash = std::hash::DefaultHasher::new();
+    args.hash(&mut hash);
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache/nalsense");
+    let path = directory.join(format!("replay-{:016x}.{codec}", hash.finish()));
+    match std::fs::read(&path) {
+        Ok(bytes) => return bytes,
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}"),
+    }
+    let output = std::process::Command::new("ffmpeg")
+        .args(args.split_ascii_whitespace())
+        .output()
+        .expect("install FFmpeg with libx264 and libx265 to generate replay fixtures");
+    assert!(
+        output.status.success(),
+        "FFmpeg: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.stdout.is_empty(),
+        "FFmpeg produced no replay fixture"
+    );
+    std::fs::create_dir_all(&directory).expect("creating fixture cache");
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temporary, &output.stdout).expect("writing generated fixture");
+    std::fs::rename(&temporary, &path).expect("publishing complete fixture to cache");
+    output.stdout
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "test pipelines require installed parsers/decoders, fixed pads, and readable frames"
+)]
+fn decode_replay_fixture(codec: &str, fixture: &[u8], gated: bool) -> Vec<Vec<u8>> {
+    let bin = gst::parse::bin_from_description(
+        &format!(
+            "{codec}parse config-interval=-1 ! \
+             video/x-{codec},parsed=true,stream-format=byte-stream,alignment=au ! \
+             nalsenseactivity warmup-frames=1000 ! \
+             nalsensereplay name=replay start-active={} ! \
+             avdec_{codec} max-threads=1 output-corrupt=false ! capsfilter caps=video/x-raw,format=I420",
+            !gated
+        ),
+        true,
+    )
+    .expect("parser, NALSense, and software decoder must be installed");
+    let replay = bin.by_name("replay").expect("replay element");
+    if gated {
+        let weak_replay = replay.downgrade();
+        let frames = std::sync::atomic::AtomicUsize::new(0);
+        replay.static_pad("sink").expect("replay sink").add_probe(
+            gst::PadProbeType::BUFFER,
+            move |_, _| {
+                let replay = weak_replay.upgrade().expect("live replay element");
+                match frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+                    3 | 27 => replay.emit_by_name::<()>("wake", &[]),
+                    6 => replay.emit_by_name::<()>("sleep", &[]),
+                    _ => {}
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+    }
+    let mut harness = gst_check::Harness::with_element(&bin, Some("sink"), Some("src"));
+    harness.set_src_caps_str(&format!("video/x-{codec},stream-format=byte-stream"));
+    harness.play();
+    assert_eq!(
+        harness.push(gst::Buffer::from_slice(fixture.to_vec())),
+        Ok(gst::FlowSuccess::Ok)
+    );
+    assert!(harness.push_event(gst::event::Eos::new()));
+    let mut frames = Vec::new();
+    while let Some(buffer) = harness.try_pull() {
+        frames.push(
+            buffer
+                .map_readable()
+                .expect("decoded frame")
+                .as_slice()
+                .to_vec(),
+        );
+    }
+    assert_eq!(
+        replay.property::<u64>("replayed-frames"),
+        if gated { 6 } else { 0 }
+    );
+    assert_eq!(replay.property::<u64>("forced-wakes"), 0);
+    frames
+}
+
 #[expect(
     clippy::expect_used,
     reason = "the generated test fixture has checked, bounded dimensions"
