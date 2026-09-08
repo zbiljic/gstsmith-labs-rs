@@ -28,8 +28,10 @@ Ubuntu, install the corresponding packages:
 ```sh
 sudo apt-get update
 sudo apt-get install --no-install-recommends \
+  ffmpeg \
   gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-bad \
+  gstreamer1.0-libav \
   gstreamer1.0-tools \
   libgstreamer1.0-dev \
   libgstreamer-plugins-base1.0-dev
