@@ -628,6 +628,86 @@ fn replay_sleep_waits_for_next_idr_boundary() {
 }
 
 #[test]
+fn replay_propagates_push_failures_and_counts_only_delivered_prefix_buffers() {
+    init();
+    for wake in ["activity", "action", "limit"] {
+        for fail_at in 0..2 {
+            for error in [gst::FlowError::Error, gst::FlowError::Flushing] {
+                let warmup = if wake == "activity" { 1 } else { 30 };
+                let bin = gst::parse::bin_from_description(
+                    &format!(
+                        "nalsenseactivity activity-threshold=1 baseline-alpha=0.1 \
+                         activity-min-frames=1 warmup-frames={warmup} ! \
+                         nalsensereplay name=replay max-buffer-frames=2"
+                    ),
+                    true,
+                )
+                .expect("linked activity and replay");
+                let replay = bin.by_name("replay").expect("replay element");
+                let mut harness = gst_check::Harness::with_element(&bin, Some("sink"), Some("src"));
+                harness.set_src_caps_str(
+                    "video/x-h264,parsed=true,stream-format=byte-stream,alignment=au",
+                );
+                harness.play();
+                let attempts = std::sync::atomic::AtomicU64::new(0);
+                harness.sinkpad().expect("harness sink").add_probe(
+                    gst::PadProbeType::BUFFER,
+                    move |_, info| {
+                        if attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == fail_at {
+                            let _buffer = info.take_buffer();
+                            info.flow_res = Err(error);
+                            gst::PadProbeReturn::Handled
+                        } else {
+                            gst::PadProbeReturn::Ok
+                        }
+                    },
+                );
+                assert_eq!(
+                    harness.push(replay_buffer(0, true)),
+                    Ok(gst::FlowSuccess::Ok)
+                );
+                assert_eq!(
+                    harness.push(replay_buffer(1, false)),
+                    Ok(gst::FlowSuccess::Ok)
+                );
+                if wake == "action" {
+                    replay.emit_by_name::<()>("wake", &[]);
+                }
+                assert_eq!(
+                    harness.push(replay_sized_buffer(2, 96, false)),
+                    Err(error),
+                    "{wake}, failure at {fail_at}"
+                );
+                assert_eq!(replay.property::<u64>("replayed-frames"), fail_at);
+                assert_eq!(replay.property::<u64>("replayed-bytes"), fail_at * 36);
+                assert!(!replay.property::<bool>("active"));
+                assert_eq!(replay.property::<u64>("buffered-frames"), 0);
+                assert_eq!(harness.push(replay_buffer(3, false)), Err(error));
+                while harness.try_pull().is_some() {}
+
+                assert!(harness.push_event(gst::event::FlushStart::new()));
+                assert!(harness.push_event(gst::event::FlushStop::new(false)));
+                let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+                assert!(harness.push_event(gst::event::Segment::new(&segment)));
+                assert_eq!(
+                    harness.push(replay_buffer(4, false)),
+                    Ok(gst::FlowSuccess::Ok)
+                );
+                assert_eq!(harness.buffers_in_queue(), 0);
+                assert_eq!(
+                    harness.push(replay_buffer(5, true)),
+                    Ok(gst::FlowSuccess::Ok)
+                );
+                let output = harness.pull().expect("fresh IDR after recovery");
+                assert!(output.flags().contains(gst::BufferFlags::DISCONT));
+                assert!(replay.property::<bool>("active"));
+                assert_eq!(replay.property::<u64>("replayed-frames"), fail_at);
+            }
+        }
+    }
+}
+
+#[test]
 fn active_replay_forwards_an_uninspected_h264_delta_buffer_with_metadata() {
     init();
     let element = gst::ElementFactory::make("nalsensereplay")

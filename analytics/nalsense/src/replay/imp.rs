@@ -46,7 +46,6 @@ enum Mode {
 struct ReplayBatch {
     buffers: VecDeque<gst::Buffer>,
     replayed_frames: u64,
-    replayed_bytes: u64,
     reason: &'static str,
 }
 
@@ -66,6 +65,7 @@ struct State {
     peak_buffered_frames: u64,
     peak_buffered_bytes: u64,
     codec: Option<Codec>,
+    flow_error: Option<gst::FlowError>,
 }
 
 impl Default for State {
@@ -80,6 +80,7 @@ impl Default for State {
             peak_buffered_frames: 0,
             peak_buffered_bytes: 0,
             codec: None,
+            flow_error: None,
         }
     }
 }
@@ -111,6 +112,7 @@ impl State {
     fn clear_stream(&mut self) {
         self.buffers.clear();
         self.buffered_bytes = 0;
+        self.flow_error = None;
     }
 
     fn set_codec(&mut self, codec: Codec) {
@@ -235,7 +237,6 @@ impl State {
         ReplayBatch {
             buffers,
             replayed_frames: 0,
-            replayed_bytes: 0,
             reason,
         }
     }
@@ -244,13 +245,10 @@ impl State {
         self.mode = Mode::Active;
         let buffers = std::mem::take(&mut self.buffers);
         let replayed_frames = u64::try_from(buffers.len()).unwrap_or(u64::MAX);
-        let replayed_bytes = std::mem::take(&mut self.buffered_bytes);
-        self.replayed_frames = self.replayed_frames.saturating_add(replayed_frames);
-        self.replayed_bytes = self.replayed_bytes.saturating_add(replayed_bytes);
+        self.buffered_bytes = 0;
         ReplayBatch {
             buffers,
             replayed_frames,
-            replayed_bytes,
             reason,
         }
     }
@@ -660,6 +658,9 @@ impl NalSenseReplay {
             if discontinuity {
                 state.invalidate_stream();
             }
+            if let Some(error) = state.flow_error {
+                return Err(error);
+            }
 
             if state.mode == Mode::Active {
                 BufferAction::Push(buffer)
@@ -772,12 +773,38 @@ impl NalSenseReplay {
                 .make_mut()
                 .set_flags(flags | gst::BufferFlags::DISCONT);
         }
-        let replayed_frames = batch.replayed_frames;
-        let replayed_bytes = batch.replayed_bytes;
+        let mut replayed_frames = 0_u64;
+        let mut replayed_bytes = 0_u64;
         let reason = batch.reason;
+        let mut result = Ok(gst::FlowSuccess::Ok);
         for buffer in batch.buffers {
-            self.srcpad.push(buffer)?;
+            let bytes = u64::try_from(buffer.size()).unwrap_or(u64::MAX);
+            if let Err(error) = self.srcpad.push(buffer) {
+                result = Err(error);
+                break;
+            }
+            if replayed_frames < batch.replayed_frames {
+                replayed_frames += 1;
+                replayed_bytes = replayed_bytes.saturating_add(bytes);
+            }
         }
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_poisoned| gst::FlowError::Error)?;
+            state.replayed_frames = state.replayed_frames.saturating_add(replayed_frames);
+            state.replayed_bytes = state.replayed_bytes.saturating_add(replayed_bytes);
+            if let Err(error) = result {
+                state.invalidate_stream();
+                if state.mode == Mode::Active {
+                    state.mode = Mode::WakeRequested;
+                }
+                // Event handlers return only bool; retain the flow error for the next buffer.
+                state.flow_error = Some(error);
+            }
+        }
+        result?;
         self.post_replay_message(reason, replayed_frames, replayed_bytes);
         Ok(gst::FlowSuccess::Ok)
     }
