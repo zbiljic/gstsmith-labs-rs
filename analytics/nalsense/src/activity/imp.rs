@@ -81,7 +81,6 @@ impl Runtime {
 
     fn reset(&mut self) {
         self.analyzer.reset();
-        self.access_unit_scanner.reset();
         self.next_frame_number = 0;
     }
 }
@@ -346,6 +345,9 @@ impl BaseTransformImpl for NalSenseActivity {
                 Ok(mut runtime) => {
                     if let Some(runtime) = runtime.as_mut() {
                         runtime.reset();
+                        if matches!(event.view(), gst::EventView::StreamStart(_)) {
+                            runtime.access_unit_scanner.reset();
+                        }
                     }
                 }
                 Err(_poisoned) => {

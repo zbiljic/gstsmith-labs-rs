@@ -205,6 +205,54 @@ fn passes_h265_access_units_and_metadata_unchanged() {
 }
 
 #[test]
+fn h265_activity_preserves_parameter_sets_across_continuity_resets() {
+    init();
+    for reset in ["discont", "segment", "flush"] {
+        let element = gst::ElementFactory::make("nalsenseactivity")
+            .build()
+            .expect("constructing H.265 activity");
+        let mut harness = gst_check::Harness::with_element(&element, Some("sink"), Some("src"));
+        harness.set_src_caps_str("video/x-h265,parsed=true,stream-format=byte-stream,alignment=au");
+        harness.play();
+        assert_eq!(
+            harness.push(h265_replay_buffer(0, 20)),
+            Ok(gst::FlowSuccess::Ok)
+        );
+        let _idr = harness.pull().expect("initial IDR with PPS");
+
+        let bytes = vec![0, 0, 0, 1, 0x02, 0x01, 0xd0, 0x55];
+        let mut delta = uninspected_delta_buffer(bytes.clone(), 1);
+        assert_eq!(harness.push(delta.clone()), Ok(gst::FlowSuccess::Ok));
+        let _delta = harness.pull().expect("slice using cached PPS");
+        if reset == "discont" {
+            delta.make_mut().set_flags(gst::BufferFlags::DISCONT);
+        } else {
+            if reset == "flush" {
+                assert!(harness.push_event(gst::event::FlushStart::new()));
+                assert!(harness.push_event(gst::event::FlushStop::new(false)));
+            }
+            let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+            assert!(harness.push_event(gst::event::Segment::new(&segment)));
+        }
+        assert_eq!(harness.push(delta), Ok(gst::FlowSuccess::Ok), "{reset}");
+        let output = harness.pull().expect("slice after continuity reset");
+        assert_eq!(
+            output.map_readable().expect("mapping output").as_slice(),
+            bytes
+        );
+
+        // A replacement stream must not inherit the previous stream's PPS.
+        assert!(harness.push_event(gst::event::StreamStart::new("replacement")));
+        let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        assert!(harness.push_event(gst::event::Segment::new(&segment)));
+        assert_eq!(
+            harness.push(uninspected_delta_buffer(bytes, 2)),
+            Err(gst::FlowError::Error)
+        );
+    }
+}
+
+#[test]
 fn emits_configured_activity_transitions() {
     init();
     let element = gst::ElementFactory::make("nalsenseactivity")
