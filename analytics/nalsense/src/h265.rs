@@ -564,11 +564,25 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_short_inputs_never_panic() {
-        for length in 0..=8 {
-            for byte in u8::MIN..=u8::MAX {
-                let input = vec![byte; length];
-                let _result = AccessUnitScanner::new().scan(&input, true);
+    fn truncated_and_mutated_annex_b_inputs_never_panic() {
+        let mut idr = pps().to_vec();
+        idr.extend_from_slice(&slice(20, 0xac));
+        for seed in [idr, slice(1, 0xd0).to_vec()] {
+            let mut scanner = AccessUnitScanner::new();
+            assert_eq!(scanner.scan(&pps(), true), Ok(None));
+            assert!(scanner.scan(&seed, true).expect("valid seed").is_some());
+            for length in 0..=seed.len() {
+                let input = seed.get(..length).expect("bounded truncation");
+                let _scan = scanner.scan(input, true);
+                let _idr = is_idr_candidate(input);
+            }
+            for index in 0..seed.len() {
+                for byte in u8::MIN..=u8::MAX {
+                    let mut input = seed.clone();
+                    *input.get_mut(index).expect("bounded mutation") = byte;
+                    let _scan = scanner.scan(&input, true);
+                    let _idr = is_idr_candidate(&input);
+                }
             }
         }
     }
