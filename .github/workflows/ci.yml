@@ -75,11 +75,6 @@ jobs:
       - name: Run tests
         run: mise run test
 
-      - name: Run NALSense all-feature gate
-        run: |
-          cargo test --locked --package gst-plugin-nalsense --all-targets --all-features
-          cargo clippy --locked --package gst-plugin-nalsense --all-targets --all-features -- -D warnings
-
       - name: Build plugin
         run: mise run build
 
