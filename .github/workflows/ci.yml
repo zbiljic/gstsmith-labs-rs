@@ -38,7 +38,7 @@ jobs:
       - name: Install GStreamer 1.24
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends \
+          sudo apt-get install -y --no-install-recommends \
             ffmpeg \
             gstreamer1.0-plugins-base \
             gstreamer1.0-plugins-bad \
