@@ -10,20 +10,21 @@ are being established before promotion to
 
 - [`analytics`](analytics/)
 
-  - [`nalsense`](analytics/nalsense/): Portable H.264 encoded-video activity
-    analysis and bounded IDR replay.
+  - [`nalsense`](analytics/nalsense/): Portable H.264 and H.265 encoded-video
+    activity analysis and bounded IDR replay.
     - `nalsenseactivity`: Detect inexpensive compressed-stream activity hints
       without decoding pixels, while passing every access unit downstream
       unchanged.
-    - `nalsensereplay`: Retain a bounded decodable H.264 prefix while dormant,
-      then replay it and resume live forwarding when activity wakes the gate.
+    - `nalsensereplay`: Retain a bounded decodable H.264 or H.265 prefix while
+      dormant, then replay it and resume live forwarding when activity wakes
+      the gate.
 
 ## Building
 
 The workspace requires GStreamer 1.24 or newer. Development requires the
-GStreamer headers and pkg-config files, the base runtime plugins, an H.264
-parser, and the `gst-inspect-1.0` and `gst-launch-1.0` command-line tools. On
-Ubuntu, install the corresponding packages:
+GStreamer headers and pkg-config files, the base runtime plugins, H.264 and
+H.265 parsers, and the `gst-inspect-1.0` and `gst-launch-1.0` command-line tools.
+On Ubuntu, install the corresponding packages:
 
 ```sh
 sudo apt-get update
