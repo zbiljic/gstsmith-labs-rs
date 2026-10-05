@@ -14,7 +14,7 @@ version = "0.1.0"
 [workspace.dependencies]
 criterion = "0.8"
 gst = { package = "gstreamer", version = "0.25.4", features = ["v1_24"] }
-gst-base = { package = "gstreamer-base", version = "0.25.3", features = ["v1_24"] }
+gst-base = { package = "gstreamer-base", version = "0.25.4", features = ["v1_24"] }
 gst-check = { package = "gstreamer-check", version = "0.25.0", features = ["v1_24"] }
 gst-plugin-version-helper = "0.8.4"
 h264-reader = "0.8.0"
