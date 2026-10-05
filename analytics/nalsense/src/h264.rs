@@ -232,7 +232,7 @@ impl AccessUnitScanner {
         let nal = RefNal::new(bytes, &[], true);
         let nal_header = nal.header().ok()?;
         let (slice, _sps, pps) =
-            SliceHeader::from_bits(context, &mut nal.rbsp_bits(), nal_header).ok()?;
+            SliceHeader::from_bits(context, &mut nal.rbsp_bits(), nal_header, None).ok()?;
         26_i32
             .checked_add(pps.pic_init_qp_minus26)?
             .checked_add(slice.slice_qp_delta)
