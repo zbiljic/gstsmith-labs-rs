@@ -32,6 +32,23 @@ packages=(
   "gst-plugin-nalsense|gstnalsense|nalsense|nalsenseactivity nalsensereplay"
 )
 
+# Optional explicit package selection keeps NALSense validation on GStreamer 1.24.
+if (( $# > 0 )); then
+  selected=()
+  for requested in "$@"; do
+    found=false
+    for mapping in "${packages[@]}"; do
+      if [[ "${mapping%%|*}" == "$requested" ]]; then
+        selected+=("$mapping")
+        found=true
+        break
+      fi
+    done
+    "$found" || fail "unknown package: $requested"
+  done
+  packages=("${selected[@]}")
+fi
+
 case "$(uname -s)" in
   Linux)
     dynamic_suffix="so"

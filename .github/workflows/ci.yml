@@ -28,14 +28,14 @@ jobs:
           github.event.pull_request.head.repo.full_name != github.repository ||
           !startsWith(github.head_ref, 'renovate/') }}
     name: Run Checks
-    runs-on: ${{ vars.RUNNER || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.RUNNER || 'ubuntu-26.04' }}
     timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install GStreamer 1.24
+      - name: Install GStreamer 1.28
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -47,9 +47,9 @@ jobs:
             libbz2-dev \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
             libssl-dev
-          pkg-config --atleast-version=1.24 gstreamer-1.0
-          pkg-config --max-version=1.25.99 gstreamer-1.0
+          pkg-config --atleast-version=1.28 gstreamer-1.0
           pkg-config --modversion gstreamer-1.0
 
       - name: Setup mise
@@ -107,3 +107,39 @@ jobs:
 
       - name: Test minimum supported Rust version
         run: cargo +"$MSRV" test --workspace --all-features --locked
+
+  gstreamer-124:
+    name: Check NALSense on GStreamer 1.24
+    runs-on: ${{ vars.RUNNER_UBUNTU_2404 || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install GStreamer 1.24
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg gstreamer1.0-plugins-base gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav gstreamer1.0-tools libbz2-dev libssl-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+          pkg-config --atleast-version=1.24 gstreamer-1.0
+          pkg-config --max-version=1.25.99 gstreamer-1.0
+      - name: Setup mise
+        uses: jdx/mise-action@v5
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Check, test, lint and build NALSense independently
+        run: |
+          cargo check --locked -p gst-plugin-nalsense --all-targets
+          cargo test --locked -p gst-plugin-nalsense --all-targets
+          cargo clippy --locked -p gst-plugin-nalsense --all-targets -- -D warnings
+          cargo build --locked -p gst-plugin-nalsense
+      - name: Validate NALSense cargo-c package
+        run: ci/check-cargo-c-packages.sh gst-plugin-nalsense
+      - name: Inspect NALSense
+        env:
+          GST_PLUGIN_PATH: ${{ github.workspace }}/target/debug
+        run: |
+          gst-inspect-1.0 nalsense
+          gst-inspect-1.0 nalsenseactivity
+          gst-inspect-1.0 nalsensereplay
