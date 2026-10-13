@@ -49,3 +49,10 @@ cargo check -p gst-plugin-ptssampler --all-targets
 cargo test -p gst-plugin-ptssampler --all-targets
 cargo clippy -p gst-plugin-ptssampler --all-targets -- -D warnings
 ```
+
+Benchmark push mode with sampling disabled, every buffer kept, and 29 out of
+30 buffers dropped, plus pull mode with sampling disabled and every buffer kept:
+
+```sh
+cargo bench --locked -p gst-plugin-ptssampler --bench hot_path
+```

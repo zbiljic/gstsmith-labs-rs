@@ -1,4 +1,8 @@
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::num::NonZeroU64;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use atomic_refcell::{AtomicRefCell, AtomicRefMut};
 
 use gst::glib;
 use gst::prelude::*;
@@ -17,51 +21,48 @@ static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     )
 });
 
-#[derive(Debug, Clone, Copy)]
 struct Settings {
-    period: u64,
-    phase: u64,
+    period: AtomicU64,
+    phase: AtomicU64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            period: DEFAULT_PERIOD,
-            phase: DEFAULT_PHASE,
+            period: AtomicU64::new(DEFAULT_PERIOD),
+            phase: AtomicU64::new(DEFAULT_PHASE),
         }
     }
 }
 
 #[derive(Default)]
+struct State {
+    segment: Option<gst::FormattedSegment<gst::ClockTime>>,
+    /// The next boundary may exceed the range of a u64 timestamp.
+    next_boundary: Option<i128>,
+}
+
+#[derive(Default)]
 pub struct PtsSampler {
-    settings: Mutex<Settings>,
-    /// Period index of the last buffer passed downstream in this segment.
-    last_window: Mutex<Option<i128>>,
+    settings: Settings,
+    state: AtomicRefCell<State>,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Index of the period containing `running_time`, counted from `phase`.
-fn window(running_time: u64, settings: Settings) -> Option<i128> {
-    if settings.period == 0 {
-        return None;
-    }
-    let offset = i128::from(running_time) - i128::from(settings.phase);
-    Some(offset.div_euclid(i128::from(settings.period)))
+/// End of the period containing `running_time`, counted from `phase`.
+fn next_boundary(running_time: u64, period: NonZeroU64, phase: u64) -> i128 {
+    let period = i128::from(period.get());
+    let offset = i128::from(running_time) - i128::from(phase);
+    i128::from(running_time) + period - offset.rem_euclid(period)
 }
 
 impl PtsSampler {
-    fn reset(&self) {
-        *lock(&self.last_window) = None;
-    }
-
-    fn running_time(&self, buffer: &gst::BufferRef) -> Option<gst::ClockTime> {
-        let pts = buffer.pts()?;
-        let segment = self.obj().segment();
-        let segment = segment.downcast_ref::<gst::ClockTime>()?;
-        segment.to_running_time(pts)
+    fn borrow_state(&self) -> Result<AtomicRefMut<'_, State>, gst::ErrorMessage> {
+        self.state.try_borrow_mut().map_err(|err| {
+            gst::error_msg!(
+                gst::CoreError::Failed,
+                ["Concurrent sampling state access: {err}"]
+            )
+        })
     }
 }
 
@@ -94,19 +95,23 @@ impl ObjectImpl for PtsSampler {
     }
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
-        let mut settings = lock(&self.settings);
         match pspec.name() {
-            "period" => settings.period = value.get().unwrap_or(DEFAULT_PERIOD),
-            "phase" => settings.phase = value.get().unwrap_or(DEFAULT_PHASE),
+            "period" => self
+                .settings
+                .period
+                .store(value.get().unwrap_or(DEFAULT_PERIOD), Ordering::Relaxed),
+            "phase" => self
+                .settings
+                .phase
+                .store(value.get().unwrap_or(DEFAULT_PHASE), Ordering::Relaxed),
             other => gst::error!(CAT, imp = self, "unknown property {other}"),
         }
     }
 
     fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
-        let settings = lock(&self.settings);
         match pspec.name() {
-            "period" => settings.period.to_value(),
-            "phase" => settings.phase.to_value(),
+            "period" => self.settings.period.load(Ordering::Relaxed).to_value(),
+            "phase" => self.settings.phase.load(Ordering::Relaxed).to_value(),
             other => {
                 gst::error!(CAT, imp = self, "unknown property {other}");
                 glib::Value::from_type(pspec.value_type())
@@ -154,7 +159,9 @@ impl BaseTransformImpl for PtsSampler {
     const TRANSFORM_IP_ON_PASSTHROUGH: bool = true;
 
     fn start(&self) -> Result<(), gst::ErrorMessage> {
-        self.reset();
+        let obj = self.obj();
+        let _guard = obj.sink_pad().stream_lock();
+        *self.borrow_state()? = State::default();
         Ok(())
     }
 
@@ -165,7 +172,22 @@ impl BaseTransformImpl for PtsSampler {
                 | gst::EventView::Segment(_)
                 | gst::EventView::FlushStop(_)
         ) {
-            self.reset();
+            // These events and buffers are serialized by the sink pad's stream lock.
+            let mut state = match self.borrow_state() {
+                Ok(state) => state,
+                Err(err) => {
+                    self.post_error_message(err);
+                    return false;
+                }
+            };
+            state.next_boundary = None;
+            match event.view() {
+                gst::EventView::Segment(segment) => {
+                    state.segment = segment.segment().downcast_ref::<gst::ClockTime>().cloned();
+                }
+                gst::EventView::FlushStop(_) => state.segment = None,
+                _ => (),
+            }
         }
         self.parent_sink_event(event)
     }
@@ -174,19 +196,40 @@ impl BaseTransformImpl for PtsSampler {
         &self,
         buffer: &gst::Buffer,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
-        let settings = *lock(&self.settings);
+        let Some(period) = NonZeroU64::new(self.settings.period.load(Ordering::Relaxed)) else {
+            return Ok(gst::FlowSuccess::Ok);
+        };
+        let Some(pts) = buffer.pts() else {
+            return Ok(gst::FlowSuccess::Ok);
+        };
+        let obj = self.obj();
+        let sink_pad = obj.sink_pad();
+        // Pull-mode buffers hold the source pad's lock, unlike sink events.
+        let _guard = (sink_pad.mode() != gst::PadMode::Push).then(|| sink_pad.stream_lock());
+        let mut state = self.borrow_state().map_err(|err| {
+            self.post_error_message(err);
+            gst::FlowError::Error
+        })?;
         // Buffers without a running time cannot be placed in a period.
-        let Some(window) = self
-            .running_time(buffer)
-            .and_then(|running_time| window(running_time.nseconds(), settings))
+        let Some(running_time) = state
+            .segment
+            .as_ref()
+            .and_then(|segment| segment.to_running_time(pts))
         else {
             return Ok(gst::FlowSuccess::Ok);
         };
-        let mut last = lock(&self.last_window);
-        if last.is_some_and(|last| window <= last) {
+        let running_time = running_time.nseconds();
+        if state
+            .next_boundary
+            .is_some_and(|next| i128::from(running_time) < next)
+        {
             return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
         }
-        *last = Some(window);
+        state.next_boundary = Some(next_boundary(
+            running_time,
+            period,
+            self.settings.phase.load(Ordering::Relaxed),
+        ));
         Ok(gst::FlowSuccess::Ok)
     }
 }
@@ -195,21 +238,22 @@ impl BaseTransformImpl for PtsSampler {
 mod tests {
     use super::*;
 
-    fn settings(period_ms: u64, phase_ms: u64) -> Settings {
-        Settings {
-            period: period_ms * 1_000_000,
-            phase: phase_ms * 1_000_000,
-        }
-    }
-
     #[test]
-    fn windows_count_periods_from_the_phase() {
-        let ms = 1_000_000;
-        assert_eq!(window(0, settings(150, 0)), Some(0));
-        assert_eq!(window(149 * ms, settings(150, 0)), Some(0));
-        assert_eq!(window(150 * ms, settings(150, 0)), Some(1));
-        assert_eq!(window(0, settings(150, 50)), Some(-1));
-        assert_eq!(window(50 * ms, settings(150, 50)), Some(0));
-        assert_eq!(window(123 * ms, settings(0, 0)), None);
+    fn boundaries_match_period_windows_including_u64_limits() {
+        for period in [1, 150, u64::MAX].into_iter().filter_map(NonZeroU64::new) {
+            for phase in [0, 50, u64::MAX] {
+                for time in [0, 49, 50, 149, 150, u64::MAX - 1, u64::MAX] {
+                    let window =
+                        (i128::from(time) - i128::from(phase)).div_euclid(i128::from(period.get()));
+                    let boundary = next_boundary(time, period, phase);
+                    assert_eq!(
+                        boundary,
+                        i128::from(phase) + (window + 1) * i128::from(period.get())
+                    );
+                    assert!(boundary > i128::from(time));
+                    assert!(boundary <= i128::from(time) + i128::from(period.get()));
+                }
+            }
+        }
     }
 }

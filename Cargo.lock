@@ -763,6 +763,8 @@ dependencies = [
 name = "gst-plugin-ptssampler"
 version = "0.1.0"
 dependencies = [
+ "atomic_refcell",
+ "criterion",
  "gst-plugin-version-helper",
  "gstreamer",
  "gstreamer-base",
