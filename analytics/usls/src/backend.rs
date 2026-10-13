@@ -1,12 +1,11 @@
-use std::{cell::RefCell, fs::File, io::Read, path::Path, sync::OnceLock};
+use std::{cell::RefCell, fs::File, path::Path, sync::OnceLock};
 
 use anyhow::{Context, Result, ensure};
 use gst::glib;
 use ort::{logging::LogLevel, value::TensorElementType};
-use sha2::{Digest, Sha256};
 use usls::{
     Config, Device, Image, ImageTransformInfo, Model, NAMES_COCO_80, OrtTensorAttr, PicoDet,
-    RFDETR, RTDETR, ResizeModeType, Runtime, Y,
+    RFDETR, RTDETR, ResizeModeType, Runtime, X,
 };
 
 // RF-DETR category IDs: https://github.com/roboflow/rf-detr/blob/fb4ceea0d5750890e43964f5fc558c4caf9b6f38/rfdetr/util/coco_classes.py
@@ -37,64 +36,51 @@ pub(crate) enum Profile {
     DeimDfineSCoco = 6,
     #[enum_value(name = "DEIMv2 Atto COCO", nick = "deimv2-atto-coco")]
     Deimv2AttoCoco = 7,
+    #[enum_value(name = "RF-DETR COCO", nick = "rfdetr-coco")]
+    RfdetrCoco = 8,
+    #[enum_value(name = "RT-DETR v1 COCO", nick = "rtdetr-v1-coco")]
+    RtdetrV1Coco = 9,
+    #[enum_value(name = "RT-DETR v2 COCO", nick = "rtdetr-v2-coco")]
+    RtdetrV2Coco = 10,
+    #[enum_value(name = "RT-DETR v4 COCO", nick = "rtdetr-v4-coco")]
+    RtdetrV4Coco = 11,
+    #[enum_value(name = "PicoDet COCO", nick = "picodet-coco")]
+    PicodetCoco = 12,
+    #[enum_value(name = "D-FINE COCO", nick = "dfine-coco")]
+    DfineCoco = 13,
+    #[enum_value(name = "DEIM D-FINE COCO", nick = "deim-dfine-coco")]
+    DeimDfineCoco = 14,
+    #[enum_value(name = "DEIMv2 HGNetv2 COCO", nick = "deimv2-hgnetv2-coco")]
+    Deimv2Hgnetv2Coco = 15,
+    #[enum_value(name = "DEIMv2 DINOv3 COCO", nick = "deimv2-dinov3-coco")]
+    Deimv2Dinov3Coco = 16,
 }
 
 impl Profile {
-    fn artifact(self) -> (&'static str, u64, usize) {
-        match self {
-            Self::RfdetrNano => (
-                "9bbecf62d2ac0718cdd9d36cc30fd013d6efdd00e887cd66765ac077bc7177b1",
-                108_050_760,
-                384,
-            ),
-            Self::RtdetrV1R18 => (
-                "79875f7b608d06e065f50ea473a5887537b93f8abd60c1c9060fd37c8f23a8e4",
-                80_464_702,
-                640,
-            ),
-            Self::RtdetrV2S => (
-                "c75afbcebb58e1b8016ee6c1a09f879995e4ed273707572e2c5ee9528a26948a",
-                80_447_976,
-                640,
-            ),
-            Self::RtdetrV4S => (
-                "8b8931caa850d2c9712ca90851bb856a43a3a1a0faf5862567ace7c0b725ddd2",
-                41_770_934,
-                640,
-            ),
-            Self::PicodetLCoco => (
-                "5255b1a46031f717c7cc1e9ca2c1ac74117f6206e30eba27d4f9aa23ac20ecac",
-                23_602_032,
-                640,
-            ),
-            Self::DfineNCoco => (
-                "537c995799e8391215de8e7d2e5d3469787ea4ae7e53068751fabd6e2c0db9e3",
-                15_501_246,
-                640,
-            ),
-            Self::DeimDfineSCoco => (
-                "78345b185cc28238b35cf2ec5721e86f2678948aed5ef7b572c6e59fe7b73efd",
-                41_761_973,
-                640,
-            ),
-            Self::Deimv2AttoCoco => (
-                "5776c9b6fe8baa74b686d800265e44cb084d1fea4712c6ae43cf8d16ab857b5a",
-                2_192_333,
-                320,
-            ),
-        }
+    fn is_rfdetr(self) -> bool {
+        matches!(self, Self::RfdetrNano | Self::RfdetrCoco)
+    }
+
+    fn is_picodet(self) -> bool {
+        matches!(self, Self::PicodetLCoco | Self::PicodetCoco)
     }
 
     fn config(self) -> Config {
         match self {
-            Self::RfdetrNano => Config::rfdetr_nano(),
-            Self::RtdetrV1R18 => Config::rtdetr_v1_r18(),
-            Self::RtdetrV2S => Config::rtdetr_v2_s(),
-            Self::RtdetrV4S => Config::rtdetr_v4_s(),
-            Self::PicodetLCoco => Config::picodet_l_coco(),
-            Self::DfineNCoco => Config::d_fine_n_coco(),
-            Self::DeimDfineSCoco => Config::deim_dfine_s_coco(),
-            Self::Deimv2AttoCoco => Config::deim_v2_atto_coco(),
+            Self::RfdetrNano | Self::RfdetrCoco => Config::rfdetr(),
+            Self::RtdetrV1R18 | Self::RtdetrV1Coco => Config::rtdetr().with_version(1.into()),
+            Self::RtdetrV2S | Self::RtdetrV2Coco => Config::rtdetr().with_version(2.into()),
+            Self::RtdetrV4S | Self::RtdetrV4Coco => Config::rtdetr().with_version(4.into()),
+            Self::PicodetLCoco | Self::PicodetCoco => {
+                Config::picodet().with_class_names(&NAMES_COCO_80)
+            }
+            Self::DfineNCoco | Self::DfineCoco => Config::d_fine(),
+            Self::DeimDfineSCoco | Self::DeimDfineCoco => Config::deim(),
+            Self::Deimv2AttoCoco | Self::Deimv2Hgnetv2Coco => Config::deimv2(),
+            // The DINOv3 exports require ImageNet normalization; HGNetv2 does not.
+            Self::Deimv2Dinov3Coco => Config::deimv2()
+                .with_image_mean([0.485, 0.456, 0.406])
+                .with_image_std([0.229, 0.224, 0.225]),
         }
     }
 }
@@ -197,27 +183,9 @@ pub(crate) fn verify_assignment(provider: Provider, messages: &[String]) -> Resu
     Ok(())
 }
 
-pub(crate) fn verify_model(path: &Path, profile: Profile) -> Result<()> {
-    let (sha256, length, _) = profile.artifact();
+fn verify_model(path: &Path) -> Result<()> {
     ensure!(path.is_file(), "model-file must name a local regular file");
-    let mut file = File::open(path).context("opening model-file")?;
-    ensure!(
-        file.metadata()?.len() == length,
-        "model-file length differs from the qualified {profile:?} graph (expected {length} bytes)"
-    );
-    let mut hash = Sha256::new();
-    let mut bytes = [0_u8; 8192];
-    loop {
-        let count = file.read(&mut bytes).context("reading model-file")?;
-        if count == 0 {
-            break;
-        }
-        hash.update(bytes.get(..count).context("invalid file read length")?);
-    }
-    ensure!(
-        format!("{:x}", hash.finalize()) == sha256,
-        "model-file is not the qualified {profile:?} FP32 batch1 graph (expected SHA256 {sha256})"
-    );
+    File::open(path).context("opening model-file")?;
     Ok(())
 }
 
@@ -236,60 +204,72 @@ fn verify_contract(
     inputs: &OrtTensorAttr,
     outputs: &OrtTensorAttr,
 ) -> Result<()> {
-    let (_, _, size) = profile.artifact();
-    let inputs_valid = match profile {
-        Profile::RfdetrNano => {
-            inputs.names == ["images"]
-                && inputs.dimss == [vec![1, 3, size, size]]
-                && inputs.dtypes == [TensorElementType::Float32]
-        }
-        Profile::PicodetLCoco => {
-            inputs.names == ["image", "scale_factor"]
-                && inputs.dimss == [vec![1, 3, size, size], vec![1, 2]]
-                && inputs.dtypes == [TensorElementType::Float32, TensorElementType::Float32]
-        }
-        _ => {
-            inputs.names == ["images", "orig_target_sizes"]
-                && inputs.dimss == [vec![1, 3, size, size], vec![1, 2]]
-                && inputs.dtypes == [TensorElementType::Float32, TensorElementType::Int64]
-        }
+    let image_valid = matches!(
+        inputs.dimss.first().map(Vec::as_slice),
+        Some([1, 3, height, width]) if *height > 0 && u16::try_from(*height).is_ok() && height == width
+    );
+    let inputs_valid = if profile.is_rfdetr() {
+        inputs.names == ["images"]
+            && inputs.dimss.len() == 1
+            && inputs.dtypes == [TensorElementType::Float32]
+    } else {
+        let (names, dtype) = if profile.is_picodet() {
+            (["image", "scale_factor"], TensorElementType::Float32)
+        } else {
+            (["images", "orig_target_sizes"], TensorElementType::Int64)
+        };
+        inputs.names == names
+            && inputs.dimss.len() == 2
+            && inputs.dimss.get(1).is_some_and(|shape| shape == &[1, 2])
+            && inputs.dtypes == [TensorElementType::Float32, dtype]
     };
-    let outputs_valid = match profile {
-        Profile::RfdetrNano => {
-            outputs.names == ["pred_boxes", "pred_logits"]
-                && outputs.dimss == [vec![1, 0, 4], vec![1, 0, 91]]
-                && outputs.dtypes == [TensorElementType::Float32, TensorElementType::Float32]
-        }
-        Profile::PicodetLCoco => {
-            outputs.names == ["multiclass_nms3_0.tmp_0", "multiclass_nms3_0.tmp_2"]
-                && outputs.dimss == [vec![0, 6], vec![1]]
-                && outputs.dtypes == [TensorElementType::Float32, TensorElementType::Int32]
-        }
-        _ => {
-            let batch = usize::from(!matches!(
-                profile,
-                Profile::DfineNCoco | Profile::DeimDfineSCoco
-            ));
-            outputs.names == ["labels", "boxes", "scores"]
-                && outputs.dimss == [vec![batch, 300], vec![batch, 300, 4], vec![batch, 300]]
-                && outputs.dtypes
-                    == [
-                        TensorElementType::Int64,
-                        TensorElementType::Float32,
-                        TensorElementType::Float32,
-                    ]
-        }
+    let outputs_valid = if profile.is_rfdetr() {
+        (outputs.names == ["pred_boxes", "pred_logits"] || outputs.names == ["boxes", "logits"])
+            && matches!(outputs.dimss.as_slice(), [boxes, logits]
+                if matches!((boxes.as_slice(), logits.as_slice()),
+                    ([b1, q1, coords], [b2, q2, classes])
+                    if *b1 <= 1 && *b2 <= 1 && [0, 4].contains(coords)
+                        && [0, 91].contains(classes) && compatible_dimensions(&[*q1, *q2])))
+            && outputs.dtypes == [TensorElementType::Float32, TensorElementType::Float32]
+    } else if profile.is_picodet() {
+        outputs.names == ["multiclass_nms3_0.tmp_0", "multiclass_nms3_0.tmp_2"]
+            && matches!(outputs.dimss.as_slice(), [rows, count]
+                if matches!(rows.as_slice(), [_, columns] if [0, 6].contains(columns))
+                    && matches!(count.as_slice(), [batch] if *batch <= 1))
+            && outputs.dtypes == [TensorElementType::Float32, TensorElementType::Int32]
+    } else {
+        outputs.names == ["labels", "boxes", "scores"]
+            && matches!(outputs.dimss.as_slice(), [labels, boxes, scores]
+                if matches!((labels.as_slice(), boxes.as_slice(), scores.as_slice()),
+                    ([b1, q1], [b2, q2, coords], [b3, q3])
+                    if *b1 <= 1 && *b2 <= 1 && *b3 <= 1
+                        && [0, 4].contains(coords) && compatible_dimensions(&[*q1, *q2, *q3])))
+            && outputs.dtypes
+                == [
+                    TensorElementType::Int64,
+                    TensorElementType::Float32,
+                    TensorElementType::Float32,
+                ]
     };
     ensure!(
-        inputs_valid && outputs_valid,
-        "qualified {profile:?} model tensor contract mismatch"
+        image_valid && inputs_valid && outputs_valid,
+        "{profile:?} tensor contract mismatch: expected static batch1 square FP32 NCHW input (size 1..65535) and compatible COCO detection outputs; inputs={inputs:?}, outputs={outputs:?}"
     );
     Ok(())
 }
 
+fn compatible_dimensions(dimensions: &[usize]) -> bool {
+    // ORT reports symbolic dimensions as zero; validate their actual sizes at inference.
+    let mut known = dimensions
+        .iter()
+        .copied()
+        .filter(|dimension| *dimension != 0);
+    let first = known.next();
+    known.all(|dimension| Some(dimension) == first)
+}
+
 pub(crate) struct Backend {
     runtime: Inference,
-    profile: Profile,
     threshold: f32,
     cap: usize,
 }
@@ -327,7 +307,7 @@ impl Backend {
         );
         verify_units(profile, provider, units)?;
         let path = path.canonicalize().context("resolving local model-file")?;
-        verify_model(&path, profile)?;
+        verify_model(&path)?;
         let owned = logger_owned()?;
         ensure!(
             provider != Provider::Coreml || owned,
@@ -354,8 +334,12 @@ impl Backend {
             .with_model_coreml_compute_units(units as u8)
             .commit()?;
         let runtime = match profile {
-            Profile::RfdetrNano => Inference::Rfdetr(Box::new(RFDETR::new(config)?)),
-            Profile::PicodetLCoco => Inference::Picodet(Box::new(PicoDet::new(config)?)),
+            Profile::RfdetrNano | Profile::RfdetrCoco => {
+                Inference::Rfdetr(Box::new(RFDETR::new(config)?))
+            }
+            Profile::PicodetLCoco | Profile::PicodetCoco => {
+                Inference::Picodet(Box::new(PicoDet::new(config)?))
+            }
             _ => Inference::Rtdetr(Box::new(RTDETR::new(config)?)),
         };
         let assignment = capture.finish();
@@ -371,7 +355,6 @@ impl Backend {
         verify_contract(profile, &engine.inputs, &engine.outputs)?;
         Ok(Self {
             runtime,
-            profile,
             threshold,
             cap,
         })
@@ -381,14 +364,13 @@ impl Backend {
     pub(crate) fn fixture(infer: fn(&Image) -> Result<Vec<Detection>>) -> Self {
         Self {
             runtime: Inference::Fixture(infer),
-            profile: Profile::RfdetrNano,
             threshold: 0.5,
             cap: 100,
         }
     }
 
     pub fn run(&mut self, image: &Image) -> Result<Vec<Detection>> {
-        let results = match &mut self.runtime {
+        match &mut self.runtime {
             Inference::Rfdetr(runtime) => {
                 // Upstream clips the origin before preserving width/height, shifting edge boxes.
                 let (model, engines) = runtime.parts_mut();
@@ -397,17 +379,19 @@ impl Backend {
                         model.processor.resize_mode_type(),
                         Some(ResizeModeType::Letterbox)
                     ),
-                    "RF-DETR requires the qualified Letterbox preset"
+                    "RF-DETR requires the Letterbox preset"
                 );
                 let inputs = model.processor.process(std::slice::from_ref(image))?;
                 let outputs = engines.run(&usls::Module::Model, &inputs)?.into_inner();
                 let boxes = outputs
                     .get("pred_boxes")
+                    .or_else(|| outputs.get("boxes"))
                     .context("missing RF-DETR boxes")?
                     .try_extract_array::<f32>()
                     .context("RF-DETR boxes must be FP32 CPU-accessible tensors")?;
                 let logits = outputs
                     .get("pred_logits")
+                    .or_else(|| outputs.get("logits"))
                     .context("missing RF-DETR logits")?
                     .try_extract_array::<f32>()
                     .context("RF-DETR logits must be FP32 CPU-accessible tensors")?;
@@ -415,7 +399,7 @@ impl Backend {
                     model.processor.images_transform_info.len() == 1,
                     "unexpected RF-DETR transform count"
                 );
-                return decode_rfdetr(
+                decode_rfdetr(
                     (
                         boxes.shape(),
                         boxes.as_slice().context("noncontiguous RF-DETR boxes")?,
@@ -432,30 +416,126 @@ impl Backend {
                         .context("missing RF-DETR transform")?,
                     self.threshold,
                     self.cap,
-                );
+                )
             }
-            Inference::Rtdetr(runtime) => runtime.run(std::slice::from_ref(image))?,
-            Inference::Picodet(runtime) => runtime.run(std::slice::from_ref(image))?,
+            Inference::Rtdetr(runtime) => run_rtdetr(runtime, image, self.threshold, self.cap),
+            Inference::Picodet(runtime) => run_picodet(runtime, image, self.threshold, self.cap),
             #[cfg(test)]
-            Inference::Fixture(infer) => {
-                return sanitize(
-                    infer(image)?,
-                    image.width(),
-                    image.height(),
-                    self.threshold,
-                    self.cap,
-                );
-            }
-        };
-        decode(
-            self.profile,
-            results,
-            image.width(),
-            image.height(),
-            self.threshold,
-            self.cap,
-        )
+            Inference::Fixture(infer) => sanitize(
+                infer(image)?,
+                image.width(),
+                image.height(),
+                self.threshold,
+                self.cap,
+            ),
+        }
     }
+}
+
+fn run_rtdetr(
+    runtime: &mut Runtime<RTDETR>,
+    image: &Image,
+    threshold: f32,
+    cap: usize,
+) -> Result<Vec<Detection>> {
+    let (model, engines) = runtime.parts_mut();
+    ensure!(
+        matches!(
+            model.processor.resize_mode_type(),
+            Some(ResizeModeType::Letterbox)
+        ),
+        "RT-DETR requires the Letterbox preset"
+    );
+    let input = model.processor.process(std::slice::from_ref(image))?;
+    let sizes = X::from(vec![
+        f32::from(u16::try_from(model.height).context("model height exceeds bound")?),
+        f32::from(u16::try_from(model.width).context("model width exceeds bound")?),
+    ])
+    .insert_axis(0)?;
+    let outputs = engines
+        .run(&usls::Module::Model, usls::inputs![&input, sizes]?)?
+        .into_inner();
+    let labels = outputs
+        .get("labels")
+        .context("missing labels")?
+        .try_extract_array::<i64>()?;
+    let boxes = outputs
+        .get("boxes")
+        .context("missing boxes")?
+        .try_extract_array::<f32>()?;
+    let scores = outputs
+        .get("scores")
+        .context("missing scores")?
+        .try_extract_array::<f32>()?;
+    ensure!(
+        model.processor.images_transform_info.len() == 1,
+        "unexpected transform count"
+    );
+    decode_rtdetr(
+        (
+            labels.shape(),
+            labels.as_slice().context("noncontiguous labels")?,
+        ),
+        (
+            boxes.shape(),
+            boxes.as_slice().context("noncontiguous boxes")?,
+        ),
+        (
+            scores.shape(),
+            scores.as_slice().context("noncontiguous scores")?,
+        ),
+        model
+            .processor
+            .images_transform_info
+            .first()
+            .context("missing transform")?,
+        threshold,
+        cap,
+    )
+}
+
+fn run_picodet(
+    runtime: &mut Runtime<PicoDet>,
+    image: &Image,
+    threshold: f32,
+    cap: usize,
+) -> Result<Vec<Detection>> {
+    let (model, engines) = runtime.parts_mut();
+    let input = model.processor.process(std::slice::from_ref(image))?;
+    ensure!(
+        model.processor.images_transform_info.len() == 1,
+        "unexpected transform count"
+    );
+    let info = model
+        .processor
+        .images_transform_info
+        .first()
+        .context("missing transform")?;
+    let scales = X::from(vec![info.height_scale, info.width_scale]).insert_axis(0)?;
+    let outputs = engines
+        .run(&usls::Module::Model, usls::inputs![&input, scales]?)?
+        .into_inner();
+    let rows = outputs
+        .get("multiclass_nms3_0.tmp_0")
+        .context("missing PicoDet detections")?
+        .try_extract_array::<f32>()?;
+    let count = outputs
+        .get("multiclass_nms3_0.tmp_2")
+        .context("missing PicoDet count")?
+        .try_extract_array::<i32>()?;
+    decode_picodet(
+        (
+            rows.shape(),
+            rows.as_slice().context("noncontiguous detections")?,
+        ),
+        (
+            count.shape(),
+            count.as_slice().context("noncontiguous count")?,
+        ),
+        [image.width(), image.height()],
+        threshold,
+        cap,
+    )
 }
 
 fn decode_rfdetr(
@@ -522,30 +602,88 @@ fn decode_rfdetr(
     sanitize(detections, info.width_src, info.height_src, threshold, cap)
 }
 
-fn decode(
-    profile: Profile,
-    results: Vec<Y>,
-    width: u32,
-    height: u32,
+fn decode_rtdetr(
+    (label_shape, labels): (&[usize], &[i64]),
+    (box_shape, boxes): (&[usize], &[f32]),
+    (score_shape, scores): (&[usize], &[f32]),
+    info: &ImageTransformInfo,
     threshold: f32,
     cap: usize,
 ) -> Result<Vec<Detection>> {
     ensure!(
-        results.len() == 1,
-        "batch1 returned an unexpected number of results"
+        label_shape == [1, labels.len()]
+            && score_shape == [1, labels.len()]
+            && box_shape == [1, labels.len(), 4]
+            && scores.len() == labels.len()
+            && labels.len().checked_mul(4) == Some(boxes.len()),
+        "RT-DETR output shapes disagree: {label_shape:?}, {box_shape:?}, {score_shape:?}"
     );
-    let result = results.into_iter().next().context("missing result")?;
-    let mut boxes = Vec::new();
-    for bbox in result.hbbs {
-        let label = class_label(profile, bbox.id().context("missing class")?)?;
-        let (x1, y1, x2, y2) = bbox.xyxy();
-        boxes.push(Detection {
+    ensure!(
+        info.height_scale.is_finite()
+            && info.height_scale > 0.0
+            && info.width_pad.is_finite()
+            && info.height_pad.is_finite(),
+        "invalid RT-DETR letterbox geometry"
+    );
+    let mut detections = Vec::new();
+    for ((&label, &score), &[x1, y1, x2, y2]) in
+        labels.iter().zip(scores).zip(boxes.as_chunks::<4>().0)
+    {
+        let label = class_label(
+            Profile::RtdetrV1Coco,
+            usize::try_from(label).context("negative class")?,
+        )?;
+        ensure!(
+            [x1, y1, x2, y2].iter().all(|value| value.is_finite()),
+            "nonfinite detection"
+        );
+        detections.push(Detection {
             label: glib::Quark::from_str(label),
-            score: bbox.confidence().context("missing score")?,
-            xyxy: [f64::from(x1), f64::from(y1), f64::from(x2), f64::from(y2)],
+            score,
+            xyxy: [
+                (x1 - info.width_pad) / info.height_scale,
+                (y1 - info.height_pad) / info.height_scale,
+                (x2 - info.width_pad) / info.height_scale,
+                (y2 - info.height_pad) / info.height_scale,
+            ]
+            .map(f64::from),
         });
     }
-    sanitize(boxes, width, height, threshold, cap)
+    sanitize(detections, info.width_src, info.height_src, threshold, cap)
+}
+
+fn decode_picodet(
+    (shape, rows): (&[usize], &[f32]),
+    (count_shape, counts): (&[usize], &[i32]),
+    [width, height]: [u32; 2],
+    threshold: f32,
+    cap: usize,
+) -> Result<Vec<Detection>> {
+    let count = match counts {
+        [count] => usize::try_from(*count).context("negative PicoDet count")?,
+        _ => anyhow::bail!("unexpected PicoDet count"),
+    };
+    ensure!(
+        count_shape == [1] && shape == [count, 6] && count.checked_mul(6) == Some(rows.len()),
+        "PicoDet output shapes disagree: {shape:?}, {count_shape:?}, count={count}"
+    );
+    let mut detections = Vec::new();
+    for &[class, score, x1, y1, x2, y2] in rows.as_chunks::<6>().0 {
+        // Comparing to the small integer domain also rejects fractional and nonfinite IDs.
+        #[expect(
+            clippy::float_cmp,
+            reason = "class IDs must equal an exactly representable integer"
+        )]
+        let label = (0_u8..80)
+            .find(|id| f32::from(*id) == class)
+            .context("invalid PicoDet COCO80 class")?;
+        detections.push(Detection {
+            label: glib::Quark::from_str(class_label(Profile::PicodetCoco, usize::from(label))?),
+            score,
+            xyxy: [x1, y1, x2, y2].map(f64::from),
+        });
+    }
+    sanitize(detections, width, height, threshold, cap)
 }
 
 pub(crate) fn sanitize(
@@ -580,7 +718,7 @@ pub(crate) fn sanitize(
 }
 
 fn class_label(profile: Profile, id: usize) -> Result<&'static str> {
-    let index = if profile == Profile::RfdetrNano {
+    let index = if profile.is_rfdetr() {
         COCO_CATEGORY_IDS
             .binary_search(&id)
             .map_err(|_error| anyhow::anyhow!("unexpected RF-DETR background/gap class {id}"))?
@@ -741,7 +879,7 @@ mod tests {
         Ok(())
     }
 
-    const PROFILES: [Profile; 8] = [
+    const PROFILES: [Profile; 17] = [
         Profile::RfdetrNano,
         Profile::RtdetrV1R18,
         Profile::RtdetrV2S,
@@ -750,12 +888,21 @@ mod tests {
         Profile::DfineNCoco,
         Profile::DeimDfineSCoco,
         Profile::Deimv2AttoCoco,
+        Profile::RfdetrCoco,
+        Profile::RtdetrV1Coco,
+        Profile::RtdetrV2Coco,
+        Profile::RtdetrV4Coco,
+        Profile::PicodetCoco,
+        Profile::DfineCoco,
+        Profile::DeimDfineCoco,
+        Profile::Deimv2Hgnetv2Coco,
+        Profile::Deimv2Dinov3Coco,
     ];
 
     #[test]
     fn labels_cover_dense_and_sparse_coco() -> Result<()> {
         for profile in PROFILES {
-            let ids = if profile == Profile::RfdetrNano {
+            let ids = if profile.is_rfdetr() {
                 [1, 13, 84, 90]
             } else {
                 [0, 11, 73, 79]
@@ -771,7 +918,7 @@ mod tests {
             }
             class_label(profile, 91).expect_err("out of range");
             class_label(profile, usize::MAX).expect_err("out of range");
-            if profile != Profile::RfdetrNano {
+            if !profile.is_rfdetr() {
                 class_label(profile, 80).expect_err("dense COCO80 upper bound");
             }
         }
@@ -779,34 +926,15 @@ mod tests {
     }
 
     #[test]
-    fn profiles_reject_unqualified_units_and_model_files() -> Result<()> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-        let mut hashes = std::collections::HashSet::new();
+    fn profiles_reject_unqualified_units() -> Result<()> {
         for profile in PROFILES {
-            ensure!(
-                hashes.insert(profile.artifact().0),
-                "each profile pins its own graph"
-            );
-            ensure!(
-                verify_model(&path, profile)
-                    .expect_err("wrong model/profile")
-                    .to_string()
-                    .contains("length differs"),
-                "reject before session initialization"
-            );
             verify_units(profile, Provider::Coreml, ComputeUnits::CpuAndGpu)?;
             for units in [ComputeUnits::All, ComputeUnits::CpuAndNeuralEngine] {
                 verify_units(profile, Provider::Cpu, units)?;
                 if profile == Profile::RfdetrNano {
                     verify_units(profile, Provider::Coreml, units)?;
                 } else {
-                    ensure!(
-                        verify_units(profile, Provider::Coreml, units)
-                            .expect_err("unqualified units")
-                            .to_string()
-                            .contains("unqualified"),
-                        "explicit provider rejection"
-                    );
+                    verify_units(profile, Provider::Coreml, units).expect_err("unqualified units");
                 }
             }
         }
@@ -814,30 +942,58 @@ mod tests {
     }
 
     #[test]
-    fn same_length_model_corruption_is_rejected_by_hash() -> Result<()> {
-        let profile = Profile::Deimv2AttoCoco;
-        let path = std::env::temp_dir().join(format!(
-            "gstsmith-usls-wrong-hash-{}-{}.onnx",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        ));
-        let file = File::options().write(true).create_new(true).open(&path)?;
-        let result = (|| -> Result<()> {
-            file.set_len(profile.artifact().1)?;
-            let error = verify_model(&path, profile)
-                .err()
-                .context("same-length corrupt model must fail")?;
+    fn model_file_must_exist_locally() -> Result<()> {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"));
+        verify_model(directory).expect_err("directory is not a model");
+        verify_model(&directory.join("missing.onnx")).expect_err("no implicit downloads");
+        verify_model(&directory.join("Cargo.toml"))?; // ORT validates the contents at startup.
+        Ok(())
+    }
+
+    #[test]
+    fn aliases_preserve_preprocessing_and_dinov3_normalizes() -> Result<()> {
+        for (alias, family) in [
+            (Profile::RfdetrNano, Profile::RfdetrCoco),
+            (Profile::RtdetrV1R18, Profile::RtdetrV1Coco),
+            (Profile::RtdetrV2S, Profile::RtdetrV2Coco),
+            (Profile::RtdetrV4S, Profile::RtdetrV4Coco),
+            (Profile::PicodetLCoco, Profile::PicodetCoco),
+            (Profile::DfineNCoco, Profile::DfineCoco),
+            (Profile::DeimDfineSCoco, Profile::DeimDfineCoco),
+            (Profile::Deimv2AttoCoco, Profile::Deimv2Hgnetv2Coco),
+        ] {
             ensure!(
-                error.to_string().contains("expected SHA256"),
-                "same-length corruption must reach the SHA256 check: {error}"
+                alias.config().image_processor() == family.config().image_processor(),
+                "alias preprocessing"
             );
-            Ok(())
-        })();
-        drop(file);
-        std::fs::remove_file(&path)?;
-        result
+            ensure!(
+                alias.is_rfdetr() == family.is_rfdetr()
+                    && alias.is_picodet() == family.is_picodet(),
+                "alias decoder"
+            );
+        }
+        let hgnet = Profile::Deimv2Hgnetv2Coco.config();
+        let dino = Profile::Deimv2Dinov3Coco.config();
+        ensure!(
+            hgnet.image_processor().image_mean.is_none()
+                && hgnet.image_processor().image_std.is_none(),
+            "HGNetv2 only scales pixels"
+        );
+        ensure!(
+            dino.image_processor()
+                .image_mean
+                .map(|v| v.map(f32::to_bits))
+                == Some([0.485_f32, 0.456, 0.406].map(f32::to_bits)),
+            "DINOv3 mean"
+        );
+        ensure!(
+            dino.image_processor()
+                .image_std
+                .map(|v| v.map(f32::to_bits))
+                == Some([0.229_f32, 0.224, 0.225].map(f32::to_bits)),
+            "DINOv3 std"
+        );
+        Ok(())
     }
 
     fn attrs(
@@ -853,76 +1009,238 @@ mod tests {
         }
     }
 
-    #[test]
-    fn model_specific_tensor_contracts_reject_mismatches() -> Result<()> {
+    fn contract(profile: Profile, size: usize, queries: usize) -> (OrtTensorAttr, OrtTensorAttr) {
         use TensorElementType::{Float32, Int32, Int64};
-        // Observed contracts of the exact qualified graphs; no model assets required.
-        for (profile, size, batch) in [
-            (Profile::RfdetrNano, 384, 1),
-            (Profile::RtdetrV1R18, 640, 1),
-            (Profile::RtdetrV2S, 640, 1),
-            (Profile::RtdetrV4S, 640, 1),
-            (Profile::PicodetLCoco, 640, 1),
-            (Profile::DfineNCoco, 640, 0),
-            (Profile::DeimDfineSCoco, 640, 0),
-            (Profile::Deimv2AttoCoco, 320, 1),
-        ] {
-            let (inputs, outputs) = match profile {
-                Profile::RfdetrNano => (
-                    attrs(&["images"], vec![vec![1, 3, 384, 384]], vec![Float32]),
-                    attrs(
-                        &["pred_boxes", "pred_logits"],
-                        vec![vec![1, 0, 4], vec![1, 0, 91]],
-                        vec![Float32, Float32],
-                    ),
+        if profile.is_rfdetr() {
+            (
+                attrs(&["images"], vec![vec![1, 3, size, size]], vec![Float32]),
+                attrs(
+                    &["pred_boxes", "pred_logits"],
+                    vec![vec![1, queries, 4], vec![1, queries, 91]],
+                    vec![Float32, Float32],
                 ),
-                Profile::PicodetLCoco => (
-                    attrs(
-                        &["image", "scale_factor"],
-                        vec![vec![1, 3, 640, 640], vec![1, 2]],
-                        vec![Float32, Float32],
-                    ),
-                    attrs(
-                        &["multiclass_nms3_0.tmp_0", "multiclass_nms3_0.tmp_2"],
-                        vec![vec![0, 6], vec![1]],
-                        vec![Float32, Int32],
-                    ),
+            )
+        } else if profile.is_picodet() {
+            (
+                attrs(
+                    &["image", "scale_factor"],
+                    vec![vec![1, 3, size, size], vec![1, 2]],
+                    vec![Float32, Float32],
                 ),
-                _ => (
-                    attrs(
-                        &["images", "orig_target_sizes"],
-                        vec![vec![1, 3, size, size], vec![1, 2]],
-                        vec![Float32, Int64],
-                    ),
-                    attrs(
-                        &["labels", "boxes", "scores"],
-                        vec![vec![batch, 300], vec![batch, 300, 4], vec![batch, 300]],
-                        vec![Int64, Float32, Float32],
-                    ),
+                attrs(
+                    &["multiclass_nms3_0.tmp_0", "multiclass_nms3_0.tmp_2"],
+                    vec![vec![queries, 6], vec![1]],
+                    vec![Float32, Int32],
                 ),
-            };
-            verify_contract(profile, &inputs, &outputs)?;
-            let mut wrong = inputs.clone();
+            )
+        } else {
+            (
+                attrs(
+                    &["images", "orig_target_sizes"],
+                    vec![vec![1, 3, size, size], vec![1, 2]],
+                    vec![Float32, Int64],
+                ),
+                attrs(
+                    &["labels", "boxes", "scores"],
+                    vec![vec![1, queries], vec![1, queries, 4], vec![1, queries]],
+                    vec![Int64, Float32, Float32],
+                ),
+            )
+        }
+    }
+
+    #[test]
+    fn tensor_contracts_accept_sizes_and_symbolic_outputs() -> Result<()> {
+        for profile in PROFILES {
+            for size in [320, 384, 640, 704] {
+                for queries in [0, 100, 300, 500] {
+                    let (inputs, mut outputs) = contract(profile, size, queries);
+                    verify_contract(profile, &inputs, &outputs)?;
+                    for shape in &mut outputs.dimss {
+                        shape.fill(0);
+                    }
+                    verify_contract(profile, &inputs, &outputs)?;
+                }
+            }
+        }
+        let (inputs, mut outputs) = contract(Profile::RfdetrCoco, 704, 300);
+        outputs.names = vec!["boxes".into(), "logits".into()];
+        verify_contract(Profile::RfdetrCoco, &inputs, &outputs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tensor_contracts_reject_incompatible_graphs() -> Result<()> {
+        for profile in PROFILES {
+            let (inputs, outputs) = contract(profile, 640, 300);
+            for shape in [
+                vec![1, 3, 640],
+                vec![0, 3, 640, 640],
+                vec![2, 3, 640, 640],
+                vec![1, 4, 640, 640],
+                vec![1, 3, 0, 0],
+                vec![1, 3, 320, 640],
+                vec![1, 3, 65536, 65536],
+            ] {
+                let mut wrong = inputs.clone();
+                *wrong.dimss.first_mut().context("image input")? = shape;
+                verify_contract(profile, &wrong, &outputs).expect_err("invalid image shape");
+            }
+            for output in [false, true] {
+                let mut wrong = if output {
+                    outputs.clone()
+                } else {
+                    inputs.clone()
+                };
+                *wrong.names.first_mut().context("tensor name")? = "wrong".into();
+                if output {
+                    verify_contract(profile, &inputs, &wrong)
+                } else {
+                    verify_contract(profile, &wrong, &outputs)
+                }
+                .expect_err("invalid names");
+                let mut wrong = if output {
+                    outputs.clone()
+                } else {
+                    inputs.clone()
+                };
+                *wrong.dtypes.first_mut().context("dtype")? = TensorElementType::Float16;
+                if output {
+                    verify_contract(profile, &inputs, &wrong)
+                } else {
+                    verify_contract(profile, &wrong, &outputs)
+                }
+                .expect_err("invalid precision");
+            }
+            let mut wrong = outputs.clone();
+            wrong.names.push("masks".into());
+            wrong.dimss.push(vec![1, 300, 640, 640]);
+            wrong.dtypes.push(TensorElementType::Float32);
+            verify_contract(profile, &inputs, &wrong).expect_err("segmentation is unsupported");
+            let mut wrong = outputs.clone();
+            wrong.dimss.first_mut().context("output shape")?.pop();
+            verify_contract(profile, &inputs, &wrong).expect_err("invalid output rank");
+            let mut wrong = outputs.clone();
             *wrong
                 .dimss
-                .first_mut()
-                .context("image input")?
-                .first_mut()
-                .context("batch")? = 2;
-            verify_contract(profile, &wrong, &outputs).expect_err("batch mismatch");
-            let mut wrong = inputs.clone();
-            *wrong.dtypes.first_mut().context("image dtype")? = TensorElementType::Float16;
-            verify_contract(profile, &wrong, &outputs).expect_err("precision mismatch");
-            let mut wrong = outputs.clone();
-            *wrong.names.first_mut().context("output name")? = "unqualified".into();
-            verify_contract(profile, &inputs, &wrong).expect_err("output mismatch");
-            let different = if profile == Profile::RfdetrNano {
-                Profile::RtdetrV2S
-            } else {
-                Profile::RfdetrNano
-            };
-            verify_contract(different, &inputs, &outputs).expect_err("wrong profile contract");
+                .get_mut(1)
+                .context("second output")?
+                .last_mut()
+                .context("dimension")? = 90;
+            verify_contract(profile, &inputs, &wrong)
+                .expect_err("invalid class, box or count dimension");
+            if !profile.is_picodet() {
+                let mut wrong = outputs.clone();
+                *wrong
+                    .dimss
+                    .first_mut()
+                    .context("output")?
+                    .first_mut()
+                    .context("batch")? = 2;
+                verify_contract(profile, &inputs, &wrong).expect_err("invalid output batch");
+                let mut wrong = outputs.clone();
+                *wrong
+                    .dimss
+                    .first_mut()
+                    .context("output")?
+                    .get_mut(1)
+                    .context("queries")? = 299;
+                verify_contract(profile, &inputs, &wrong).expect_err("query counts disagree");
+            }
+            if !profile.is_rfdetr() {
+                let mut wrong = inputs.clone();
+                wrong.names.swap(0, 1);
+                verify_contract(profile, &wrong, &outputs)
+                    .expect_err("positional inputs reordered");
+                let mut wrong = inputs.clone();
+                *wrong.dimss.get_mut(1).context("auxiliary input")? = vec![0, 2];
+                verify_contract(profile, &wrong, &outputs).expect_err("dynamic auxiliary batch");
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn checked_dense_decoders_reject_invalid_rows_and_preserve_geometry() -> Result<()> {
+        let info = ImageTransformInfo {
+            width_src: 400,
+            height_src: 200,
+            height_scale: 0.5,
+            height_pad: 50.0,
+            ..ImageTransformInfo::default()
+        };
+        let boxes = [-5.0, 60.0, 15.0, 80.0];
+        let run = |labels: &[i64], boxes: &[f32], scores: &[f32]| {
+            decode_rtdetr(
+                (&[1, labels.len()], labels),
+                (&[1, 1, 4], boxes),
+                (&[1, scores.len()], scores),
+                &info,
+                0.5,
+                100,
+            )
+        };
+        let detections = run(&[73], &boxes, &[0.9])?;
+        let bbox = detections.first().context("detection")?;
+        ensure!(
+            bbox.label.as_str() == "book"
+                && bbox.xyxy.map(f64::to_bits) == [0.0_f64, 20.0, 30.0, 60.0].map(f64::to_bits),
+            "independent endpoint clipping"
+        );
+        for labels in [&[-1_i64][..], &[80][..], &[][..], &[0, 1][..]] {
+            run(labels, &boxes, &[0.9]).expect_err("invalid labels/count");
+        }
+        for score in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+            run(&[0], &boxes, &[score]).expect_err("invalid confidence, including below threshold");
+        }
+        run(&[0], &[f32::NAN; 4], &[0.1]).expect_err("nonfinite low-score box");
+        run(&[0], &boxes, &[]).expect_err("no silent truncation");
+        let run = |rows: &[f32], count: i32| {
+            decode_picodet((&[1, 6], rows), (&[1], &[count]), [400, 200], 0.5, 100)
+        };
+        let detections = run(&[73.0, 0.9, -10.0, 20.0, 30.0, 60.0], 1)?;
+        ensure!(
+            detections
+                .first()
+                .context("PicoDet result")?
+                .xyxy
+                .map(f64::to_bits)
+                == bbox.xyxy.map(f64::to_bits),
+            "PicoDet coordinates are already in source space"
+        );
+        ensure!(
+            run(&[-0.0, 0.9, 0.0, 0.0, 1.0, 1.0], 1)?
+                .first()
+                .context("zero class")?
+                .label
+                .as_str()
+                == "person",
+            "signed zero is class zero"
+        );
+        for class in [-1.0, 0.5, 80.0, f32::NAN, f32::INFINITY] {
+            run(&[class, 0.1, 0.0, 0.0, 1.0, 1.0], 1)
+                .expect_err("invalid class, including below threshold");
+        }
+        for count in [-1, 0, 2] {
+            run(&[0.0; 6], count).expect_err("invalid count");
+        }
+        run(&[0.0; 5], 1).expect_err("incomplete row");
+        ensure!(
+            decode_rtdetr(
+                (&[1, 0], &[]),
+                (&[1, 0, 4], &[]),
+                (&[1, 0], &[]),
+                &info,
+                0.5,
+                100
+            )?
+            .is_empty(),
+            "empty RT-DETR"
+        );
+        ensure!(
+            decode_picodet((&[0, 6], &[]), (&[1], &[0]), [400, 200], 0.5, 100)?.is_empty(),
+            "empty PicoDet"
+        );
         Ok(())
     }
 

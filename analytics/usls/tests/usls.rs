@@ -33,6 +33,38 @@ fn factory_registers_without_assets_and_requires_a_model() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn malformed_local_model_fails_at_startup() -> Result<()> {
+    initialize()?;
+    let pipeline = gst::Pipeline::new();
+    let element = gst::ElementFactory::make("uslsobjectdetect").build()?;
+    pipeline.add(&element)?;
+    element.set_property(
+        "model-file",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+    );
+    element.set_property_from_str("model-profile", "deimv2-dinov3-coco");
+    let _failure = element
+        .set_state(gst::State::Paused)
+        .expect_err("malformed ONNX");
+    let message = pipeline
+        .bus()
+        .context("bus")?
+        .timed_pop_filtered(gst::ClockTime::from_seconds(1), &[gst::MessageType::Error])
+        .context("model error message")?;
+    let gst::MessageView::Error(error) = message.view() else {
+        anyhow::bail!("expected error");
+    };
+    ensure!(
+        error
+            .debug()
+            .is_some_and(|debug| debug.contains("Protobuf") || debug.contains("INVALID_PROTOBUF")),
+        "ONNX parser error: {error:?}"
+    );
+    pipeline.set_state(gst::State::Null)?;
+    Ok(())
+}
+
 #[cfg(not(all(feature = "coreml", target_os = "macos", target_arch = "aarch64")))]
 #[test]
 fn unavailable_coreml_fails_explicitly() -> Result<()> {
@@ -75,6 +107,15 @@ fn new_profiles_reject_unqualified_coreml_units_before_model_load() -> Result<()
         "dfine-n-coco",
         "deim-dfine-s-coco",
         "deimv2-atto-coco",
+        "rfdetr-coco",
+        "rtdetr-v1-coco",
+        "rtdetr-v2-coco",
+        "rtdetr-v4-coco",
+        "picodet-coco",
+        "dfine-coco",
+        "deim-dfine-coco",
+        "deimv2-hgnetv2-coco",
+        "deimv2-dinov3-coco",
     ] {
         for units in ["all", "cpu-and-neural-engine"] {
             let pipeline = gst::Pipeline::new();
@@ -147,7 +188,7 @@ fn verify_detections(buffer: &gst::BufferRef, width: u32, height: u32) -> Result
 }
 
 #[test]
-#[ignore = "requires exact local qualified graph and person JPEG sample; no downloads"]
+#[ignore = "requires local compatible graph and person JPEG sample; no downloads"]
 fn real_model() -> Result<()> {
     initialize()?;
     let model = PathBuf::from(

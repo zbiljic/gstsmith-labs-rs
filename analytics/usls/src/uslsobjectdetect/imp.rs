@@ -72,12 +72,12 @@ impl ObjectImpl for UslsObjectDetect {
         static PROPERTIES: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
             vec![
                 glib::ParamSpecEnum::builder::<Profile>("model-profile")
-                    .blurb("Qualified detector profile; model-file must match this profile")
+                    .blurb("COCO detector family and preprocessing; model-file must match this profile")
                     .default_value(Profile::RfdetrNano)
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecString::builder("model-file")
-                    .blurb("Required local qualified FP32 batch1 ONNX graph for model-profile")
+                    .blurb("Required local compatible FP32 batch1 ONNX graph for model-profile")
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecFloat::builder("score-threshold")
@@ -517,6 +517,11 @@ mod tests {
                 "streaming mutation rejected"
             );
         }
+        e.set_property_from_str("model-profile", "deimv2-dinov3-coco");
+        ensure!(
+            e.property::<Profile>("model-profile") == Profile::Deimv2Dinov3Coco,
+            "family selection after stop"
+        );
         e.set_property_from_str("model-profile", "deimv2-atto-coco");
         ensure!(
             e.property::<Profile>("model-profile") == Profile::Deimv2AttoCoco,

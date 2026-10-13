@@ -26,7 +26,7 @@ description = "Run the opt-in usls real-model CPU smoke test"
 dir = "{{config_root}}/../.."
 env.GSTSMITH_USLS_PROVIDER = "cpu"
 run = '''
-: "${GSTSMITH_USLS_MODEL:?GSTSMITH_USLS_MODEL must name the local qualified graph}"
+: "${GSTSMITH_USLS_MODEL:?GSTSMITH_USLS_MODEL must name the local compatible ONNX graph}"
 : "${GSTSMITH_USLS_SAMPLE:?GSTSMITH_USLS_SAMPLE must name the local person JPEG}"
 cargo test --release --locked -p gst-plugin-usls --test usls real_model -- --ignored --nocapture
 '''
@@ -36,7 +36,7 @@ description = "Run the opt-in usls real-model CoreML CPU+GPU smoke test"
 dir = "{{config_root}}/../.."
 env.GSTSMITH_USLS_PROVIDER = "coreml"
 run = '''
-: "${GSTSMITH_USLS_MODEL:?GSTSMITH_USLS_MODEL must name the local qualified graph}"
+: "${GSTSMITH_USLS_MODEL:?GSTSMITH_USLS_MODEL must name the local compatible ONNX graph}"
 : "${GSTSMITH_USLS_SAMPLE:?GSTSMITH_USLS_SAMPLE must name the local person JPEG}"
 cargo test --release --locked -p gst-plugin-usls --features coreml --test usls real_model -- --ignored --nocapture
 '''

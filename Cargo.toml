@@ -23,7 +23,6 @@ gst-video = { package = "gstreamer-video", version = "0.25.4" }
 h264-reader = "0.9.0"
 memchr = "2.8.3"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "api-28"] }
-sha2 = "0.10"
 usls = { git = "https://github.com/jamjamjon/usls", rev = "c15ad77c1879dbf1117376d34d3022a325cd9cdc", default-features = false, features = ["vision", "ort-download-binaries", "ort-api-28"] }
 
 [workspace.lints.rust]

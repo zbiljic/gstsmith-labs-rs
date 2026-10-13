@@ -30,7 +30,6 @@ gst-analytics = { workspace = true }
 gst-base = { workspace = true, features = ["v1_28"] }
 gst-video = { workspace = true, features = ["v1_28"] }
 ort = { workspace = true }
-sha2 = { workspace = true }
 usls = { workspace = true }
 
 # Non-macOS platforms reject CoreML before session creation. Cargo still forwards
