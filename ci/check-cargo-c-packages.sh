@@ -30,6 +30,7 @@ pc_dir="$libdir/pkgconfig"
 # Cargo package | cargo-c library/.pc stem | GStreamer plugin | element names
 packages=(
   "gst-plugin-nalsense|gstnalsense|nalsense|nalsenseactivity nalsensereplay"
+  "gst-plugin-usls|gstusls|usls|uslsobjectdetect"
 )
 
 # Optional explicit package selection keeps NALSense validation on GStreamer 1.24.
@@ -201,9 +202,10 @@ compile_static_consumer() {
   local source="$1"
   local binary="$2"
   local module="$3"
+  shift 3
   local -a static_flags
   read -r -a static_flags <<<"$(pkg-config --static --cflags --libs "$module")"
-  cc "$source" -o "$binary" "${static_flags[@]}"
+  cc "$source" -o "$binary" "${static_flags[@]}" "$@"
 }
 
 export GST_REGISTRY="$stage_root/static-registry.bin"
@@ -217,7 +219,18 @@ for mapping in "${packages[@]}"; do
     "GST_PLUGIN_STATIC_DECLARE($plugin);" \
     "  GST_PLUGIN_STATIC_REGISTER($plugin);" \
     "!registry_has_plugin(registry, \"$plugin\")"
-  compile_static_consumer "$static_source" "$static_binary" "$stem"
+  static_extra_flags=()
+  if [[ "$plugin" == "usls" && "$(uname -s)" == "Darwin" ]]; then
+    # ort-sys emits clang_rt.osx; cargo-c preserves the library name, but its
+    # private pkg-config flags cannot infer the consumer's compiler resource dir.
+    runtime_dir="$(cc --print-runtime-dir)"
+    test -n "$runtime_dir" || fail "cc --print-runtime-dir returned an empty directory"
+    test -d "$runtime_dir" || fail "cc runtime directory does not exist: $runtime_dir"
+    test -f "$runtime_dir/libclang_rt.osx.a" ||
+      fail "cc runtime directory lacks libclang_rt.osx.a: $runtime_dir"
+    static_extra_flags+=("-L$runtime_dir")
+  fi
+  compile_static_consumer "$static_source" "$static_binary" "$stem" "${static_extra_flags[@]}"
   "$static_binary"
 done
 

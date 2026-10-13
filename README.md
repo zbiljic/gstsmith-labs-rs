@@ -19,10 +19,17 @@ are being established before promotion to
       dormant, then replay it and resume live forwarding when activity wakes
       the gate.
 
+  - [`usls`](analytics/usls/): Inference elements powered by
+    [usls](https://github.com/jamjamjon/usls).
+    - `uslsobjectdetect`: The first element, supporting qualified RF-DETR Nano,
+      RT-DETR v1/v2/v4, PicoDet, D-FINE, DEIM and DEIMv2 FP32 batch-one profiles
+      with CPU and optional CoreML, preserving the original RGB frame.
+
 ## Building
 
-The workspace requires GStreamer 1.24 or newer. Development requires the
-GStreamer headers and pkg-config files, the base runtime plugins, H.264 and
+The full workspace requires GStreamer 1.28 or newer. NALSense independently
+supports GStreamer 1.24 (`cargo build -p gst-plugin-nalsense`). Development requires
+the GStreamer headers and pkg-config files, the base runtime plugins, H.264 and
 H.265 parsers, and the `gst-inspect-1.0` and `gst-launch-1.0` command-line tools.
 On Ubuntu, install the corresponding packages:
 
@@ -35,7 +42,8 @@ sudo apt-get install --no-install-recommends \
   gstreamer1.0-libav \
   gstreamer1.0-tools \
   libgstreamer1.0-dev \
-  libgstreamer-plugins-base1.0-dev
+  libgstreamer-plugins-base1.0-dev \
+  libgstreamer-plugins-bad1.0-dev
 ```
 
 For macOS and other distributions, follow the

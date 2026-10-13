@@ -1,0 +1,61 @@
+[package]
+name = "gst-plugin-usls"
+version = { workspace = true }
+description = "GStreamer inference elements powered by usls."
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+readme = "README.md"
+repository = { workspace = true }
+
+[package.metadata.capi]
+min_version = "0.9.21"
+
+[package.metadata.capi.header]
+enabled = false
+
+[package.metadata.capi.library]
+install_subdir = "gstreamer-1.0"
+versioning = false
+import_library = false
+
+[package.metadata.capi.pkg_config]
+requires_private = "gstreamer-1.0 >= 1.28, gstreamer-base-1.0 >= 1.28, gstreamer-video-1.0 >= 1.28, gstreamer-analytics-1.0 >= 1.28, gobject-2.0, glib-2.0, gmodule-2.0"
+
+[dependencies]
+anyhow = { workspace = true }
+gst = { workspace = true, features = ["v1_28"] }
+gst-analytics = { workspace = true }
+gst-base = { workspace = true, features = ["v1_28"] }
+gst-video = { workspace = true, features = ["v1_28"] }
+ort = { workspace = true }
+sha2 = { workspace = true }
+usls = { workspace = true }
+
+# Non-macOS platforms reject CoreML before session creation. Cargo still forwards
+# the feature, so permit ort-sys to select its CPU distribution on those targets.
+# macOS retains strict distribution matching and verified CoreML placement.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ort = { workspace = true, features = ["lax-feature-matching"] }
+
+[features]
+default = []
+static = []
+capi = []
+doc = ["gst/v1_28", "gst-base/v1_28", "gst-video/v1_28", "gst-analytics/v1_28"]
+coreml = ["usls/coreml"]
+
+[lib]
+name = "gstusls"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[build-dependencies]
+gst-plugin-version-helper = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+gst-check = { workspace = true, features = ["v1_28"] }

@@ -91,6 +91,8 @@ jobs:
           gst-inspect-1.0 nalsense
           gst-inspect-1.0 nalsenseactivity
           gst-inspect-1.0 nalsensereplay
+          gst-inspect-1.0 usls
+          gst-inspect-1.0 uslsobjectdetect
 
       - name: Read minimum supported Rust version
         run: |
@@ -143,3 +145,30 @@ jobs:
           gst-inspect-1.0 nalsense
           gst-inspect-1.0 nalsenseactivity
           gst-inspect-1.0 nalsensereplay
+
+  usls-coreml:
+    name: Check optional CoreML build on macOS
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install GStreamer
+        run: |
+          brew install gstreamer
+          pkg-config --atleast-version=1.28 gstreamer-1.0
+      - name: Setup mise
+        uses: jdx/mise-action@v5
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Test and lint optional CoreML
+        run: |
+          cargo test --locked -p gst-plugin-usls --all-targets --features coreml
+          cargo clippy --locked -p gst-plugin-usls --all-targets --features coreml -- -D warnings
+          cargo build --locked -p gst-plugin-usls --features coreml
+      - name: Inspect asset-free plugin
+        env:
+          GST_PLUGIN_PATH: ${{ github.workspace }}/target/debug
+        run: |
+          gst-inspect-1.0 usls
+          gst-inspect-1.0 uslsobjectdetect

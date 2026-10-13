@@ -1,0 +1,42 @@
+[tasks.test]
+description = "Run usls CPU tests without model assets"
+depends = []
+dir = "{{config_root}}/../.."
+run = "cargo test --locked -p gst-plugin-usls --all-targets"
+
+[tasks."test:coreml"]
+description = "Run usls tests with optional CoreML support"
+dir = "{{config_root}}/../.."
+run = "cargo test --locked -p gst-plugin-usls --all-targets --features coreml"
+
+[tasks.build]
+description = "Build the usls CPU plugin"
+depends = []
+dir = "{{config_root}}/../.."
+run = "cargo build --locked -p gst-plugin-usls"
+
+[tasks.inspect]
+description = "Build and inspect uslsobjectdetect"
+depends = ["build"]
+dir = "{{config_root}}/../.."
+run = 'GST_PLUGIN_PATH="$PWD/target/debug${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" gst-inspect-1.0 uslsobjectdetect'
+
+[tasks."smoke:cpu"]
+description = "Run the opt-in usls real-model CPU smoke test"
+dir = "{{config_root}}/../.."
+env.GSTSMITH_USLS_PROVIDER = "cpu"
+run = '''
+: "${GSTSMITH_USLS_MODEL:?GSTSMITH_USLS_MODEL must name the local qualified graph}"
+: "${GSTSMITH_USLS_SAMPLE:?GSTSMITH_USLS_SAMPLE must name the local person JPEG}"
+cargo test --release --locked -p gst-plugin-usls --test usls real_model -- --ignored --nocapture
+'''
+
+[tasks."smoke:coreml"]
+description = "Run the opt-in usls real-model CoreML CPU+GPU smoke test"
+dir = "{{config_root}}/../.."
+env.GSTSMITH_USLS_PROVIDER = "coreml"
+run = '''
+: "${GSTSMITH_USLS_MODEL:?GSTSMITH_USLS_MODEL must name the local qualified graph}"
+: "${GSTSMITH_USLS_SAMPLE:?GSTSMITH_USLS_SAMPLE must name the local person JPEG}"
+cargo test --release --locked -p gst-plugin-usls --features coreml --test usls real_model -- --ignored --nocapture
+'''
