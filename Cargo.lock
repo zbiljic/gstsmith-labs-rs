@@ -750,10 +750,12 @@ dependencies = [
 name = "gst-plugin-jsontap"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "gst-plugin-version-helper",
  "gstreamer",
  "gstreamer-base",
  "gstreamer-check",
+ "serde",
  "serde_json",
  "tempfile",
 ]

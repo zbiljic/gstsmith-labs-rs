@@ -26,6 +26,7 @@ requires_private = "gstreamer-1.0 >= 1.24, gstreamer-base-1.0 >= 1.24, gobject-2
 [dependencies]
 gst = { workspace = true }
 gst-base = { workspace = true }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.151"
 
 [features]
@@ -39,8 +40,13 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dev-dependencies]
+criterion = { workspace = true }
 gst-check = { workspace = true }
 tempfile = "3.27.0"
+
+[[bench]]
+name = "hot_path"
+harness = false
 
 [lints]
 workspace = true

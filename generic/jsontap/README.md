@@ -58,3 +58,10 @@ cargo check -p gst-plugin-jsontap --all-targets
 cargo test -p gst-plugin-jsontap --all-targets
 cargo clippy -p gst-plugin-jsontap --all-targets -- -D warnings
 ```
+
+Benchmark plain buffers and nested custom metadata in push mode (a null device
+and a temporary file) and pull mode (a null device):
+
+```sh
+cargo bench --locked -p gst-plugin-jsontap --bench hot_path
+```

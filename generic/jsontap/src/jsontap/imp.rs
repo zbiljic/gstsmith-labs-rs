@@ -27,6 +27,16 @@ struct State {
     seq: u64,
 }
 
+impl State {
+    fn write(&mut self, value: &impl serde::Serialize) -> Result<(), gst::ErrorMessage> {
+        // shortcut: file writes can block streaming, use an async writer if live isolation is needed.
+        serde_json::to_writer(&mut self.writer, value)
+            .map_err(std::io::Error::from)
+            .and_then(|()| self.writer.write_all(b"\n"))
+            .map_err(|err| gst::error_msg!(gst::ResourceError::Write, ["writing record: {err}"]))
+    }
+}
+
 #[derive(Default)]
 pub struct JsonTap {
     settings: Mutex<Settings>,
@@ -38,7 +48,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl JsonTap {
-    fn write(&self, value: &serde_json::Value) -> Result<(), gst::ErrorMessage> {
+    fn write(&self, value: &impl serde::Serialize) -> Result<(), gst::ErrorMessage> {
         let mut state = lock(&self.state);
         let Some(state) = state.as_mut() else {
             return Err(gst::error_msg!(
@@ -46,11 +56,7 @@ impl JsonTap {
                 ["jsontap is not started"]
             ));
         };
-        // shortcut: file writes can block streaming, use an async writer if live isolation is needed.
-        serde_json::to_writer(&mut state.writer, value)
-            .map_err(std::io::Error::from)
-            .and_then(|()| state.writer.write_all(b"\n"))
-            .map_err(|err| gst::error_msg!(gst::ResourceError::Write, ["writing record: {err}"]))
+        state.write(value)
     }
 
     fn flush(&self) -> Result<(), gst::ErrorMessage> {
@@ -187,16 +193,18 @@ impl BaseTransformImpl for JsonTap {
         &self,
         buffer: &gst::Buffer,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
-        let seq = {
+        // Inspect metas before locking: GStreamer value serializers can call plugin code.
+        let mut record = record::buffer(buffer);
+        let result = {
             let mut state = lock(&self.state);
             let Some(state) = state.as_mut() else {
                 return Err(gst::FlowError::Flushing);
             };
-            let seq = state.seq;
-            state.seq = seq.saturating_add(1);
-            seq
+            record.seq = state.seq;
+            state.seq = state.seq.saturating_add(1);
+            state.write(&record)
         };
-        self.write(&record::buffer(seq, buffer)).map_err(|err| {
+        result.map_err(|err| {
             self.post_error_message(err);
             gst::FlowError::Error
         })?;
@@ -208,21 +216,29 @@ impl BaseTransformImpl for JsonTap {
 mod tests {
     use super::*;
 
-    #[test]
-    fn caps_write_failure_posts_a_resource_error() {
+    fn tap_with_read_only_writer(
+        capacity: usize,
+    ) -> (
+        super::super::JsonTap,
+        gst::Pipeline,
+        tempfile::NamedTempFile,
+    ) {
         gst::init().expect("GStreamer should initialize");
         let file = tempfile::NamedTempFile::new().expect("temporary file");
         let tap: super::super::JsonTap = glib::Object::new();
         let pipeline = gst::Pipeline::new();
         pipeline.add(&tap).expect("add tap");
         *lock(&tap.imp().state) = Some(State {
-            writer: BufWriter::with_capacity(1, File::open(file.path()).expect("read-only file")),
+            writer: BufWriter::with_capacity(
+                capacity,
+                File::open(file.path()).expect("read-only file"),
+            ),
             seq: 0,
         });
-        let caps = gst::Caps::builder("application/x-test").build();
-        tap.imp()
-            .set_caps(&caps, &caps)
-            .expect_err("read-only file rejects caps record");
+        (tap, pipeline, file)
+    }
+
+    fn assert_resource_write_error(pipeline: &gst::Pipeline) {
         let message = pipeline
             .bus()
             .expect("pipeline bus")
@@ -235,5 +251,37 @@ mod tests {
             error.error().kind::<gst::ResourceError>(),
             Some(gst::ResourceError::Write)
         );
+    }
+
+    #[test]
+    fn caps_write_failure_posts_a_resource_error() {
+        let (tap, pipeline, _file) = tap_with_read_only_writer(1);
+        let caps = gst::Caps::builder("application/x-test").build();
+        tap.imp()
+            .set_caps(&caps, &caps)
+            .expect_err("read-only file rejects caps record");
+        assert_resource_write_error(&pipeline);
+    }
+
+    #[test]
+    fn buffer_write_failure_posts_a_resource_error() {
+        let (tap, pipeline, _file) = tap_with_read_only_writer(1);
+        assert_eq!(
+            tap.imp().transform_ip_passthrough(&gst::Buffer::new()),
+            Err(gst::FlowError::Error),
+        );
+        assert_resource_write_error(&pipeline);
+    }
+
+    #[test]
+    fn stop_reports_flush_failure_and_closes_the_writer() {
+        let (tap, pipeline, _file) = tap_with_read_only_writer(8192);
+        tap.imp()
+            .transform_ip_passthrough(&gst::Buffer::new())
+            .expect("record is buffered");
+        let error = tap.imp().stop().expect_err("read-only file rejects flush");
+        tap.imp().post_error_message(error);
+        assert_resource_write_error(&pipeline);
+        assert!(lock(&tap.imp().state).is_none());
     }
 }

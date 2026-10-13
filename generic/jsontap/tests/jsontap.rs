@@ -83,6 +83,94 @@ fn stopping_without_eos_flushes_buffered_records() {
 }
 
 #[test]
+fn restarting_changes_location_and_resets_sequence_numbers() {
+    init();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first = dir.path().join("first.jsonl");
+    let second = dir.path().join("second.jsonl");
+    let tap = gst::ElementFactory::make("jsontap")
+        .property("location", first.to_str().expect("UTF-8 path"))
+        .build()
+        .expect("tap");
+    let mut h = gst_check::Harness::with_element(&tap, Some("sink"), Some("src"));
+    h.set_src_caps_str("application/x-test");
+    h.push(gst::Buffer::new()).expect("buffer pushes");
+    h.pull().expect("buffer passes through");
+
+    tap.set_state(gst::State::Ready).expect("ready");
+    assert_eq!(records(&first).len(), 2);
+    tap.set_property("location", second.to_str().expect("UTF-8 path"));
+    tap.set_state(gst::State::Playing).expect("playing");
+    assert!(h.push_event(gst::event::StreamStart::new("restarted")));
+    h.set_src_caps_str("application/x-test");
+    assert!(
+        h.push_event(gst::event::Segment::new(&gst::FormattedSegment::<
+            gst::ClockTime,
+        >::new()))
+    );
+    h.push(gst::Buffer::new()).expect("buffer pushes");
+    h.pull().expect("buffer passes through");
+    assert!(h.push_event(gst::event::Eos::new()));
+
+    let first = records(&first);
+    let second = records(&second);
+    assert_eq!(first[1]["seq"], 0);
+    assert_eq!(second.len(), 3);
+    assert_eq!(second[0]["kind"], "caps");
+    assert_eq!(second[1]["seq"], 0);
+    assert_eq!(second[2]["kind"], "eos");
+}
+
+#[test]
+fn pull_mode_preserves_the_buffer_and_flushes_on_stop() {
+    init();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("pull.jsonl");
+    let tap = gst::ElementFactory::make("jsontap")
+        .property("location", path.to_str().expect("UTF-8 path"))
+        .build()
+        .expect("tap");
+    let sink = tap.static_pad("sink").expect("sink pad");
+    let src = tap.static_pad("src").expect("source pad");
+    let mut input = gst::Buffer::from_slice(vec![9u8, 8, 7]);
+    input
+        .get_mut()
+        .expect("writable")
+        .set_pts(gst::ClockTime::from_mseconds(5));
+    let original = input.clone();
+    let upstream = gst::Pad::builder(gst::PadDirection::Src)
+        .getrange_function(move |_, _, _, _, _| {
+            Ok(gst::PadGetRangeSuccess::NewBuffer(input.clone()))
+        })
+        .build();
+    upstream.link(&sink).expect("link source");
+    src.activate_mode(gst::PadMode::Pull, true)
+        .expect("activate pull mode");
+    assert!(sink.send_event(gst::event::StreamStart::new("pull-test")));
+    assert!(sink.send_event(gst::event::Caps::new(
+        &gst::Caps::builder("application/x-test").build()
+    )));
+    assert!(
+        sink.send_event(gst::event::Segment::new(&gst::FormattedSegment::<
+            gst::ClockTime,
+        >::new()))
+    );
+
+    let output = src.range(0, 3).expect("pulled buffer");
+    assert_eq!(output.as_ptr(), original.as_ptr());
+    src.activate_mode(gst::PadMode::Pull, false)
+        .expect("deactivate pull mode");
+    upstream.unlink(&sink).expect("unlink source");
+    let records = records(&path);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["kind"], "caps");
+    assert_eq!(records[1]["kind"], "buffer");
+    assert_eq!(records[1]["seq"], 0);
+    assert_eq!(records[1]["pts"], 5_000_000u64);
+    assert_eq!(records[1]["size"], 3);
+}
+
+#[test]
 fn fails_to_start_without_a_location() {
     init();
     let tap = gst::ElementFactory::make("jsontap")
