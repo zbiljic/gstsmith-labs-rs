@@ -747,6 +747,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gst-plugin-jsontap"
+version = "0.1.0"
+dependencies = [
+ "gst-plugin-version-helper",
+ "gstreamer",
+ "gstreamer-base",
+ "gstreamer-check",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "gst-plugin-nalsense"
 version = "0.1.0"
 dependencies = [

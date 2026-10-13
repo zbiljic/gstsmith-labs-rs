@@ -10,6 +10,10 @@ are being established before promotion to
 
 - [`generic`](generic/)
 
+  - [`jsontap`](generic/jsontap/): Passthrough inspection tap.
+    - `jsontap`: Record buffer timestamps, flags, sizes, and metadata, caps
+      changes, and EOS as JSON lines while preserving downstream data.
+
   - [`ptssampler`](generic/ptssampler/): Running-time period sampling.
     - `ptssampler`: Pass the first buffer of every period and drop the rest,
       preserving buffers and caps.
