@@ -31,6 +31,7 @@ pc_dir="$libdir/pkgconfig"
 packages=(
   "gst-plugin-nalsense|gstnalsense|nalsense|nalsenseactivity nalsensereplay"
   "gst-plugin-usls|gstusls|usls|uslsobjectdetect"
+  "gst-plugin-ptssampler|gstptssampler|ptssampler|ptssampler"
 )
 
 # Optional explicit package selection keeps NALSense validation on GStreamer 1.24.

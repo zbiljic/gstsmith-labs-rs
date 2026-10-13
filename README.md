@@ -8,6 +8,12 @@ are being established before promotion to
 
 ## Plugins
 
+- [`generic`](generic/)
+
+  - [`ptssampler`](generic/ptssampler/): Running-time period sampling.
+    - `ptssampler`: Pass the first buffer of every period and drop the rest,
+      preserving buffers and caps.
+
 - [`analytics`](analytics/)
 
   - [`nalsense`](analytics/nalsense/): Portable H.264 and H.265 encoded-video

@@ -1,5 +1,5 @@
 [workspace]
-members = ["analytics/nalsense", "analytics/usls"]
+members = ["analytics/nalsense", "analytics/usls", "generic/ptssampler"]
 resolver = "3"
 
 [workspace.package]
