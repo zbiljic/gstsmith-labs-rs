@@ -118,9 +118,9 @@ thread_local! {
     static INITIALIZATION: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
-struct Capture;
+pub(crate) struct Capture;
 impl Capture {
-    fn begin() -> Result<Self> {
+    pub(crate) fn begin() -> Result<Self> {
         INITIALIZATION.with(|messages| {
             ensure!(messages.borrow().is_none(), "nested ORT initialization");
             *messages.borrow_mut() = Some(Vec::new());
@@ -131,7 +131,7 @@ impl Capture {
         clippy::unused_self,
         reason = "consumes the capture guard to close its initialization scope"
     )]
-    fn finish(self) -> Vec<String> {
+    pub(crate) fn finish(self) -> Vec<String> {
         INITIALIZATION.with(|messages| messages.borrow_mut().take().unwrap_or_default())
     }
 }
@@ -141,7 +141,7 @@ impl Drop for Capture {
     }
 }
 
-fn logger_owned() -> Result<bool> {
+pub(crate) fn logger_owned() -> Result<bool> {
     static OWNED: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
     OWNED
         .get_or_init(|| {

@@ -4,10 +4,13 @@ use gst::glib;
 
 mod backend;
 mod frame;
+mod segment;
 mod uslsobjectdetect;
+mod uslssegment;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
-    uslsobjectdetect::register(plugin)
+    uslsobjectdetect::register(plugin)?;
+    uslssegment::register(plugin)
 }
 
 gst::plugin_define!(
