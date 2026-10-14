@@ -16,10 +16,14 @@ dir = "{{config_root}}/../.."
 run = "cargo build --locked -p gst-plugin-usls"
 
 [tasks.inspect]
-description = "Build and inspect uslsobjectdetect"
+description = "Build and inspect both usls elements"
 depends = ["build"]
 dir = "{{config_root}}/../.."
-run = 'GST_PLUGIN_PATH="$PWD/target/debug${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" gst-inspect-1.0 uslsobjectdetect'
+run = '''
+export GST_PLUGIN_PATH="$PWD/target/debug${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+gst-inspect-1.0 uslsobjectdetect
+gst-inspect-1.0 uslssegment
+'''
 
 [tasks."smoke:cpu"]
 description = "Run the opt-in usls real-model CPU smoke test"
@@ -40,3 +44,34 @@ run = '''
 : "${GSTSMITH_USLS_SAMPLE:?GSTSMITH_USLS_SAMPLE must name the local person JPEG}"
 cargo test --release --locked -p gst-plugin-usls --features coreml --test usls real_model -- --ignored --nocapture
 '''
+
+[tasks."smoke:segment"]
+description = "Run the opt-in segmentation CPU smoke test with local assets"
+dir = "{{config_root}}/../.."
+env.GSTSMITH_SEGMENT_PROVIDER = "cpu"
+run = '''
+: "${GSTSMITH_SEGMENT_PROFILE:?GSTSMITH_SEGMENT_PROFILE must name the segmentation family}"
+: "${GSTSMITH_SEGMENT_SAMPLE:?GSTSMITH_SEGMENT_SAMPLE must name a local image}"
+cargo test --release --locked -p gst-plugin-usls --test segment real_segmentation -- --ignored --nocapture
+'''
+
+[tasks."smoke:segment:coreml"]
+description = "Run the opt-in segmentation CoreML CPU+GPU smoke test with local assets"
+dir = "{{config_root}}/../.."
+env.GSTSMITH_SEGMENT_PROVIDER = "coreml"
+run = '''
+: "${GSTSMITH_SEGMENT_PROFILE:?GSTSMITH_SEGMENT_PROFILE must name the segmentation family}"
+: "${GSTSMITH_SEGMENT_SAMPLE:?GSTSMITH_SEGMENT_SAMPLE must name a local image}"
+cargo test --release --locked -p gst-plugin-usls --features coreml --test segment real_segmentation -- --ignored --nocapture
+'''
+
+# Version pins apply only to optional asset tooling, not plugin operation or Rust tests.
+[tasks."prepare:segment"]
+description = "Download and prepare verified FastSAM or MobileSAM smoke-test assets"
+dir = "{{config_root}}/../.."
+run = "uv run --with onnx==1.23.2 python analytics/usls/scripts/prepare_segment.py"
+
+[tasks."fixtures:segment"]
+description = "Regenerate the checked-in synthetic segmentation ONNX fixtures"
+dir = "{{config_root}}/../.."
+run = "uv run --with onnx==1.23.2 --with numpy==2.5.4 python analytics/usls/tests/fixtures/segment/generate.py"

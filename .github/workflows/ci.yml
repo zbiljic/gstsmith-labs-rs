@@ -93,6 +93,7 @@ jobs:
           gst-inspect-1.0 nalsensereplay
           gst-inspect-1.0 usls
           gst-inspect-1.0 uslsobjectdetect
+          gst-inspect-1.0 uslssegment
           gst-inspect-1.0 jsontap
           gst-inspect-1.0 ptssampler
 
@@ -174,3 +175,4 @@ jobs:
         run: |
           gst-inspect-1.0 usls
           gst-inspect-1.0 uslsobjectdetect
+          gst-inspect-1.0 uslssegment

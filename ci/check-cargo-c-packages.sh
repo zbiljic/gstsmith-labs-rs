@@ -30,7 +30,7 @@ pc_dir="$libdir/pkgconfig"
 # Cargo package | cargo-c library/.pc stem | GStreamer plugin | element names
 packages=(
   "gst-plugin-nalsense|gstnalsense|nalsense|nalsenseactivity nalsensereplay"
-  "gst-plugin-usls|gstusls|usls|uslsobjectdetect"
+  "gst-plugin-usls|gstusls|usls|uslsobjectdetect uslssegment"
   "gst-plugin-jsontap|gstjsontap|jsontap|jsontap"
   "gst-plugin-ptssampler|gstptssampler|ptssampler|ptssampler"
 )
