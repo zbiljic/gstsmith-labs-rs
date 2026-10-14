@@ -1,0 +1,22 @@
+[package]
+name = "segmentation-meta"
+version = { workspace = true }
+description = "Safe binary segmentation metadata bridge for GStreamer 1.28."
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+publish = false
+
+[dependencies]
+gst = { workspace = true }
+gst-analytics = { workspace = true }
+gst-video = { workspace = true }
+
+# This binding is the sole FFI boundary; plugin crates retain unsafe_code=forbid.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
