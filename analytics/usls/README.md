@@ -1,18 +1,25 @@
 # usls inference plugin
 
 This plugin integrates [usls](https://github.com/jamjamjon/usls)
-inference capabilities into GStreamer elements. Its first element,
-`uslsobjectdetect`, synchronously attaches standard object detection and related
+inference capabilities into GStreamer elements. `uslsobjectdetect`
+synchronously attaches standard object detection and related
 classification analytics to RGB video. It supports compatible COCO FP32 batch-one
 exports across detector sizes through pinned usls and ONNX Runtime 1.28. The
 `rfdetr-nano` compatibility profile remains the default. CPU is the portable
 default; CoreML CPU+GPU is optional on supported Apple Silicon builds.
+
+[`uslssegment`](SEGMENTATION.md) attaches standard segmentation masks. It
+supports the Image Segmentation families, including SAM prompts supplied by
+upstream detections on the same buffer. See its documentation for profiles,
+local encoder/decoder setup, limits and pipelines. The detector documentation
+below describes `uslsobjectdetect`.
 
 GStreamer 1.28 or newer is required. Build and inspect without any model assets:
 
 ```sh
 cargo build --locked -p gst-plugin-usls
 GST_PLUGIN_PATH="$PWD/target/debug" gst-inspect-1.0 uslsobjectdetect
+GST_PLUGIN_PATH="$PWD/target/debug" gst-inspect-1.0 uslssegment
 cargo build --locked -p gst-plugin-usls --features coreml
 ```
 
@@ -221,9 +228,13 @@ root or a plugin directory, run `mise run //analytics/usls:TASK`:
 | `test`         | Ordinary CPU tests; no model or sample required |
 | `test:coreml`  | Ordinary tests with optional CoreML support     |
 | `build`        | Build the CPU plugin                            |
-| `inspect`      | Build and inspect `uslsobjectdetect`            |
+| `inspect`      | Build and inspect both elements                |
 | `smoke:cpu`    | Explicit real-model CPU test                    |
 | `smoke:coreml` | Explicit real-model CoreML CPU+GPU test         |
+| `smoke:segment` | Explicit segmentation CPU test with local assets |
+| `smoke:segment:coreml` | Explicit segmentation CoreML CPU+GPU test |
+| `prepare:segment` | Download and prepare FastSAM or MobileSAM smoke assets |
+| `fixtures:segment` | Regenerate synthetic segmentation test fixtures |
 
 The smoke tasks require `GSTSMITH_USLS_MODEL` and `GSTSMITH_USLS_SAMPLE` to name
 existing local files. `GSTSMITH_USLS_PROFILE` selects a profile and defaults to

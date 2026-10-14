@@ -31,10 +31,13 @@ are being established before promotion to
 
   - [`usls`](analytics/usls/): Inference elements powered by
     [usls](https://github.com/jamjamjon/usls).
-    - `uslsobjectdetect`: The first element, supporting compatible RF-DETR,
+    - `uslsobjectdetect`: Supports compatible RF-DETR,
       RT-DETR v1/v2/v4, PicoDet, D-FINE, DEIM and DEIMv2 COCO FP32 batch-one
       exports across model sizes with CPU and optional CoreML, preserving the
       original RGB frame.
+    - [`uslssegment`](analytics/usls/SEGMENTATION.md): Automatic and prompted
+      segmentation across the usls Image Segmentation families, with native
+      mask metadata and same-frame detection prompts.
 
 ## Building
 
