@@ -31,7 +31,7 @@ are being established before promotion to
 
   - [`usls`](analytics/usls/): Inference elements powered by
     [usls](https://github.com/jamjamjon/usls).
-    - `uslsobjectdetect`: Supports compatible RF-DETR,
+    - [`uslsobjectdetect`](analytics/usls/OBJECT_DETECTION.md): Supports compatible RF-DETR,
       RT-DETR v1/v2/v4, PicoDet, D-FINE, DEIM and DEIMv2 COCO FP32 batch-one
       exports across model sizes with CPU and optional CoreML, preserving the
       original RGB frame.

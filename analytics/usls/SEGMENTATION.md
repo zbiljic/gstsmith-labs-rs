@@ -5,6 +5,9 @@ RGB frames. Automatic models segment each frame; prompted models take boxes
 from detection metadata on that same buffer, or a fixed box/point prompt.
 Original pixels, timestamps and existing metadata pass through unchanged.
 
+See the [plugin README](README.md) for shared build instructions, runtime
+requirements and development tasks.
+
 ## Models
 
 Select the export family explicitly. Input size comes from the local ONNX graph,
