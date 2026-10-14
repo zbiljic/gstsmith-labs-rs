@@ -174,9 +174,16 @@ fn logger_owned() -> Result<bool> {
 pub(crate) fn verify_assignment(provider: Provider, messages: &[String]) -> Result<()> {
     if provider == Provider::Coreml {
         ensure!(
-            messages
-                .iter()
-                .any(|line| line.contains("Node(s) placed on [CoreMLExecutionProvider]")),
+            messages.iter().any(|line| {
+                let Some((placement, count)) = line.trim().split_once(". Number of nodes: ") else {
+                    return false;
+                };
+                matches!(
+                    placement,
+                    "All nodes placed on [CoreMLExecutionProvider]"
+                        | "Node(s) placed on [CoreMLExecutionProvider]"
+                ) && count.parse::<usize>().is_ok_and(|count| count > 0)
+            }),
             "CoreML requested but no final CoreML assignment verified; all-CPU fallback rejected"
         );
     }
@@ -1299,18 +1306,41 @@ mod tests {
     }
 
     #[test]
+    fn placement_accepts_full_and_partial_coreml_but_rejects_cpu_only() -> Result<()> {
+        for message in [
+            "  All nodes placed on [CoreMLExecutionProvider]. Number of nodes: 1",
+            "  Node(s) placed on [CoreMLExecutionProvider]. Number of nodes: 4",
+        ] {
+            verify_assignment(Provider::Coreml, &[message.into()])?;
+        }
+        for message in [
+            "All nodes placed on [CPUExecutionProvider]. Number of nodes: 268",
+            "Node(s) placed on [CPUExecutionProvider]. Number of nodes: 4",
+            "All nodes placed on [CoreMLExecutionProvider]. Number of nodes: 0",
+            "Node(s) placed on [CoreMLExecutionProvider]. Number of nodes: 0",
+            "CoreMLExecutionProvider::GetCapability: 268 supported nodes",
+        ] {
+            verify_assignment(Provider::Coreml, &[message.into()])
+                .expect_err("requires final nonempty CoreML placement");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn placement_capture_never_reuses_another_session() -> Result<()> {
         let first = Capture::begin()?;
         INITIALIZATION.with(|messages| {
-            *messages.borrow_mut() =
-                Some(vec!["1 Node(s) placed on [CoreMLExecutionProvider]".into()]);
+            *messages.borrow_mut() = Some(vec![
+                "Node(s) placed on [CoreMLExecutionProvider]. Number of nodes: 1".into(),
+            ]);
         });
         verify_assignment(Provider::Coreml, &first.finish())?;
         let second = Capture::begin()?;
         std::thread::spawn(|| {
             INITIALIZATION.with(|messages| {
-                *messages.borrow_mut() =
-                    Some(vec!["1 Node(s) placed on [CoreMLExecutionProvider]".into()]);
+                *messages.borrow_mut() = Some(vec![
+                    "Node(s) placed on [CoreMLExecutionProvider]. Number of nodes: 1".into(),
+                ]);
             });
         })
         .join()
