@@ -1,8 +1,11 @@
-use std::{fs::File, path::Path};
+use std::{borrow::Cow, fs::File, path::Path};
 
 use anyhow::{Context, Result, ensure};
 use gst::glib;
-use ort::value::TensorElementType;
+use ort::{
+    session::{SessionInputValue, SessionOutputs},
+    value::{TensorElementType, TensorRef},
+};
 use usls::{
     Config, Device, Engine, FromConfig, Image, ImageProcessor, Module, OrtTensorAttr,
     ResizeModeType, SamKind, X,
@@ -347,7 +350,8 @@ impl Runtime {
                 .context("missing resize mode")?,
             info,
         )?;
-        let outputs = if self.options.profile == Profile::EcDetSeg {
+        let attrs = self.engine.outputs.clone();
+        let raw_outputs = if self.options.profile == Profile::EcDetSeg {
             let sizes = X::from_shape_vec(
                 &[1, 2],
                 vec![
@@ -355,12 +359,11 @@ impl Runtime {
                     f32::from(u16::try_from(self.size[0])?),
                 ],
             )?;
-            let attrs = self.engine.outputs.clone();
-            collect(self.engine.run(usls::inputs![&input, sizes]?)?, &attrs)?
+            self.engine.run(usls::inputs![&input, sizes]?)?.into_inner()
         } else {
-            let attrs = self.engine.outputs.clone();
-            collect(self.engine.run(&input)?, &attrs)?
+            self.engine.run(&input)?.into_inner()
         };
+        let outputs = collect(&raw_outputs, &attrs)?;
         if let Some(decoder) = self.decoder.as_mut() {
             let mut regions = Vec::new();
             let cap = self.options.cap.min(self.options.maximum / pixels);
@@ -489,18 +492,21 @@ fn prompt_contract(
 }
 
 #[derive(Clone, Debug)]
-struct Tensor {
+struct Tensor<'a> {
     shape: Vec<usize>,
-    data: Vec<f32>,
+    data: Cow<'a, [f32]>,
 }
-impl Tensor {
-    fn x(&self) -> Result<X> {
-        X::from_shape_vec(&self.shape, self.data.clone())
+impl Tensor<'_> {
+    fn input(&self, leading_axis: bool) -> Result<SessionInputValue<'_>> {
+        let mut shape = self.shape.clone();
+        if leading_axis {
+            shape.insert(0, 1);
+        }
+        Ok(TensorRef::from_array_view((shape, self.data.as_ref()))?.into())
     }
 }
 
-fn collect(outputs: usls::Xs<'_>, attrs: &OrtTensorAttr) -> Result<Vec<Tensor>> {
-    let outputs = outputs.into_inner();
+fn collect<'a>(outputs: &'a SessionOutputs<'_>, attrs: &OrtTensorAttr) -> Result<Vec<Tensor<'a>>> {
     ensure!(
         outputs.len() == attrs.names.len(),
         "inference output count changed"
@@ -510,7 +516,7 @@ fn collect(outputs: usls::Xs<'_>, attrs: &OrtTensorAttr) -> Result<Vec<Tensor>> 
     for (index, name) in attrs.names.iter().enumerate() {
         let output = outputs.get(name).context("missing output tensor")?;
         let (shape, data) = if attrs.dtypes.get(index) == Some(&TensorElementType::Int64) {
-            let array = output.try_extract_array::<i64>()?;
+            let (shape, array) = output.try_extract_tensor::<i64>()?;
             bytes = bytes
                 .checked_add(array.len().checked_mul(8).context("tensor overflow")?)
                 .context("tensor overflow")?;
@@ -522,9 +528,9 @@ fn collect(outputs: usls::Xs<'_>, attrs: &OrtTensorAttr) -> Result<Vec<Tensor>> 
                     Ok(f32::from(u16::try_from(id)?))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            (array.shape().to_vec(), data)
+            (shape, Cow::Owned(data))
         } else {
-            let array = output.try_extract_array::<f32>()?;
+            let (shape, array) = output.try_extract_tensor::<f32>()?;
             bytes = bytes
                 .checked_add(array.len().checked_mul(4).context("tensor overflow")?)
                 .context("tensor overflow")?;
@@ -533,8 +539,12 @@ fn collect(outputs: usls::Xs<'_>, attrs: &OrtTensorAttr) -> Result<Vec<Tensor>> 
                 array.iter().all(|v| v.is_finite()),
                 "nonfinite segmentation tensor"
             );
-            (array.shape().to_vec(), array.iter().copied().collect())
+            (shape, Cow::Borrowed(array))
         };
+        let shape = shape
+            .iter()
+            .map(|&dim| usize::try_from(dim))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let declared = attrs
             .dimss
             .get(index)
@@ -747,7 +757,7 @@ fn select(mut candidates: Vec<Candidate>, cap: usize, nms: bool) -> Vec<Candidat
     }
     selected
 }
-fn tensor(outputs: &[Tensor], index: usize) -> Result<&Tensor> {
+fn tensor<'a, 'data>(outputs: &'a [Tensor<'data>], index: usize) -> Result<&'a Tensor<'data>> {
     outputs.get(index).context("missing segmentation tensor")
 }
 fn value(values: &[f32], index: usize) -> Result<f32> {
@@ -773,7 +783,11 @@ fn class(value: f32, count: usize) -> Result<usize> {
     clippy::too_many_lines,
     reason = "keep the three export layouts and bounded mask generation together"
 )]
-fn decode_automatic(outputs: &[Tensor], map: &Mapping, options: &Options) -> Result<Vec<Region>> {
+fn decode_automatic(
+    outputs: &[Tensor<'_>],
+    map: &Mapping,
+    options: &Options,
+) -> Result<Vec<Region>> {
     let pixels = usize::try_from(map.width)?
         .checked_mul(usize::try_from(map.height)?)
         .context("mask size overflow")?;
@@ -905,35 +919,37 @@ fn decode_automatic(outputs: &[Tensor], map: &Mapping, options: &Options) -> Res
     let candidates = select(candidates, cap, nms);
     let mut regions = Vec::new();
     for candidate in candidates {
-        let logits = if options.profile == Profile::EcDetSeg {
-            masks
-                .data
-                .get(candidate.row * plane..(candidate.row + 1) * plane)
-                .context("mask row bounds")?
-                .to_vec()
-        } else {
-            let predictions = tensor(outputs, 0)?;
-            let end_to_end = options.profile == Profile::YoloE26;
-            let start = if end_to_end { 6 } else { 4 + classes.len() };
-            let mut logits = vec![0.0f64; plane];
-            for c in 0..channels {
-                let coefficient = value(
-                    &predictions.data,
-                    if end_to_end {
-                        candidate.row * columns + start + c
-                    } else {
-                        (start + c) * rows + candidate.row
-                    },
-                )?;
-                let proto = masks
-                    .data
-                    .get(c * plane..(c + 1) * plane)
-                    .context("prototype bounds")?;
-                for (logit, value) in logits.iter_mut().zip(proto) {
-                    *logit += f64::from(coefficient) * f64::from(*value);
+        let logits =
+            if options.profile == Profile::EcDetSeg {
+                Cow::Borrowed(
+                    masks
+                        .data
+                        .get(candidate.row * plane..(candidate.row + 1) * plane)
+                        .context("mask row bounds")?,
+                )
+            } else {
+                let predictions = tensor(outputs, 0)?;
+                let end_to_end = options.profile == Profile::YoloE26;
+                let start = if end_to_end { 6 } else { 4 + classes.len() };
+                let mut logits = vec![0.0f64; plane];
+                for c in 0..channels {
+                    let coefficient = value(
+                        &predictions.data,
+                        if end_to_end {
+                            candidate.row * columns + start + c
+                        } else {
+                            (start + c) * rows + candidate.row
+                        },
+                    )?;
+                    let proto = masks
+                        .data
+                        .get(c * plane..(c + 1) * plane)
+                        .context("prototype bounds")?;
+                    for (logit, value) in logits.iter_mut().zip(proto) {
+                        *logit += f64::from(coefficient) * f64::from(*value);
+                    }
                 }
-            }
-            logits
+                Cow::Owned(logits
                 .into_iter()
                 .map(|v| {
                     ensure!(
@@ -947,8 +963,8 @@ fn decode_automatic(outputs: &[Tensor], map: &Mapping, options: &Options) -> Res
                     let value = v as f32;
                     Ok(value)
                 })
-                .collect::<Result<Vec<_>>>()?
-        };
+                .collect::<Result<Vec<_>>>()?)
+            };
         let pixels = map.mask(
             &logits,
             *mw,
@@ -980,7 +996,7 @@ fn decode_automatic(outputs: &[Tensor], map: &Mapping, options: &Options) -> Res
 fn run_prompt(
     decoder: &mut Engine,
     profile: Profile,
-    features: &[Tensor],
+    features: &[Tensor<'_>],
     prompt: &Prompt,
     map: &Mapping,
     options: &Options,
@@ -998,7 +1014,7 @@ fn run_prompt(
         coords.extend(map.point(point)?);
         labels.push(if positive { 1.0 } else { 0.0 });
     }
-    let mut args;
+    let mut args: Vec<SessionInputValue<'_>>;
     if profile == Profile::Sam3 {
         if labels.is_empty() {
             coords.extend([0.0, 0.0]);
@@ -1013,9 +1029,9 @@ fn run_prompt(
         } else {
             X::zeros(&[1, 0, 4])
         };
-        args = vec![points, labels, boxes];
+        args = vec![points.try_into()?, labels.try_into()?, boxes.try_into()?];
         for feature in features {
-            args.push(feature.x()?);
+            args.push(feature.input(false)?);
         }
     } else {
         ensure!(!labels.is_empty(), "empty SAM prompt");
@@ -1026,24 +1042,27 @@ fn run_prompt(
             coords.extend([0.0, 0.0]);
             labels.push(-1.0);
         }
-        args = vec![tensor(features, 0)?.x()?];
+        args = vec![tensor(features, 0)?.input(false)?];
         if profile == Profile::SamHq {
-            args.push(tensor(features, 1)?.x()?.insert_axis(0)?);
+            args.push(tensor(features, 1)?.input(true)?);
         }
         if matches!(profile, Profile::Sam2 | Profile::Sam21) {
-            args.push(tensor(features, 1)?.x()?);
-            args.push(tensor(features, 2)?.x()?);
+            args.push(tensor(features, 1)?.input(false)?);
+            args.push(tensor(features, 2)?.input(false)?);
         }
-        args.push(X::from_shape_vec(&[1, labels.len(), 2], coords)?);
-        args.push(X::from_shape_vec(&[1, labels.len()], labels)?);
+        args.push(X::from_shape_vec(&[1, labels.len(), 2], coords)?.try_into()?);
+        args.push(X::from_shape_vec(&[1, labels.len()], labels)?.try_into()?);
         if profile != Profile::EdgeSam {
-            args.push(X::zeros(&[1, 1, map.model[1] / 4, map.model[0] / 4]));
-            args.push(X::zeros(&[1]));
+            args.push(X::zeros(&[1, 1, map.model[1] / 4, map.model[0] / 4]).try_into()?);
+            args.push(X::zeros(&[1]).try_into()?);
             // Decode in model space, then invert the exact recorded resize/padding.
-            args.push(X::from(vec![
-                f32::from(u16::try_from(map.model[1])?),
-                f32::from(u16::try_from(map.model[0])?),
-            ]));
+            args.push(
+                X::from(vec![
+                    f32::from(u16::try_from(map.model[1])?),
+                    f32::from(u16::try_from(map.model[0])?),
+                ])
+                .try_into()?,
+            );
         }
     }
     ensure!(
@@ -1051,18 +1070,19 @@ fn run_prompt(
         "decoder input count mismatch"
     );
     for (arg, declared) in args.iter().zip(&decoder.inputs.dimss) {
+        let (shape, _) = arg.try_extract_tensor::<f32>()?;
         ensure!(
-            arg.shape().len() == declared.len()
-                && arg
-                    .shape()
+            shape.len() == declared.len()
+                && shape
                     .iter()
                     .zip(declared)
-                    .all(|(a, b)| *b == 0 || a == b),
+                    .all(|(a, b)| *b == 0 || usize::try_from(*a).ok() == Some(*b)),
             "prompt does not match decoder input dimensions"
         );
     }
     let attrs = decoder.outputs.clone();
-    let outputs = collect(decoder.run(&args)?, &attrs)?;
+    let raw_outputs = decoder.run::<0>(args.as_slice())?.into_inner();
+    let outputs = collect(&raw_outputs, &attrs)?;
     let (masks, scores, object_score) = if profile == Profile::Sam3 {
         let score = value(&tensor(&outputs, 2)?.data, 0)?;
         (
@@ -1176,11 +1196,66 @@ mod tests {
             py: 0.0,
         }
     }
-    fn t(shape: &[usize], data: &[f32]) -> Tensor {
+    fn t(shape: &[usize], data: &[f32]) -> Tensor<'static> {
         Tensor {
             shape: shape.to_vec(),
-            data: data.to_vec(),
+            data: data.to_vec().into(),
         }
+    }
+    #[test]
+    fn output_views_borrow_storage_and_keep_validation() -> Result<()> {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/segment/fastsam.onnx");
+        let mut runtime = Runtime::new(Some(&path), None, None, Options::default())?;
+        let mut attrs = runtime.engine.outputs.clone().as_ref().clone();
+        let input = vec![X::zeros(&[1, 3, 4, 4])];
+        let mut raw = runtime.engine.run(&input)?.into_inner();
+        {
+            let tensors = collect(&raw, &attrs)?;
+            for (tensor, name) in tensors.iter().zip(&attrs.names) {
+                let (_, source) = raw
+                    .get(name)
+                    .context("output")?
+                    .try_extract_tensor::<f32>()?;
+                ensure!(
+                    matches!(tensor.data, Cow::Borrowed(_))
+                        && tensor.data.as_ptr() == source.as_ptr(),
+                    "output was copied"
+                );
+            }
+        }
+        attrs.dimss.first_mut().context("shape")?.push(1);
+        collect(&raw, &attrs).expect_err("wrong output rank");
+        attrs.dimss.first_mut().context("shape")?.pop();
+        let name = attrs.names.last().context("last output")?;
+        let (_, values) = raw
+            .get_mut(name)
+            .context("output")?
+            .try_extract_tensor_mut::<f32>()?;
+        *values.first_mut().context("value")? = f32::NAN;
+        collect(&raw, &attrs).expect_err("every output is checked for nonfinite values");
+        Ok(())
+    }
+    #[test]
+    fn decoder_embeddings_borrow_the_same_storage() -> Result<()> {
+        logger_owned()?;
+        let features = t(&[1, 2, 1, 2], &[1.0, 2.0, 3.0, 4.0]);
+        for leading_axis in [false, true] {
+            for _ in 0..3 {
+                let input = features.input(leading_axis)?;
+                let (shape, values) = input.try_extract_tensor::<f32>()?;
+                ensure!(
+                    values.as_ptr() == features.data.as_ptr(),
+                    "embedding was copied"
+                );
+                ensure!(
+                    shape.len() == features.shape.len() + usize::from(leading_axis),
+                    "embedding rank"
+                );
+                ensure!(values == features.data.as_ref(), "embedding values");
+            }
+        }
+        Ok(())
     }
     #[test]
     fn nonsquare_masks_remove_padding_before_threshold() -> Result<()> {
@@ -1261,7 +1336,7 @@ mod tests {
             regions.first().context("region")?.label == glib::Quark::from_str("person"),
             "COCO label"
         );
-        outputs.first_mut().context("labels")?.data = vec![80.0];
+        outputs.first_mut().context("labels")?.data = vec![80.0].into();
         decode_automatic(&outputs, &mapping(), &opts).expect_err("invalid class");
         let opts = Options {
             profile: Profile::BiRefDis,

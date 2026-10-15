@@ -114,7 +114,7 @@ Mask storage further caps the number of processed objects. A single mask that
 exceeds the budget fails the flow. A GRAY8 mask costs `width × height` bytes;
 16 masks at 1920×1080 cost about 32 MiB, in addition to the original frame,
 image copies and inference tensors. Model input allocation is capped at 128 MiB,
-and copied output tensors at 256 MiB per session invocation. These bounds do
+and exposed output tensors at 256 MiB per session invocation. These bounds do
 not limit ORT's internal allocations or the model's working memory. Use trusted
 local graphs. Frame and model dimensions must each be at most 65535.
 
