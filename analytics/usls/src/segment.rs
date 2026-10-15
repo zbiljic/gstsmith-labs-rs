@@ -655,40 +655,57 @@ impl Mapping {
         pixels
             .try_reserve_exact(count)
             .context("allocating segmentation mask")?;
+        pixels.resize(count, 0);
         let cutoff = (f64::from(threshold) / (1.0 - f64::from(threshold))).ln();
-        for y in 0..self.height {
-            let my = (((f64::from(y) + 0.5) * self.sy + self.py) * mh as f64
-                / self.model[1] as f64
-                - 0.5)
-                .clamp(0.0, (mh - 1) as f64);
-            let y0 = my.floor() as usize;
-            let y1 = (y0 + 1).min(mh - 1);
-            for x in 0..self.width {
-                if bbox.is_some_and(|[x1, y1, x2, y2]| {
-                    f64::from(x) + 0.5 < x1
-                        || f64::from(x) + 0.5 >= x2
-                        || f64::from(y) + 0.5 < y1
-                        || f64::from(y) + 0.5 >= y2
-                }) {
-                    pixels.push(0);
-                    continue;
-                }
-                let mx = (((f64::from(x) + 0.5) * self.sx + self.px) * mw as f64
+        let [left, top, right, bottom] =
+            bbox.unwrap_or([0.0, 0.0, f64::from(self.width), f64::from(self.height)]);
+        let left = (left - 0.5).ceil().clamp(0.0, f64::from(self.width)) as usize;
+        let right = (right - 0.5).ceil().clamp(0.0, f64::from(self.width)) as usize;
+        let top = (top - 0.5).ceil().clamp(0.0, f64::from(self.height)) as usize;
+        let bottom = (bottom - 0.5).ceil().clamp(0.0, f64::from(self.height)) as usize;
+        if left >= right || top >= bottom {
+            return Ok(pixels);
+        }
+        // Horizontal samples are identical for every output row.
+        let xs = (left..right)
+            .map(|x| {
+                let mx = (((x as f64 + 0.5) * self.sx + self.px) * mw as f64
                     / self.model[0] as f64
                     - 0.5)
                     .clamp(0.0, (mw - 1) as f64);
                 let x0 = mx.floor() as usize;
-                let x1 = (x0 + 1).min(mw - 1);
-                let at = |xx, yy| -> Result<f64> {
-                    Ok(f64::from(
-                        *logits.get(yy * mw + xx).context("mask sample bounds")?,
-                    ))
-                };
-                let dx = mx - x0 as f64;
-                let dy = my - y0 as f64;
-                let top = at(x0, y0)? * (1.0 - dx) + at(x1, y0)? * dx;
-                let bottom = at(x0, y1)? * (1.0 - dx) + at(x1, y1)? * dx;
-                pixels.push(u8::from(top * (1.0 - dy) + bottom * dy > cutoff));
+                (x0, (x0 + 1).min(mw - 1), mx - x0 as f64)
+            })
+            .collect::<Vec<_>>();
+        for (y, row) in pixels
+            .chunks_exact_mut(usize::try_from(self.width)?)
+            .enumerate()
+            .take(bottom)
+            .skip(top)
+        {
+            let my = (((y as f64 + 0.5) * self.sy + self.py) * mh as f64 / self.model[1] as f64
+                - 0.5)
+                .clamp(0.0, (mh - 1) as f64);
+            let y0 = my.floor() as usize;
+            let y1 = (y0 + 1).min(mh - 1);
+            let upper = logits
+                .get(y0 * mw..(y0 + 1) * mw)
+                .context("mask row bounds")?;
+            let lower = logits
+                .get(y1 * mw..(y1 + 1) * mw)
+                .context("mask row bounds")?;
+            let dy = my - y0 as f64;
+            for (pixel, &(x0, x1, dx)) in row
+                .get_mut(left..right)
+                .context("mask crop bounds")?
+                .iter_mut()
+                .zip(&xs)
+            {
+                let top =
+                    f64::from(value(upper, x0)?) * (1.0 - dx) + f64::from(value(upper, x1)?) * dx;
+                let bottom =
+                    f64::from(value(lower, x0)?) * (1.0 - dx) + f64::from(value(lower, x1)?) * dx;
+                *pixel = u8::from(top * (1.0 - dy) + bottom * dy > cutoff);
             }
         }
         Ok(pixels)
@@ -1310,6 +1327,109 @@ mod tests {
         attrs.dimss = vec![vec![1, 3, 384, 640]];
         attrs.dtypes = vec![TensorElementType::Float16];
         image_contract(&attrs, false).expect_err("FP16");
+        Ok(())
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "tensor sizes are bounded; sample coordinates are clamped to nonnegative image indices before flooring"
+    )]
+    fn reference_mask(
+        map: &Mapping,
+        logits: &[f32],
+        mw: usize,
+        mh: usize,
+        threshold: f32,
+        bbox: Option<[f64; 4]>,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            mw > 0
+                && mh > 0
+                && mw.checked_mul(mh) == Some(logits.len())
+                && logits.iter().all(|v| v.is_finite()),
+            "invalid mask tensor"
+        );
+        let count = usize::try_from(map.width)?
+            .checked_mul(usize::try_from(map.height)?)
+            .context("mask overflow")?;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(count)
+            .context("allocating segmentation mask")?;
+        let cutoff = (f64::from(threshold) / (1.0 - f64::from(threshold))).ln();
+        for y in 0..map.height {
+            let my = (((f64::from(y) + 0.5) * map.sy + map.py) * mh as f64 / map.model[1] as f64
+                - 0.5)
+                .clamp(0.0, (mh - 1) as f64);
+            let y0 = my.floor() as usize;
+            let y1 = (y0 + 1).min(mh - 1);
+            for x in 0..map.width {
+                if bbox.is_some_and(|[x1, y1, x2, y2]| {
+                    f64::from(x) + 0.5 < x1
+                        || f64::from(x) + 0.5 >= x2
+                        || f64::from(y) + 0.5 < y1
+                        || f64::from(y) + 0.5 >= y2
+                }) {
+                    pixels.push(0);
+                    continue;
+                }
+                let mx = (((f64::from(x) + 0.5) * map.sx + map.px) * mw as f64
+                    / map.model[0] as f64
+                    - 0.5)
+                    .clamp(0.0, (mw - 1) as f64);
+                let x0 = mx.floor() as usize;
+                let x1 = (x0 + 1).min(mw - 1);
+                let at = |xx, yy| -> Result<f64> {
+                    Ok(f64::from(
+                        *logits.get(yy * mw + xx).context("mask sample bounds")?,
+                    ))
+                };
+                let dx = mx - x0 as f64;
+                let dy = my - y0 as f64;
+                let top = at(x0, y0)? * (1.0 - dx) + at(x1, y0)? * dx;
+                let bottom = at(x0, y1)? * (1.0 - dx) + at(x1, y1)? * dx;
+                pixels.push(u8::from(top * (1.0 - dy) + bottom * dy > cutoff));
+            }
+        }
+        Ok(pixels)
+    }
+
+    #[test]
+    fn masks_match_scalar_reference_at_edges_and_thresholds() -> Result<()> {
+        for (width, height) in [(1, 1), (7, 9), (31, 13)] {
+            for padded in [false, true] {
+                let map = Mapping {
+                    width,
+                    height,
+                    model: [16, 16],
+                    sx: 16.0 / f64::from(width),
+                    sy: if padded { 8.0 } else { 16.0 } / f64::from(height),
+                    px: 0.0,
+                    py: if padded { 4.0 } else { 0.0 },
+                };
+                for (mw, mh) in [(1, 1), (3, 5), (16, 16)] {
+                    let logits = (0..mw * mh)
+                        .map(|i| f32::from(i16::try_from(i % 17).expect("bounded value")) - 8.0)
+                        .collect::<Vec<_>>();
+                    for threshold in [0.0, 0.1, 0.5, 0.9, 1.0] {
+                        for bbox in [
+                            None,
+                            Some([0.5, 0.5, 1.5, 1.5]),
+                            Some([0.6, 1.2, 5.5, 6.8]),
+                            Some([0.0, 0.0, 0.1, 0.1]),
+                            Some([0.0, 0.0, f64::from(width), f64::from(height)]),
+                        ] {
+                            ensure!(
+                                map.mask(&logits, mw, mh, threshold, bbox)?
+                                    == reference_mask(&map, &logits, mw, mh, threshold, bbox)?,
+                                "mask differs: {width}x{height}, {mw}x{mh}, padded={padded}, threshold={threshold}, bbox={bbox:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
