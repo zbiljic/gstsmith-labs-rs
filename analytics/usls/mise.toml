@@ -75,3 +75,13 @@ run = "uv run --with onnx==1.23.2 python analytics/usls/scripts/prepare_segment.
 description = "Regenerate the checked-in synthetic segmentation ONNX fixtures"
 dir = "{{config_root}}/../.."
 run = "uv run --with onnx==1.23.2 --with numpy==2.5.4 python analytics/usls/tests/fixtures/segment/generate.py"
+
+[tasks."bench:segment"]
+description = "Measure release mask reconstruction without model assets"
+dir = "{{config_root}}/../.."
+run = "cargo test --release --locked -p gst-plugin-usls --lib benchmark_masks -- --ignored --nocapture"
+
+[tasks."bench:segment:real"]
+description = "Measure warmed segmentation with explicit local assets and varying prompt counts"
+dir = "{{config_root}}/../.."
+run = "cargo test --release --locked -p gst-plugin-usls --features coreml --test segment benchmark_segmentation -- --ignored --nocapture"

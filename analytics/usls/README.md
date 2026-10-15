@@ -62,6 +62,8 @@ root or a plugin directory, run `mise run //analytics/usls:TASK`:
 | `smoke:segment:coreml` | Explicit segmentation CoreML CPU+GPU test |
 | `prepare:segment` | Download and prepare FastSAM or MobileSAM smoke assets |
 | `fixtures:segment` | Regenerate synthetic segmentation test fixtures |
+| `bench:segment` | Measure release mask reconstruction without model assets |
+| `bench:segment:real` | Measure warmed pipelines using local segmentation assets |
 
 Smoke tests use explicit local model and sample files and are excluded from the
 ordinary test gate. See the [object detection guide](OBJECT_DETECTION.md#validation-with-local-models)

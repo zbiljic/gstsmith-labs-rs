@@ -199,3 +199,20 @@ MobileSAM decoder's dynamic prompt dimensions. Existing files are verified and
 reused. Asset URLs and input/output checksums live in the
 [preparation script](scripts/prepare_segment.py). Optional tooling dependencies
 are managed by the [mise tasks](mise.toml).
+
+## Performance measurements
+
+Run `mise run //analytics/usls:bench:segment` for model-free mask reconstruction
+measurements. It compares the original scalar reference with the current sampler
+and reports median time for full and boxed masks at several source resolutions
+and region counts, after two warmup iterations.
+
+`mise run //analytics/usls:bench:segment:real` uses the same local
+`GSTSMITH_SEGMENT_*` assets as the smoke test. Leave `GSTSMITH_SEGMENT_PROMPT`
+unset: prompted profiles use 0, 1, 4 and 16 same-frame detection boxes. The task
+reports median synchronous processing latency for 640×360 and 1920×1080 after
+three warmup frames, excluding session creation, sample resizing and input
+construction. Set `GSTSMITH_SEGMENT_PROVIDER=cpu` or `coreml` as appropriate.
+These opt-in release measurements have no timing assertions and do not run in
+ordinary tests. Compare runs on the same idle host with the same model/provider;
+the smoke tests remain the correctness check.

@@ -1404,6 +1404,61 @@ mod tests {
         image_contract(&attrs, false).expect_err("FP16");
         Ok(())
     }
+    #[test]
+    #[ignore = "release-only mask timing; run bench:segment"]
+    fn benchmark_masks() -> Result<()> {
+        use std::{hint::black_box, time::Instant};
+        ensure!(!cfg!(debug_assertions), "benchmark requires --release");
+        let logits = (0..160 * 160)
+            .map(|i| f32::from(i16::try_from(i % 97).expect("bounded value")) - 48.0)
+            .collect::<Vec<_>>();
+        for (width, height, count) in [
+            (640, 360, 16),
+            (1920, 1080, 1),
+            (1920, 1080, 16),
+            (3840, 2160, 4),
+        ] {
+            let map = Mapping {
+                width,
+                height,
+                model: [640, 640],
+                sx: 640.0 / f64::from(width),
+                sy: 640.0 / f64::from(width),
+                px: 0.0,
+                py: (640.0 - f64::from(height) * 640.0 / f64::from(width)) / 2.0,
+            };
+            for reference in [true, false] {
+                for boxed in [false, true] {
+                    let bbox = boxed.then_some([
+                        f64::from(width) * 0.25,
+                        f64::from(height) * 0.25,
+                        f64::from(width) * 0.75,
+                        f64::from(height) * 0.75,
+                    ]);
+                    let mut times = Vec::new();
+                    for iteration in 0..11 {
+                        let start = Instant::now();
+                        for _ in 0..count {
+                            black_box(if reference {
+                                reference_mask(&map, black_box(&logits), 160, 160, 0.5, bbox)?
+                            } else {
+                                map.mask(black_box(&logits), 160, 160, 0.5, bbox)?
+                            });
+                        }
+                        if iteration >= 2 {
+                            times.push(start.elapsed());
+                        }
+                    }
+                    times.sort_unstable();
+                    println!(
+                        "mask {width}x{height} regions={count} boxed={boxed} reference={reference} median_ms={:.3}",
+                        times.get(4).context("median")?.as_secs_f64() * 1000.0
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
     #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,

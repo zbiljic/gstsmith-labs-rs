@@ -51,10 +51,6 @@ fn every_profile_registers_without_assets_and_missing_files_fail() -> Result<()>
 
 #[test]
 #[ignore = "requires explicit local segmentation assets in GSTSMITH_SEGMENT_* variables"]
-#[expect(
-    clippy::too_many_lines,
-    reason = "keep the opt-in end-to-end qualification in one test"
-)]
 fn real_segmentation() -> Result<()> {
     initialize()?;
     let profile = std::env::var("GSTSMITH_SEGMENT_PROFILE").context("GSTSMITH_SEGMENT_PROFILE")?;
@@ -79,21 +75,7 @@ fn real_segmentation() -> Result<()> {
             .copy_from_slice(source);
     }
     for _ in 0..2 {
-        let e = gst::ElementFactory::make("uslssegment").build()?;
-        e.set_property_from_str("model-profile", &profile);
-        if let Ok(provider) = std::env::var("GSTSMITH_SEGMENT_PROVIDER") {
-            e.set_property_from_str("execution-provider", &provider);
-        }
-        for (env, property) in [
-            ("GSTSMITH_SEGMENT_MODEL", "model-file"),
-            ("GSTSMITH_SEGMENT_ENCODER", "encoder-file"),
-            ("GSTSMITH_SEGMENT_DECODER", "decoder-file"),
-            ("GSTSMITH_SEGMENT_PROMPT", "prompt"),
-        ] {
-            if let Ok(value) = std::env::var(env) {
-                e.set_property(property, value);
-            }
-        }
+        let e = local_element(&profile)?;
         for _ in 0..2 {
             if let Err(error) = e.set_state(gst::State::Paused) {
                 e.set_state(gst::State::Null)?;
@@ -169,6 +151,90 @@ fn real_segmentation() -> Result<()> {
     println!(
         "{profile}: masks, pixels, timestamps, relations, restarts, standard overlay and EOS passed"
     );
+    Ok(())
+}
+
+fn local_element(profile: &str) -> Result<gst::Element> {
+    let e = gst::ElementFactory::make("uslssegment").build()?;
+    e.set_property_from_str("model-profile", profile);
+    if let Ok(provider) = std::env::var("GSTSMITH_SEGMENT_PROVIDER") {
+        e.set_property_from_str("execution-provider", &provider);
+    }
+    for (env, property) in [
+        ("GSTSMITH_SEGMENT_MODEL", "model-file"),
+        ("GSTSMITH_SEGMENT_ENCODER", "encoder-file"),
+        ("GSTSMITH_SEGMENT_DECODER", "decoder-file"),
+        ("GSTSMITH_SEGMENT_PROMPT", "prompt"),
+    ] {
+        if let Ok(value) = std::env::var(env) {
+            e.set_property(property, value);
+        }
+    }
+    Ok(e)
+}
+
+#[test]
+#[ignore = "release-only steady-state timing with local GSTSMITH_SEGMENT_* assets"]
+fn benchmark_segmentation() -> Result<()> {
+    use std::{hint::black_box, time::Instant};
+    ensure!(!cfg!(debug_assertions), "benchmark requires --release");
+    initialize()?;
+    let profile = std::env::var("GSTSMITH_SEGMENT_PROFILE").context("GSTSMITH_SEGMENT_PROFILE")?;
+    ensure!(
+        std::env::var_os("GSTSMITH_SEGMENT_PROMPT").is_none(),
+        "unset fixed prompt for prompt-count benchmark"
+    );
+    let sample = std::env::var("GSTSMITH_SEGMENT_SAMPLE").context("GSTSMITH_SEGMENT_SAMPLE")?;
+    let image = usls::Image::try_read(&sample)?;
+    let prompted =
+        profile.starts_with("sam") || matches!(profile.as_str(), "mobile-sam" | "edge-sam");
+    for (width, height) in [(640, 360), (1920, 1080)] {
+        let rgb = image::imageops::resize(
+            &image.image,
+            width,
+            height,
+            image::imageops::FilterType::Triangle,
+        );
+        let e = local_element(&profile)?;
+        let mut h = gst_check::Harness::with_element(&e, Some("sink"), Some("src"));
+        h.set_src_caps_str(&format!("video/x-raw,format=RGB,width={width},height={height},pixel-aspect-ratio=1/1,framerate=30/1"));
+        h.play();
+        for &count in if prompted {
+            &[0, 1, 4, 16][..]
+        } else {
+            &[0][..]
+        } {
+            let mut times = Vec::new();
+            for iteration in 0..8 {
+                let mut input = gst::Buffer::from_mut_slice(rgb.as_raw().clone());
+                if count > 0 {
+                    let mut meta = gst_analytics::AnalyticsRelationMeta::add(input.make_mut());
+                    for _ in 0..count {
+                        meta.add_od_mtd(
+                            gst::glib::Quark::from_str("object"),
+                            0,
+                            0,
+                            i32::try_from(width)?,
+                            i32::try_from(height)?,
+                            0.99,
+                        )?;
+                    }
+                }
+                let start = Instant::now();
+                let output = h.push_and_pull(input)?;
+                let elapsed = start.elapsed();
+                black_box(&output);
+                if iteration >= 3 {
+                    times.push(elapsed);
+                }
+            }
+            times.sort_unstable();
+            println!(
+                "pipeline {profile} {width}x{height} prompts={count} median_ms={:.3}",
+                times.get(2).context("median")?.as_secs_f64() * 1000.0
+            );
+        }
+    }
     Ok(())
 }
 
