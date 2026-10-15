@@ -29,6 +29,7 @@ gst = { workspace = true, features = ["v1_28"] }
 gst-analytics = { workspace = true }
 gst-base = { workspace = true, features = ["v1_28"] }
 gst-video = { workspace = true, features = ["v1_28"] }
+image = { workspace = true }
 ort = { workspace = true }
 segmentation-meta = { path = "../../utils/segmentation-meta" }
 usls = { workspace = true }

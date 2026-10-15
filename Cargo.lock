@@ -796,6 +796,7 @@ dependencies = [
  "gstreamer-base",
  "gstreamer-check",
  "gstreamer-video",
+ "image",
  "ort",
  "segmentation-meta",
  "usls",

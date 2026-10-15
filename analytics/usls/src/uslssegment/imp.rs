@@ -427,9 +427,17 @@ impl UslsSegment {
             } else {
                 vec![]
             };
+            if state.options.profile.prompted() && prompts.is_empty() {
+                frame::validate_rgb(buffer, info, state.maximum)?;
+                let pixels = frame::packed_size(width, height, state.maximum)? / 3;
+                ensure!(
+                    pixels <= state.options.maximum,
+                    "one mask exceeds max-mask-bytes"
+                );
+                return Ok(());
+            }
             let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<Region>> {
-                let packed = frame::copy_rgb(buffer, info, state.maximum)?;
-                let image = usls::Image::from_u8s(&packed, width, height)?;
+                let image = frame::image_rgb(buffer, info, state.maximum)?;
                 state.backend.run(&image, &prompts)
             }));
             let regions = if let Ok(result) = result {
@@ -643,6 +651,46 @@ mod tests {
         );
         h.play();
         h
+    }
+    #[test]
+    fn empty_prompts_skip_backend_but_preserve_validation() -> Result<()> {
+        let e = element(panics)?;
+        let mut h = harness(&e);
+        let input = buffer(None)?;
+        let expected = input.map_readable()?.as_slice().to_vec();
+        let output = h.push_and_pull(input)?;
+        ensure!(
+            output.map_readable()?.as_slice() == expected,
+            "carrier changed"
+        );
+        ensure!(
+            output.pts() == Some(gst::ClockTime::from_mseconds(123)),
+            "PTS changed"
+        );
+        ensure!(
+            e.imp()
+                .state
+                .lock()
+                .map_err(|_error| anyhow::anyhow!("state lock"))?
+                .is_some(),
+            "backend called"
+        );
+        let mut malformed = gst::Buffer::with_size(1)?;
+        e.imp()
+            .process(malformed.make_mut())
+            .expect_err("short carrier");
+        {
+            let mut guard = e
+                .imp()
+                .state
+                .lock()
+                .map_err(|_error| anyhow::anyhow!("state lock"))?;
+            guard.as_mut().context("state")?.options.maximum = 5;
+        }
+        e.imp()
+            .process(buffer(None)?.make_mut())
+            .expect_err("mask budget");
+        Ok(())
     }
     #[test]
     fn masks_follow_this_frames_detections_and_preserve_carrier() -> Result<()> {

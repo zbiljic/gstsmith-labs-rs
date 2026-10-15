@@ -77,11 +77,41 @@ pub(crate) fn copy_rows(
     Ok(packed)
 }
 
-pub(crate) fn copy_rgb(
+pub(crate) fn image_rgb(
     buffer: &gst::BufferRef,
     info: &gst_video::VideoInfo,
     maximum: u32,
-) -> Result<Vec<u8>> {
+) -> Result<usls::Image> {
+    let (map, offset, stride) = map_rgb(buffer, info, maximum)?;
+    let packed = copy_rows(
+        map.as_slice(),
+        offset,
+        stride,
+        info.width(),
+        info.height(),
+        maximum,
+    )?;
+    Ok(
+        image::RgbImage::from_raw(info.width(), info.height(), packed)
+            .context("invalid packed RGB dimensions")?
+            .into(),
+    )
+}
+
+pub(crate) fn validate_rgb(
+    buffer: &gst::BufferRef,
+    info: &gst_video::VideoInfo,
+    maximum: u32,
+) -> Result<()> {
+    map_rgb(buffer, info, maximum)?;
+    Ok(())
+}
+
+fn map_rgb<'a>(
+    buffer: &'a gst::BufferRef,
+    info: &gst_video::VideoInfo,
+    maximum: u32,
+) -> Result<(gst::BufferMap<'a, gst::buffer::Readable>, usize, i32)> {
     // Bound both carrier coalescing and image allocation before either map.
     ensure!(
         buffer.size() <= usize::try_from(maximum)?,
@@ -121,14 +151,7 @@ pub(crate) fn copy_rgb(
     // Safe carrier slices also handle negative stride and a last row without
     // trailing padding; the binding's plane_data() assumes a full positive plane.
     let map = buffer.map_readable().context("mapping RGB carrier")?;
-    copy_rows(
-        map.as_slice(),
-        offset,
-        stride,
-        info.width(),
-        info.height(),
-        maximum,
-    )
+    Ok((map, offset, stride))
 }
 
 #[cfg(test)]
@@ -157,11 +180,39 @@ mod tests {
     }
 
     #[test]
+    fn owned_images_honor_video_meta_stride_and_offset() -> Result<()> {
+        gst::init()?;
+        let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgb, 3, 2).build()?;
+        for (offset, stride, expected) in [
+            (1, 12, (1..=18).collect::<Vec<_>>()),
+            (13, -12, (10..=18).chain(1..=9).collect::<Vec<_>>()),
+        ] {
+            let mut data = vec![99];
+            data.extend(1..=9);
+            data.extend([99; 3]);
+            data.extend(10..=18);
+            let mut buffer = gst::Buffer::from_mut_slice(data.clone());
+            gst_video::VideoMeta::add_full(
+                buffer.make_mut(),
+                gst_video::VideoFrameFlags::empty(),
+                gst_video::VideoFormat::Rgb,
+                3,
+                2,
+                &[offset],
+                &[stride],
+            )?;
+            let image = image_rgb(&buffer, &info, 1024)?;
+            ensure!(image.as_raw() == &expected, "image rows");
+            ensure!(buffer.map_readable()?.as_slice() == data, "carrier changed");
+        }
+        Ok(())
+    }
+    #[test]
     fn padded_carrier_is_bounded_before_mapping() -> Result<()> {
         gst::init()?;
         let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgb, 1, 1).build()?;
         let buffer = gst::Buffer::with_size(1024)?;
-        copy_rgb(&buffer, &info, 32)
+        image_rgb(&buffer, &info, 32)
             .expect_err("carrier exceeds limit even though packed pixels fit");
         Ok(())
     }
@@ -180,7 +231,7 @@ mod tests {
                 &[offset],
                 &[stride],
             )?;
-            copy_rgb(&buffer, &info, 1024).expect_err("malformed VideoMeta extent");
+            image_rgb(&buffer, &info, 1024).expect_err("malformed VideoMeta extent");
         }
         Ok(())
     }

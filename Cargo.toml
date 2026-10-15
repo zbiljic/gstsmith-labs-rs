@@ -28,6 +28,7 @@ gst-check = { package = "gstreamer-check", version = "0.25.0", features = ["v1_2
 gst-plugin-version-helper = "0.8.4"
 gst-video = { package = "gstreamer-video", version = "0.25.4" }
 h264-reader = "0.9.0"
+image = { version = "0.25", default-features = false }
 memchr = "2.8.3"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "api-28"] }
 usls = { git = "https://github.com/jamjamjon/usls", rev = "c15ad77c1879dbf1117376d34d3022a325cd9cdc", default-features = false, features = ["vision", "ort-download-binaries", "ort-api-28"] }

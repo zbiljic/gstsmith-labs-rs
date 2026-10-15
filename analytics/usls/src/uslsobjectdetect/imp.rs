@@ -340,8 +340,7 @@ impl UslsObjectDetect {
             let state = guard.as_mut().context("runtime is unavailable")?;
             let info = state.info.as_ref().context("RGB caps are not negotiated")?;
             let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<Detection>> {
-                let packed = frame::copy_rgb(buffer, info, state.maximum)?;
-                let image = usls::Image::from_u8s(&packed, info.width(), info.height())?;
+                let image = frame::image_rgb(buffer, info, state.maximum)?;
                 state.backend.run(&image)
             }));
             if let Ok(result) = result {
