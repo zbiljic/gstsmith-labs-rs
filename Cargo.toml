@@ -20,7 +20,7 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1.0.104"
 atomic_refcell = "0.1.14"
-criterion = "0.8"
+criterion = "0.8.2"
 gst = { package = "gstreamer", version = "0.25.4", features = ["v1_24"] }
 gst-analytics = { package = "gstreamer-analytics", version = "0.25.4", features = ["v1_28"] }
 gst-base = { package = "gstreamer-base", version = "0.25.4", features = ["v1_24"] }
