@@ -1,0 +1,1950 @@
+//! The playback pipeline: a source and a standby pattern, one shown at a
+//! time, and one `wallwarp` branch per display.
+//!
+//! ```text
+//! source  ! identity ! videoconvert [! videocrop] ! videoscale [! videorate] ! RGBA canvas [! clocksync] ! selector.
+//! standby ! identity ! videoconvert ! videoscale ! RGBA canvas ! selector.
+//! input-selector name=selector ! tee
+//!   tee. ! queue ! wallwarp ! webrtcsink meta="meta,display=<id>"   (per display)
+//! ```
+//!
+//! The source and the standby are each a bin that is swapped while playing,
+//! so the displays keep their streams when the source changes. The source
+//! shows from its first frame; the standby shows while it connects, after it
+//! ends, and when it fails or stalls. A source that fails is retried after a
+//! growing delay, and one that ends restarts if asked to, so clips loop and
+//! streams reconnect. Built-in patterns skip `videorate` and `clocksync`,
+//! which only files and other sources need, and which add latency.
+//!
+//! Every `webrtcsink` is its own producer, announced to the signalling server
+//! with the display's ID in its metadata, and encodes separately for every
+//! browser that connects. Each sink runs its own signalling server on its own
+//! port by default: `webrtcsink`'s signalling client connects once, without
+//! retrying, so several sinks cannot rely on a server another sink starts. An
+//! external server, such as `gst-webrtc-signalling-server`, can serve all
+//! displays instead.
+
+use std::net::TcpListener;
+use std::str::FromStr as _;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail, ensure};
+use gst::prelude::*;
+use gst_video::prelude::*;
+use serde::{Deserialize, Serialize};
+use wall_geometry::{Layout, Screen, Size};
+
+use crate::drift::Measurement;
+use crate::framecode::{self, CodeGeometry};
+use crate::source::{Input, Prepared, Resolver, SLATE_TEXT, Source, Via};
+
+/// Where browsers find the signalling server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Signalling {
+    /// Every display's sink serves on its own port, the first free ones from
+    /// `first_port` in layout order, listening on `host`.
+    BuiltIn { host: String, first_port: u16 },
+    /// One server at this `ws://` or `wss://` URI for every display; browsers
+    /// use the same URI, so it must name an address they can reach.
+    External(String),
+}
+
+/// What ends every branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Sink {
+    WebRtc(Signalling),
+    /// An `appsink` named `sink-<id>`, for tests.
+    AppSink,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerOptions {
+    pub source: Prepared,
+    /// The pattern shown whenever the source is not.
+    pub standby: String,
+    /// Restart the source when it ends: clips loop and streams reconnect.
+    pub restart: bool,
+    pub fps: u32,
+    pub sink: Sink,
+    pub fill: Fill,
+    /// Finds web pages' streams again when they fail, since their URLs expire.
+    pub resolver: Resolver,
+}
+
+/// How a source whose aspect ratio differs from the canvas fills it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Fill {
+    /// Crop the source to the canvas's aspect ratio, so the displays show no
+    /// empty bars and the source's edges may be cut off.
+    #[default]
+    Cover,
+    /// Show the whole source, with black bars on two sides.
+    Contain,
+}
+
+/// Longest side of a display's preview, in pixels.
+const PREVIEW_PIXELS: u32 = 480;
+
+/// Most previews per second.
+const PREVIEW_RATE: i32 = 4;
+
+/// How a display reaches its stream, as sent to its page.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Endpoint {
+    /// The built-in server's port on the host serving the page.
+    Port(u16),
+    /// A signalling server URI.
+    Uri(String),
+    /// No browser endpoint, as with test sinks.
+    None,
+}
+
+/// One display's branch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Route {
+    pub display: String,
+    pub output: Size,
+    pub endpoint: Endpoint,
+    /// Which pipeline the stream belongs to; its producer announces the same
+    /// number, so browsers skip producers of pipelines that failed to stop.
+    pub generation: u32,
+    /// Where measuring draws the frame code, if it fits.
+    pub code: Option<CodeGeometry>,
+}
+
+/// Something the pipeline reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlayerEvent {
+    Playing,
+    Finished,
+    Failed(String),
+}
+
+/// Milliseconds since a fixed start, shared with the browsers' clock sync.
+#[derive(Clone, Copy, Debug)]
+pub struct Clock(Instant);
+
+impl Clock {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Instant::now())
+    }
+
+    #[must_use]
+    pub fn now_ms(&self) -> f64 {
+        self.0.elapsed().as_secs_f64() * 1000.0
+    }
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The latest frame of a preview sink as JPEG, or `None` before the first.
+pub fn preview_jpeg(sink: &gst::Element) -> Result<Option<Vec<u8>>> {
+    let Some(sample) = sink.property::<Option<gst::Sample>>("last-sample") else {
+        return Ok(None);
+    };
+    let caps = sample.caps().context("preview without caps")?;
+    let info = gst_video::VideoInfo::from_caps(caps)?;
+    let buffer = sample.buffer().context("preview without a buffer")?;
+    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+        .map_err(|_err| anyhow::anyhow!("cannot map a preview frame"))?;
+    let stride = frame
+        .plane_stride()
+        .first()
+        .and_then(|stride| usize::try_from(*stride).ok())
+        .context("preview without a stride")?;
+    let (width, height) = (info.width(), info.height());
+    let row = usize::try_from(width)? * 4;
+    let rows = usize::try_from(height)?;
+    let mut pixels = Vec::with_capacity(row * rows);
+    for line in frame.plane_data(0)?.chunks(stride).take(rows) {
+        pixels.extend(line.get(..row).context("short preview row")?);
+    }
+    let image = image::RgbaImage::from_raw(width, height, pixels).context("preview size")?;
+    let mut jpeg = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .to_rgb8()
+        .write_to(&mut jpeg, image::ImageFormat::Jpeg)?;
+    Ok(Some(jpeg.into_inner()))
+}
+
+/// The frame number of a running time at `fps` frames per second.
+#[must_use]
+pub fn frame_number(running: gst::ClockTime, fps: u32) -> u64 {
+    let frames = (u128::from(running.nseconds()) * u128::from(fps) + 500_000_000) / 1_000_000_000;
+    u64::try_from(frames).unwrap_or(u64::MAX)
+}
+
+/// Asks the bus thread to finish.
+const STOP_MESSAGE: &str = "wallplay-stop";
+
+/// Fail early, with what to install, when an element WebRTC playback needs
+/// is missing; otherwise every browser session fails on its own.
+fn check_webrtc_elements() -> Result<()> {
+    if gst::ElementFactory::find("webrtcsink").is_none() {
+        bail!("webrtcsink is not available; install the rswebrtc plugin from gst-plugins-rs");
+    }
+    if ["nicesrc", "nicesink"]
+        .iter()
+        .any(|factory| gst::ElementFactory::find(factory).is_none())
+    {
+        bail!(
+            "webrtcbin needs libnice's GStreamer elements, which are not available; install \
+             libnice's GStreamer plugin, often packaged apart from GStreamer itself"
+        );
+    }
+    Ok(())
+}
+
+/// Numbers every pipeline started in this process.
+static GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// How long after a browser connects a session may still be negotiating;
+/// see [`Player::stop`].
+const SETTLE: Duration = Duration::from_millis(1500);
+
+/// How many ports past the preferred one a signalling server may move to.
+const PORT_SEARCH: u16 = 100;
+
+/// The first port from `start` that `host` can listen on and is not in
+/// `taken`. A pipeline whose teardown hangs keeps its signalling ports.
+fn free_port(host: &str, start: u16, taken: &[u16]) -> Option<u16> {
+    (start..=start.saturating_add(PORT_SEARCH))
+        .filter(|port| !taken.contains(port))
+        .find(|port| TcpListener::bind((host, *port)).is_ok())
+}
+
+/// A running pipeline. Dropping it stops playback; [`Player::stop`] does so
+/// without blocking.
+pub struct Player {
+    pipeline: gst::Pipeline,
+    inputs: Arc<Inputs>,
+    routes: Vec<Route>,
+    /// Every display's warp, in layout order.
+    warps: Vec<Warp>,
+    measuring: Arc<AtomicBool>,
+    drawing: Arc<AtomicBool>,
+    /// When a browser last started a session.
+    last_consumer: Arc<Mutex<Option<Instant>>>,
+    bus_thread: Option<JoinHandle<()>>,
+}
+
+/// A display's `wallwarp` and the quad it takes next.
+struct Warp {
+    display: String,
+    element: gst::Element,
+    /// A quad for another canvas size, taken when frames of that size
+    /// arrive, so no frame is warped with the other canvas's quad.
+    pending: Arc<Mutex<Option<(Size, String)>>>,
+}
+
+impl Warp {
+    fn install(element: &gst::Element, display: &str) -> Result<Self> {
+        let pending: Arc<Mutex<Option<(Size, String)>>> = Arc::default();
+        let waiting = Arc::clone(&pending);
+        let warp = element.downgrade();
+        element
+            .static_pad("sink")
+            .context("wallwarp has no sink pad")?
+            .add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+                if let Some(gst::PadProbeData::Event(event)) = &info.data
+                    && let gst::EventView::Caps(caps) = event.view()
+                    && let Ok(video) = gst_video::VideoInfo::from_caps(caps.caps())
+                {
+                    let mut waiting = lock(&waiting);
+                    let size = Size {
+                        width: video.width(),
+                        height: video.height(),
+                    };
+                    if let Some((canvas, quad)) = waiting.take_if(|(canvas, _)| *canvas == size)
+                        && let Some(warp) = warp.upgrade()
+                    {
+                        gst::debug!(gst::CAT_DEFAULT, "new quad for {canvas:?}");
+                        warp.set_property("quad", quad);
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        Ok(Self {
+            display: display.to_owned(),
+            element: element.clone(),
+            pending,
+        })
+    }
+}
+
+fn make(factory: &str) -> Result<gst::Element> {
+    gst::ElementFactory::make(factory)
+        .build()
+        .with_context(|| format!("creating {factory}; is its GStreamer plugin installed?"))
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// How long the source may go without a frame before the standby shows.
+const STALL_STANDBY: Duration = Duration::from_secs(2);
+
+/// How long the source may go without a frame before it restarts.
+const STALL_RESTART: Duration = Duration::from_secs(10);
+
+/// How long a source may take to show its first frame.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Seconds before retrying a source that failed, the last repeating.
+const RETRY_DELAYS: [u64; 4] = [1, 2, 5, 10];
+
+/// A source that ends sooner than this after starting is retried after a
+/// delay instead of restarted at once.
+const SHORTEST_RUN: Duration = Duration::from_secs(1);
+
+/// How far ahead of the clock a source that is not live starts, as slack
+/// against network hiccups.
+const START_MARGIN: gst::ClockTime = gst::ClockTime::from_mseconds(300);
+
+/// How often the bus thread looks after the inputs.
+const TICK: Duration = Duration::from_millis(250);
+
+/// Posted by an input bin whose stream ended.
+const ENDED_MESSAGE: &str = "wallplay-input-ended";
+
+/// Name of the `clocksync` that plays sources in real time.
+const PACE: &str = "pace";
+
+/// Prefix of input bins' names, which end in the attempt's number.
+const INPUT_PREFIX: &str = "input-";
+
+/// One of the selector's two inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Main,
+    Standby,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Main => "source",
+            Self::Standby => "standby",
+        }
+    }
+}
+
+/// What the source is doing, for the control page.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SourceStatus {
+    /// `starting`, `playing`, `retrying` or `ended`.
+    pub state: String,
+    /// Why it last failed, until it plays again.
+    pub error: Option<String>,
+    /// Whether the displays show the standby pattern.
+    pub standby: bool,
+    /// How often it restarted after ending or failing.
+    pub restarts: u32,
+}
+
+/// Name of the `capsfilter` giving an input the canvas's size.
+const CANVAS_CAPS: &str = "canvas";
+
+/// Name of the `videocrop` cropping a source to the canvas.
+const CROP: &str = "crop";
+
+/// The canvas every input is converted to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Canvas {
+    size: Size,
+    fps: u32,
+    fill: Fill,
+}
+
+impl Canvas {
+    /// Elements converting `input`'s video to the canvas, starting with an
+    /// `identity` whose output [`align_start`] moves to the clock. Patterns
+    /// are live and produce the canvas frame rate themselves; other sources
+    /// may not, so `videorate` matches the rate, holding a frame to do so,
+    /// and a `clocksync` named [`PACE`] plays them in real time.
+    fn chain(&self, input: &Input) -> Result<Vec<gst::Element>> {
+        let entry = make("identity")?;
+        let convert = make("videoconvert")?;
+        let scale = gst::ElementFactory::make("videoscale")
+            .property("add-borders", true)
+            .build()?;
+        let filter = gst::ElementFactory::make("capsfilter")
+            .name(CANVAS_CAPS)
+            .property("caps", self.caps()?)
+            .build()?;
+        if input.is_pattern() {
+            return Ok(vec![entry, convert, scale, filter]);
+        }
+        // Cropping to the canvas's aspect ratio first leaves scaling no
+        // borders to add.
+        let crop = if self.fill == Fill::Cover {
+            Some(cover_crop(&filter)?)
+        } else {
+            None
+        };
+        Ok([entry, convert]
+            .into_iter()
+            .chain(crop)
+            .chain([
+                scale,
+                make("videorate")?,
+                filter,
+                gst::ElementFactory::make("clocksync").name(PACE).build()?,
+            ])
+            .collect())
+    }
+
+    fn caps(&self) -> Result<gst::Caps> {
+        let fps = i32::try_from(self.fps).context("frame rate too large")?;
+        Ok(gst_video::VideoCapsBuilder::new()
+            .format(gst_video::VideoFormat::Rgba)
+            .width(i32::try_from(self.size.width)?)
+            .height(i32::try_from(self.size.height)?)
+            .framerate(gst::Fraction::new(fps, 1))
+            .pixel_aspect_ratio(gst::Fraction::new(1, 1))
+            .build())
+    }
+
+    /// Convert the running chain in `bin` to this canvas, which has the same
+    /// fill as the one it was made for.
+    /// A cropping `videocrop` follows the canvas caps by itself.
+    fn retarget(&self, bin: &gst::Bin) -> Result<()> {
+        bin.by_name(CANVAS_CAPS)
+            .context("an input without its canvas caps")?
+            .set_property("caps", self.caps()?);
+        Ok(())
+    }
+}
+
+/// A `videocrop` cutting its input to the aspect ratio of the caps that
+/// `canvas`, a capsfilter, asks for. The crop is worked out on the streaming
+/// thread from each caps event and frame, so it always fits the frames it
+/// cuts. (`aspectratiocrop` keeps the caps it saw when its ratio was set and
+/// applies them to the next frame, so a source that changes size with the
+/// canvas got cropped, and mapped, as if it still had its old size.)
+fn cover_crop(canvas: &gst::Element) -> Result<gst::Element> {
+    let crop = gst::ElementFactory::make("videocrop")
+        .name(CROP)
+        .build()
+        .context("creating videocrop; is gst-plugins-good installed?")?;
+    let pad = crop
+        .static_pad("sink")
+        .context("a videocrop without a sink pad")?;
+    let canvas = canvas.downgrade();
+    let element = crop.downgrade();
+    // videocrop starts uncropped; setting a side, even to its current value,
+    // makes it renegotiate, so only changes are set.
+    let applied = Mutex::new(Sides::default());
+    pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+        move |pad, info| {
+            let caps = match &info.data {
+                Some(gst::PadProbeData::Event(event)) => match event.view() {
+                    gst::EventView::Caps(caps) => Some(caps.caps_owned()),
+                    _ => None,
+                },
+                Some(gst::PadProbeData::Buffer(_)) => pad.current_caps(),
+                _ => None,
+            };
+            let (Some(caps), Some(canvas), Some(element)) =
+                (caps, canvas.upgrade(), element.upgrade())
+            else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let sides = gst_video::VideoInfo::from_caps(&caps)
+                .ok()
+                .zip(gst_video::VideoInfo::from_caps(&canvas.property::<gst::Caps>("caps")).ok())
+                .map(|(frame, target)| Sides::covering(&frame, target.width(), target.height()))
+                .unwrap_or_default();
+            let mut applied = lock(&applied);
+            if *applied != sides {
+                element.set_property("top", sides.top);
+                element.set_property("bottom", sides.bottom);
+                element.set_property("left", sides.left);
+                element.set_property("right", sides.right);
+                *applied = sides;
+            }
+            gst::PadProbeReturn::Ok
+        },
+    )
+    .context("watching the crop's input")?;
+    Ok(crop)
+}
+
+/// Rows and columns a `videocrop` removes from each edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Sides {
+    top: i32,
+    bottom: i32,
+    left: i32,
+    right: i32,
+}
+
+impl Sides {
+    /// The equal crop on two opposite edges that leaves `frame` with the
+    /// aspect ratio of a `width` × `height` canvas of square pixels, or none
+    /// when it already has it or would lose everything. Rounds as
+    /// `aspectratiocrop` does, toward a slightly larger remainder.
+    fn covering(frame: &gst_video::VideoInfo, width: u32, height: u32) -> Self {
+        let (w, h) = (i64::from(frame.width()), i64::from(frame.height()));
+        let par = frame.par();
+        let (pn, pd) = (i64::from(par.numer()), i64::from(par.denom()));
+        let (tw, th) = (i64::from(width), i64::from(height));
+        if w == 0 || h == 0 || tw == 0 || th == 0 || pn <= 0 || pd <= 0 {
+            return Self::default();
+        }
+        // Compare w·pn / (h·pd) with tw / th without rounding.
+        let shown = w * pn * th;
+        let wanted = tw * h * pd;
+        let side = |excess: i64, scale: i64, full: i64| {
+            let cut = excess / (2 * scale);
+            (cut < full / 2).then(|| i32::try_from(cut).ok()).flatten()
+        };
+        match wanted.cmp(&shown) {
+            // Too tall: keep w·pn·th / (tw·pd) of the h rows.
+            std::cmp::Ordering::Greater => side(wanted - shown, tw * pd, h)
+                .map(|cut| Self {
+                    top: cut,
+                    bottom: cut,
+                    ..Self::default()
+                })
+                .unwrap_or_default(),
+            // Too wide: keep h·pd·tw / (th·pn) of the w columns.
+            std::cmp::Ordering::Less => side(shown - wanted, th * pn, w)
+                .map(|cut| Self {
+                    left: cut,
+                    right: cut,
+                    ..Self::default()
+                })
+                .unwrap_or_default(),
+            std::cmp::Ordering::Equal => Self::default(),
+        }
+    }
+}
+
+/// How far to move a stream whose first buffer is `buffer`, leaving `pad`,
+/// so that it starts with the next canvas frame of `period`, or a little
+/// later if it is not live: a file starts at running time zero wherever the
+/// pipeline's clock is. Starting on a frame of the canvas keeps frame
+/// numbers from repeating where the selector switches. Also returns whether
+/// the stream is live.
+fn start_offset(
+    pad: &gst::Pad,
+    upstream: &gst::Pad,
+    buffer: &gst::BufferRef,
+    period: gst::ClockTime,
+) -> Option<(i64, bool)> {
+    let element = pad.parent_element()?;
+    let now = element.clock()?.time().checked_sub(element.base_time()?)?;
+    let segment = pad.sticky_event::<gst::event::Segment>(0)?;
+    let running = segment
+        .segment()
+        .downcast_ref::<gst::format::Time>()?
+        .to_running_time(buffer.pts()?)?;
+    let mut latency = gst::query::Latency::new();
+    let live = upstream.peer_query(&mut latency) && latency.result().0;
+    let start = if live { now } else { now + START_MARGIN };
+    let period = period.nseconds().max(1);
+    let start = (start.nseconds() / period + 1).checked_mul(period)?;
+    let offset = i64::try_from(start).ok()? - i64::try_from(running.nseconds()).ok()?;
+    Some((offset.max(0), live))
+}
+
+/// Move the stream leaving `entry` to the clock on its first buffer. An
+/// input added to a playing pipeline would otherwise start in the past, and
+/// `pace` would let it race to catch up. A live stream comes in real time
+/// already, and waiting for its latency on top would only delay it, so it
+/// passes `pace` without waiting.
+fn align_start(entry: &gst::Element, pace: Option<gst::Element>, fps: u32) -> Result<()> {
+    let period = gst::ClockTime::SECOND
+        .mul_div_floor(1, u64::from(fps.max(1)))
+        .context("frame rate too large")?;
+    let src = entry
+        .static_pad("src")
+        .context("identity has no source pad")?;
+    let sink = entry
+        .static_pad("sink")
+        .context("identity has no sink pad")?;
+    // A blocking probe runs before the pad sends its sticky events again,
+    // so the first buffer already goes out with the new offset.
+    src.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::BLOCK,
+        move |pad, info| {
+            if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data
+                && let Some((offset, live)) = start_offset(pad, &sink, buffer, period)
+            {
+                pad.set_offset(offset);
+                if let Some(pace) = pace.as_ref().filter(|_| live) {
+                    pace.set_property("sync", false);
+                }
+            }
+            gst::PadProbeReturn::Remove
+        },
+    );
+    Ok(())
+}
+
+/// Link `source`'s video pads to `entry` as they appear, and anything else,
+/// such as a WHEP stream's audio, to a `fakesink`.
+fn link_dynamic(source: &gst::Element, entry: &gst::Element, bin: &gst::Bin) -> Result<()> {
+    let sink = entry
+        .static_pad("sink")
+        .context("identity has no sink pad")?;
+    let bin = bin.downgrade();
+    source.connect_pad_added(move |_source, pad| {
+        if !pad.name().starts_with("audio") && !sink.is_linked() && pad.link(&sink).is_ok() {
+            return;
+        }
+        let Some(bin) = bin.upgrade() else {
+            return;
+        };
+        let linked = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .property("async", false)
+            .build()
+            .map_err(anyhow::Error::from)
+            .and_then(|fakesink| {
+                bin.add(&fakesink)?;
+                fakesink.sync_state_with_parent()?;
+                let fakesink_pad = fakesink.static_pad("sink").context("fakesink has no pad")?;
+                pad.link(&fakesink_pad)?;
+                Ok(())
+            });
+        if let Err(error) = linked {
+            gst::warning!(gst::CAT_DEFAULT, "could not discard a stream: {error:#}");
+        }
+    });
+    Ok(())
+}
+
+/// Which input the selector shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Showing {
+    Standby,
+    /// The current source.
+    Main,
+    /// The source being replaced, until the new one's first frame.
+    Outgoing,
+}
+
+/// The selector and which input it shows.
+struct Selection {
+    selector: gst::Element,
+    /// Where each input joins the selector.
+    main: Option<gst::Pad>,
+    standby: Option<gst::Pad>,
+    outgoing: Option<gst::Pad>,
+    showing: Showing,
+}
+
+impl Selection {
+    fn show(&mut self, showing: Showing) {
+        self.showing = showing;
+        let pad = match showing {
+            Showing::Main => self.main.as_ref(),
+            Showing::Standby => self.standby.as_ref(),
+            Showing::Outgoing => self.outgoing.as_ref(),
+        };
+        if let Some(pad) = pad {
+            self.selector.set_property("active-pad", pad);
+        }
+    }
+
+    /// A frame left the input that joins at `pad`.
+    fn frame(&mut self, pad: &gst::Pad) {
+        if self.showing != Showing::Main && self.main.as_ref() == Some(pad) {
+            self.show(Showing::Main);
+        }
+    }
+
+    /// The source that joins at `pad` stalled.
+    fn stalled(&mut self, pad: &gst::Pad) {
+        let shown = match self.showing {
+            Showing::Main => self.main.as_ref(),
+            Showing::Outgoing => self.outgoing.as_ref(),
+            Showing::Standby => None,
+        };
+        if shown == Some(pad) {
+            self.show(Showing::Standby);
+        }
+    }
+
+    /// The source joining at `pad` is being replaced: keep showing it, if
+    /// it shows, until the next source's first frame.
+    fn hand_over(&mut self, pad: &gst::Pad) {
+        if self.main.as_ref() != Some(pad) {
+            return;
+        }
+        self.outgoing = self.main.take();
+        if self.showing == Showing::Main {
+            self.showing = Showing::Outgoing;
+        }
+    }
+
+    /// The source being replaced, joining at `pad`, stops.
+    fn drop_outgoing(&mut self, pad: &gst::Pad) {
+        if self.outgoing.as_ref() != Some(pad) {
+            return;
+        }
+        if self.showing == Showing::Outgoing {
+            self.show(Showing::Standby);
+        }
+        self.outgoing = None;
+    }
+
+    /// `role` now joins at `pad`, or not at all; a source shows from its
+    /// first frame.
+    fn join(&mut self, role: Role, pad: Option<gst::Pad>) {
+        match role {
+            Role::Main => {
+                self.main = pad;
+                if self.showing == Showing::Main {
+                    self.show(Showing::Standby);
+                }
+            }
+            Role::Standby => {
+                self.standby = pad;
+                if self.showing == Showing::Standby {
+                    self.show(Showing::Standby);
+                }
+            }
+        }
+    }
+}
+
+/// What went wrong in an input, briefly: the error and the last line of its
+/// details, which often says more, as in "Not Found" and "Not Found (404),
+/// URL: …".
+fn input_error(error: &gst::message::Error) -> String {
+    let message = error.error().to_string();
+    let detail = error
+        .debug()
+        .and_then(|debug| debug.lines().last().map(str::trim).map(str::to_owned))
+        .filter(|detail| !detail.is_empty() && *detail != message && detail.len() <= 200);
+    match detail {
+        Some(detail) => format!("{message} ({detail})"),
+        None => message,
+    }
+}
+
+/// Watch frames and the end of the stream leaving an input's bin: frames
+/// keep the time of the latest one and show the source; the end of the
+/// stream is held back from the selector and reported on the bus.
+fn watch_output(
+    ghost: &gst::Pad,
+    joined: gst::Pad,
+    bin: &gst::Bin,
+    last_frame: Arc<Mutex<Option<Instant>>>,
+    selection: Arc<Mutex<Selection>>,
+) {
+    let bin = bin.downgrade();
+    ghost.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+        move |_pad, info| match &info.data {
+            Some(gst::PadProbeData::Buffer(_)) => {
+                *lock(&last_frame) = Some(Instant::now());
+                lock(&selection).frame(&joined);
+                gst::PadProbeReturn::Ok
+            }
+            Some(gst::PadProbeData::Event(event)) if event.type_() == gst::EventType::Eos => {
+                if let Some(bin) = bin.upgrade() {
+                    let ended = gst::message::Application::builder(gst::Structure::new_empty(
+                        ENDED_MESSAGE,
+                    ))
+                    .src(&bin)
+                    .build();
+                    if bin.post_message(ended).is_err() {
+                        gst::warning!(gst::CAT_DEFAULT, "could not report an ended input");
+                    }
+                }
+                gst::PadProbeReturn::Drop
+            }
+            _ => gst::PadProbeReturn::Ok,
+        },
+    );
+}
+
+/// A URL's file name, or its host if it has none, for the slate.
+fn short_name(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let host = rest.split('/').next().unwrap_or(rest);
+    let file = rest
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|file| *file != host && !file.is_empty());
+    file.unwrap_or(host).to_owned()
+}
+
+/// One attempt at playing an input.
+struct Attempt {
+    bin: gst::Bin,
+    /// Where it joins the selector.
+    pad: gst::Pad,
+    started: Instant,
+    /// When its latest frame left the bin.
+    last_frame: Arc<Mutex<Option<Instant>>>,
+    /// What its slate, if it is one, last said.
+    slate: String,
+}
+
+impl Attempt {
+    fn owns(&self, object: &gst::Object) -> bool {
+        object == self.bin.upcast_ref::<gst::Object>() || object.has_as_ancestor(&self.bin)
+    }
+}
+
+/// One input of the selector and what plays on it.
+struct Feed {
+    role: Role,
+    source: Prepared,
+    attempt: Option<Attempt>,
+    /// The attempt being replaced, shown until `attempt`'s first frame.
+    outgoing: Option<Attempt>,
+    /// Numbers attempts, naming their bins.
+    serial: u64,
+    /// Failures since it last played.
+    failures: u32,
+    retry_at: Option<Instant>,
+    /// Finding a web page's stream again.
+    resolving: Option<JoinHandle<Result<Prepared>>>,
+}
+
+impl Feed {
+    fn new(role: Role, source: Prepared) -> Self {
+        Self {
+            role,
+            source,
+            attempt: None,
+            outgoing: None,
+            serial: 0,
+            failures: 0,
+            retry_at: None,
+            resolving: None,
+        }
+    }
+
+    /// Whether `object` belongs to its current attempt.
+    fn owns(&self, object: &gst::Object) -> bool {
+        self.attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.owns(object))
+    }
+
+    /// Whether `object` belongs to the attempt being replaced.
+    fn owned_by_outgoing(&self, object: &gst::Object) -> bool {
+        self.outgoing
+            .as_ref()
+            .is_some_and(|attempt| attempt.owns(object))
+    }
+}
+
+struct Feeds {
+    main: Feed,
+    standby: Feed,
+    /// Set once the player stops, so nothing restarts.
+    stopped: bool,
+}
+
+/// Everything that swaps and restarts the inputs, shared by the player, its
+/// bus thread and pad probes.
+///
+/// Lock order: `feeds`, then `selection`, then `status`. Pad probes take only
+/// `selection` and an attempt's `last_frame`.
+struct Inputs {
+    pipeline: gst::Pipeline,
+    selector: gst::Element,
+    canvas: Mutex<Canvas>,
+    resolver: Resolver,
+    restart: AtomicBool,
+    /// Tells the bus thread to finish.
+    halted: AtomicBool,
+    feeds: Mutex<Feeds>,
+    selection: Arc<Mutex<Selection>>,
+    status: Mutex<SourceStatus>,
+}
+
+impl Inputs {
+    fn new(
+        pipeline: &gst::Pipeline,
+        selector: gst::Element,
+        canvas: Size,
+        options: &PlayerOptions,
+    ) -> Result<Self> {
+        Ok(Self {
+            pipeline: pipeline.clone(),
+            selector: selector.clone(),
+            canvas: Mutex::new(Canvas {
+                size: canvas,
+                fps: options.fps,
+                fill: options.fill,
+            }),
+            resolver: options.resolver.clone(),
+            restart: AtomicBool::new(options.restart),
+            halted: AtomicBool::new(false),
+            feeds: Mutex::new(Feeds {
+                main: Feed::new(Role::Main, options.source.clone()),
+                standby: Feed::new(Role::Standby, Prepared::pattern(&options.standby)?),
+                stopped: false,
+            }),
+            selection: Arc::new(Mutex::new(Selection {
+                selector,
+                main: None,
+                standby: None,
+                outgoing: None,
+                showing: Showing::Standby,
+            })),
+            status: Mutex::new(SourceStatus::default()),
+        })
+    }
+
+    fn feed(feeds: &mut Feeds, role: Role) -> &mut Feed {
+        match role {
+            Role::Main => &mut feeds.main,
+            Role::Standby => &mut feeds.standby,
+        }
+    }
+
+    /// Start a new attempt at `feed`'s source.
+    fn start(&self, feed: &mut Feed) {
+        feed.serial += 1;
+        feed.retry_at = None;
+        match self.attach(feed.role, feed.serial, &feed.source.input) {
+            Ok(attempt) => {
+                feed.attempt = Some(attempt);
+                if feed.role == Role::Main {
+                    "starting".clone_into(&mut lock(&self.status).state);
+                }
+            }
+            Err(error) => self.fail(feed, &format!("{error:#}")),
+        }
+    }
+
+    /// Build a bin playing `input`, join it to the selector and start it.
+    fn attach(&self, role: Role, serial: u64, input: &Input) -> Result<Attempt> {
+        let bin = gst::Bin::with_name(&format!("{INPUT_PREFIX}{}-{serial}", role.name()));
+        // A source still prerolling, or one that never will, must not take
+        // the pipeline back to paused, which would stop the standby too.
+        bin.set_property("async-handling", true);
+        let configured = input.clone();
+        bin.connect_deep_element_added(move |_bin, _parent, element| {
+            configured.configure(element);
+        });
+        let canvas = *lock(&self.canvas);
+        let source = input.element(canvas.size)?;
+        let chain = canvas.chain(input)?;
+        bin.add(&source)?;
+        bin.add_many(&chain)?;
+        gst::Element::link_many(&chain)?;
+        let (Some(entry), Some(last)) = (chain.first(), chain.last()) else {
+            bail!("empty canvas chain");
+        };
+        if source.static_pad("src").is_some() {
+            source
+                .link(entry)
+                .context("the source pipeline has no video output")?;
+        } else {
+            link_dynamic(&source, entry, &bin)?;
+        }
+        let ghost = gst::GhostPad::with_target(
+            &last
+                .static_pad("src")
+                .context("capsfilter has no source pad")?,
+        )?;
+        bin.add_pad(&ghost)?;
+        align_start(entry, bin.by_name(PACE), canvas.fps)?;
+        self.pipeline.add(&bin)?;
+        let Some(pad) = self.selector.request_pad_simple("sink_%u") else {
+            self.pipeline.remove(&bin)?;
+            bail!("input-selector has no input to give");
+        };
+        let last_frame = Arc::new(Mutex::new(None));
+        watch_output(
+            ghost.upcast_ref(),
+            pad.clone(),
+            &bin,
+            Arc::clone(&last_frame),
+            Arc::clone(&self.selection),
+        );
+        if let Err(error) = ghost.link(&pad) {
+            self.selector.release_request_pad(&pad);
+            self.pipeline.remove(&bin)?;
+            return Err(error.into());
+        }
+        lock(&self.selection).join(role, Some(pad.clone()));
+        // A source that cannot start, such as a missing file, posts why on
+        // the bus, which retries it.
+        if bin.sync_state_with_parent().is_err() {
+            gst::info!(gst::CAT_DEFAULT, "an input did not start");
+        }
+        Ok(Attempt {
+            bin,
+            pad,
+            started: Instant::now(),
+            last_frame,
+            slate: String::new(),
+        })
+    }
+
+    /// Stop `feed`'s current attempt on another thread, since stopping a
+    /// network source can take a while.
+    fn retire(&self, feed: &mut Feed) {
+        let Some(attempt) = feed.attempt.take() else {
+            return;
+        };
+        {
+            let mut selection = lock(&self.selection);
+            let joined = match feed.role {
+                Role::Main => selection.main.as_ref(),
+                Role::Standby => selection.standby.as_ref(),
+            };
+            if joined == Some(&attempt.pad) {
+                selection.join(feed.role, None);
+            }
+        }
+        self.stop_attempt(attempt);
+    }
+
+    /// Stop the attempt `feed` is replacing, if any.
+    fn retire_outgoing(&self, feed: &mut Feed) {
+        if let Some(attempt) = feed.outgoing.take() {
+            lock(&self.selection).drop_outgoing(&attempt.pad);
+            self.stop_attempt(attempt);
+        }
+    }
+
+    /// Replace `feed`'s attempt with a new one, keeping a source on screen,
+    /// if it shows, until the new one's first frame.
+    fn hand_over(&self, feed: &mut Feed) {
+        let showing = lock(&self.selection).showing;
+        match (feed.role, showing) {
+            // An earlier source still shows while this one starts.
+            (Role::Main, Showing::Outgoing) => self.retire(feed),
+            (Role::Main, Showing::Main) => {
+                self.retire_outgoing(feed);
+                if let Some(attempt) = feed.attempt.take() {
+                    lock(&self.selection).hand_over(&attempt.pad);
+                    feed.outgoing = Some(attempt);
+                }
+            }
+            _ => {
+                self.retire_outgoing(feed);
+                self.retire(feed);
+            }
+        }
+        self.start(feed);
+    }
+
+    fn stop_attempt(&self, attempt: Attempt) {
+        attempt.bin.set_locked_state(true);
+        let (pipeline, selector) = (self.pipeline.clone(), self.selector.clone());
+        let stopping = std::thread::Builder::new()
+            .name("wallplay-retire".to_owned())
+            .spawn(move || {
+                if attempt.bin.set_state(gst::State::Null).is_err() {
+                    gst::warning!(gst::CAT_DEFAULT, "an input did not stop cleanly");
+                }
+                if let Some(ghost) = attempt.bin.static_pad("src")
+                    && ghost.unlink(&attempt.pad).is_err()
+                {
+                    gst::warning!(gst::CAT_DEFAULT, "an input was not linked");
+                }
+                selector.release_request_pad(&attempt.pad);
+                if pipeline.remove(&attempt.bin).is_err() {
+                    gst::warning!(gst::CAT_DEFAULT, "an input was already removed");
+                }
+            });
+        if stopping.is_err() {
+            gst::warning!(gst::CAT_DEFAULT, "could not stop an input");
+        }
+    }
+
+    /// Stop `feed`'s attempt after `error` and retry after a delay.
+    fn fail(&self, feed: &mut Feed, error: &str) {
+        self.retire(feed);
+        self.retire_outgoing(feed);
+        feed.failures = feed.failures.saturating_add(1);
+        let index = usize::try_from(feed.failures - 1).unwrap_or(usize::MAX);
+        let delay = RETRY_DELAYS
+            .get(index)
+            .or(RETRY_DELAYS.last())
+            .copied()
+            .unwrap_or(1);
+        feed.retry_at = Some(Instant::now() + Duration::from_secs(delay));
+        match feed.role {
+            Role::Main => {
+                let mut status = lock(&self.status);
+                "retrying".clone_into(&mut status.state);
+                status.error = Some(error.to_owned());
+                status.restarts = status.restarts.saturating_add(1);
+            }
+            Role::Standby => gst::warning!(gst::CAT_DEFAULT, "the standby failed: {error}"),
+        }
+    }
+
+    /// Play `source` on `role` from now on, stopping what played.
+    fn replace(&self, role: Role, source: &Prepared) {
+        let mut feeds = lock(&self.feeds);
+        if feeds.stopped {
+            return;
+        }
+        let feed = Self::feed(&mut feeds, role);
+        feed.source = source.clone();
+        feed.failures = 0;
+        feed.resolving = None;
+        feed.retry_at = None;
+        if role == Role::Main {
+            *lock(&self.status) = SourceStatus::default();
+        }
+        self.hand_over(feed);
+    }
+
+    /// Convert every input to `canvas` while playing. Sources other than
+    /// patterns keep playing and only change size, so a clip does not start
+    /// over; patterns, and sources whose fill changed, restart.
+    fn reshape(&self, canvas: Canvas) {
+        let mut feeds = lock(&self.feeds);
+        if feeds.stopped {
+            return;
+        }
+        let previous = std::mem::replace(&mut *lock(&self.canvas), canvas);
+        for role in [Role::Standby, Role::Main] {
+            let feed = Self::feed(&mut feeds, role);
+            self.retire_outgoing(feed);
+            let Some(attempt) = &feed.attempt else {
+                // A source waiting to retry starts with the new canvas.
+                continue;
+            };
+            let kept = !feed.source.input.is_pattern()
+                && previous.fill == canvas.fill
+                && canvas.retarget(&attempt.bin).is_ok();
+            if !kept {
+                self.retire(feed);
+                self.start(feed);
+            }
+        }
+    }
+
+    /// An input's stream ended: restart it, or leave the standby showing.
+    fn ended(&self, src: Option<&gst::Object>) {
+        let Some(src) = src else {
+            return;
+        };
+        let mut feeds = lock(&self.feeds);
+        for role in [Role::Main, Role::Standby] {
+            let feed = Self::feed(&mut feeds, role);
+            if feed.owned_by_outgoing(src) {
+                // Its last frame stays until the next source's first, or
+                // until it counts as stalled.
+                return;
+            }
+            let Some(started) = feed.attempt.as_ref().map(|attempt| attempt.started) else {
+                continue;
+            };
+            if !feed.owns(src) {
+                continue;
+            }
+            if role == Role::Main && !self.restart.load(Ordering::Relaxed) {
+                self.retire(feed);
+                let mut status = lock(&self.status);
+                "ended".clone_into(&mut status.state);
+                status.error = None;
+            } else if started.elapsed() < SHORTEST_RUN {
+                self.fail(feed, "it ended right after starting");
+            } else {
+                if role == Role::Main {
+                    let mut status = lock(&self.status);
+                    status.restarts = status.restarts.saturating_add(1);
+                }
+                // The last frame stays until the restarted source's first.
+                self.hand_over(feed);
+            }
+            return;
+        }
+    }
+
+    /// `src` posted `error`: retry its input if it belongs to one. Returns
+    /// whether an input, current or stopping, posted it.
+    fn failed(&self, src: Option<&gst::Object>, error: &str) -> bool {
+        let Some(src) = src else {
+            return false;
+        };
+        let mut feeds = lock(&self.feeds);
+        for role in [Role::Main, Role::Standby] {
+            let feed = Self::feed(&mut feeds, role);
+            if feed.owns(src) {
+                self.fail(feed, error);
+                return true;
+            }
+            if feed.owned_by_outgoing(src) {
+                self.retire_outgoing(feed);
+                return true;
+            }
+        }
+        // Inputs being stopped may still report errors.
+        std::iter::successors(Some(src.clone()), gst::Object::parent)
+            .any(|object| object.name().starts_with(INPUT_PREFIX))
+    }
+
+    /// Retry what is due, find stalled inputs, and keep the slate current.
+    fn tick(&self) {
+        let mut feeds = lock(&self.feeds);
+        if feeds.stopped {
+            return;
+        }
+        for role in [Role::Standby, Role::Main] {
+            self.check(Self::feed(&mut feeds, role));
+        }
+        let slate = self.slate_text(&feeds.main);
+        if let Some(attempt) = feeds.standby.attempt.as_mut()
+            && slate != attempt.slate
+            && let Some(text) = attempt.bin.by_name(SLATE_TEXT)
+        {
+            text.set_property("text", &slate);
+            attempt.slate = slate;
+        }
+    }
+
+    fn check(&self, feed: &mut Feed) {
+        // A source being replaced goes once the next one shows, or once it
+        // has sent no frame for a while, as a clip that ended does.
+        if let Some(outgoing) = &feed.outgoing {
+            let mut selection = lock(&self.selection);
+            let quiet = (*lock(&outgoing.last_frame)).map_or(Duration::MAX, |last| last.elapsed());
+            if selection.showing == Showing::Outgoing && quiet > STALL_STANDBY {
+                selection.stalled(&outgoing.pad);
+            }
+            let replaced = selection.showing != Showing::Outgoing;
+            drop(selection);
+            if replaced {
+                self.retire_outgoing(feed);
+            }
+        }
+        if feed.resolving.as_ref().is_some_and(JoinHandle::is_finished) {
+            match feed.resolving.take().map(JoinHandle::join) {
+                Some(Ok(Ok(source))) => {
+                    feed.source = source;
+                    self.start(feed);
+                }
+                Some(Ok(Err(error))) => self.fail(feed, &format!("{error:#}")),
+                _ => self.fail(feed, "finding the stream failed"),
+            }
+        }
+        if feed.retry_at.is_some_and(|at| at <= Instant::now()) {
+            feed.retry_at = None;
+            if feed.source.via == Via::YtDlp {
+                // Streams found from web pages expire; find the stream again.
+                let (source, resolver) = (feed.source.source.clone(), self.resolver.clone());
+                match std::thread::Builder::new()
+                    .name("wallplay-resolve".to_owned())
+                    .spawn(move || Prepared::prepare(&source, &resolver))
+                {
+                    Ok(resolving) => feed.resolving = Some(resolving),
+                    Err(error) => self.fail(feed, &error.to_string()),
+                }
+            } else {
+                self.start(feed);
+            }
+        }
+        let Some(attempt) = &feed.attempt else {
+            return;
+        };
+        let last_frame = *lock(&attempt.last_frame);
+        match last_frame {
+            Some(last_frame) => {
+                feed.failures = 0;
+                if feed.role == Role::Main {
+                    let mut status = lock(&self.status);
+                    if status.state == "starting" {
+                        "playing".clone_into(&mut status.state);
+                        status.error = None;
+                    }
+                }
+                let quiet = last_frame.elapsed();
+                if quiet > STALL_RESTART {
+                    self.fail(feed, &format!("no video for {} s", STALL_RESTART.as_secs()));
+                } else if quiet > STALL_STANDBY {
+                    lock(&self.selection).stalled(&attempt.pad);
+                }
+            }
+            None if attempt.started.elapsed() > CONNECT_TIMEOUT => {
+                self.fail(
+                    feed,
+                    &format!("no video within {} s", CONNECT_TIMEOUT.as_secs()),
+                );
+            }
+            None => {}
+        }
+    }
+
+    /// What the slate says about the source.
+    fn slate_text(&self, main: &Feed) -> String {
+        let name = main
+            .source
+            .title
+            .clone()
+            .unwrap_or_else(|| match &main.source.source {
+                Source::Uri(url) | Source::Media(url) | Source::Page(url) | Source::Whep(url) => {
+                    short_name(url)
+                }
+                Source::Pattern(_) | Source::Launch(_) => "The source".to_owned(),
+            });
+        let status = lock(&self.status);
+        match (status.state.as_str(), &status.error) {
+            ("ended", _) => format!("{name}\nended"),
+            (_, Some(error)) => format!("{name}\n{error}\nRetrying"),
+            _ => format!("{name}\nConnecting"),
+        }
+    }
+
+    fn status(&self) -> SourceStatus {
+        let standby = lock(&self.selection).showing == Showing::Standby;
+        SourceStatus {
+            standby,
+            ..lock(&self.status).clone()
+        }
+    }
+
+    /// Stop every input on this thread, for good.
+    fn stop(&self) {
+        let mut feeds = lock(&self.feeds);
+        feeds.stopped = true;
+        for role in [Role::Main, Role::Standby] {
+            let feed = Self::feed(&mut feeds, role);
+            feed.retry_at = None;
+            feed.resolving = None;
+            for attempt in feed.attempt.iter().chain(&feed.outgoing) {
+                attempt.bin.set_locked_state(true);
+                if attempt.bin.set_state(gst::State::Null).is_err() {
+                    gst::warning!(gst::CAT_DEFAULT, "an input did not stop cleanly");
+                }
+            }
+        }
+    }
+}
+
+/// Everything a stamping probe needs.
+struct Stamper {
+    display: String,
+    fps: u32,
+    info: gst_video::VideoInfo,
+    code: CodeGeometry,
+    measuring: Arc<AtomicBool>,
+    /// Whether to draw the frame code, for browsers that cannot tell frames
+    /// apart by their RTP timestamps.
+    drawing: Arc<AtomicBool>,
+    measurement: Arc<Mutex<Measurement>>,
+    clock: Clock,
+}
+
+impl Stamper {
+    /// Record when `warp`'s output for `screen` leaves it while measuring,
+    /// drawing its frame code if asked; returns where the code goes, or `None`
+    /// when the output is too small for it.
+    fn install(
+        warp: &gst::Element,
+        screen: &Screen,
+        fps: u32,
+        (measuring, drawing): (&Arc<AtomicBool>, &Arc<AtomicBool>),
+        measurement: &Arc<Mutex<Measurement>>,
+        clock: Clock,
+    ) -> Result<Option<CodeGeometry>> {
+        let (width, height) = (screen.output.width, screen.output.height);
+        let Some(code) = CodeGeometry::for_output(width, height) else {
+            return Ok(None);
+        };
+        let stamper = Self {
+            display: screen.id.clone(),
+            fps,
+            info: gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgba, width, height)
+                .build()?,
+            code,
+            measuring: Arc::clone(measuring),
+            drawing: Arc::clone(drawing),
+            measurement: Arc::clone(measurement),
+            clock,
+        };
+        let pad = warp
+            .static_pad("src")
+            .context("wallwarp has no source pad")?;
+        pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+            if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
+                stamper.stamp(pad, buffer);
+            }
+            gst::PadProbeReturn::Ok
+        });
+        Ok(Some(code))
+    }
+
+    fn stamp(&self, pad: &gst::Pad, buffer: &mut gst::Buffer) {
+        if !self.measuring.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(running) = buffer.pts().and_then(|pts| {
+            let segment = pad.sticky_event::<gst::event::Segment>(0)?;
+            segment
+                .segment()
+                .downcast_ref::<gst::format::Time>()?
+                .to_running_time(pts)
+        }) else {
+            return;
+        };
+        let frame = frame_number(running, self.fps);
+        // How far the pipeline clock has moved past the frame's running time.
+        let delay = pad.parent_element().and_then(|element| {
+            let now = element.clock()?.time();
+            let late = now
+                .checked_sub(element.base_time()?)?
+                .checked_sub(running)?;
+            Some(Duration::from(late).as_secs_f64() * 1000.0)
+        });
+        if self.drawing.load(Ordering::Relaxed) {
+            let Ok(mut video) =
+                gst_video::VideoFrameRef::from_buffer_ref_writable(buffer.make_mut(), &self.info)
+            else {
+                return;
+            };
+            let stride = video
+                .plane_stride()
+                .first()
+                .and_then(|stride| usize::try_from(*stride).ok());
+            let (Some(stride), Ok(pixels)) = (stride, video.plane_data_mut(0)) else {
+                return;
+            };
+            framecode::stamp(pixels, stride, &self.code, frame);
+        }
+        lock(&self.measurement).stamped(&self.display, frame, self.clock.now_ms(), delay);
+    }
+}
+
+impl Player {
+    /// Build and start the pipeline for `layout`. `events` is called from a
+    /// background thread.
+    pub fn start(
+        layout: &Layout,
+        options: &PlayerOptions,
+        measurement: &Arc<Mutex<Measurement>>,
+        clock: Clock,
+        events: impl Fn(PlayerEvent) + Send + 'static,
+    ) -> Result<Self> {
+        ensure!(options.fps > 0, "the frame rate must be positive");
+        ensure!(!layout.screens.is_empty(), "the layout has no displays");
+        if matches!(options.sink, Sink::WebRtc(_)) {
+            check_webrtc_elements()?;
+        }
+        let pipeline = gst::Pipeline::with_name("wallplay");
+        let measuring = Arc::new(AtomicBool::new(false));
+        let drawing = Arc::new(AtomicBool::new(true));
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+        let last_consumer = Arc::new(Mutex::new(None));
+        // Inactive inputs drop their frames rather than wait for the active
+        // one, which may have stalled.
+        let selector = gst::ElementFactory::make("input-selector")
+            .property("sync-streams", false)
+            .build()?;
+        let tee = gst::ElementFactory::make("tee")
+            .property("allow-not-linked", true)
+            .build()?;
+        pipeline.add_many([&selector, &tee])?;
+        selector.link(&tee)?;
+        let mut routes: Vec<Route> = Vec::new();
+        let mut warps = Vec::new();
+        for screen in &layout.screens {
+            let (width, height) = (screen.output.width, screen.output.height);
+            let queue = gst::ElementFactory::make("queue")
+                .property("max-size-buffers", 2_u32)
+                .property("max-size-bytes", 0_u32)
+                .property("max-size-time", 0_u64)
+                .property_from_str("leaky", "downstream")
+                .build()?;
+            let warp = gst::ElementFactory::make("wallwarp")
+                .name(format!("warp-{}", screen.id))
+                .property("quad", layout.source_quad(screen).to_string())
+                .property("output-width", width)
+                .property("output-height", height)
+                .build()
+                .context("creating wallwarp")?;
+            let (sink, endpoint) =
+                Self::display_sink(&screen.id, generation, &routes, options, &last_consumer)?;
+            // The warped output goes to the display and, a few times a
+            // second and scaled down, to a preview for the control page.
+            let split = make("tee")?;
+            let to_sink = make("queue")?;
+            let preview = Self::preview_branch(&screen.id, screen.output)?;
+            pipeline.add_many([&queue, &warp, &split, &to_sink, &sink])?;
+            pipeline.add_many(&preview)?;
+            tee.link(&queue)?;
+            gst::Element::link_many([&queue, &warp, &split, &to_sink, &sink])?;
+            split.link(preview.first().context("empty preview branch")?)?;
+            gst::Element::link_many(&preview)?;
+            let code = Stamper::install(
+                &warp,
+                screen,
+                options.fps,
+                (&measuring, &drawing),
+                measurement,
+                clock,
+            )?;
+            warps.push(Warp::install(&warp, &screen.id)?);
+            routes.push(Route {
+                display: screen.id.clone(),
+                output: screen.output,
+                endpoint,
+                generation,
+                code,
+            });
+        }
+        let inputs = Arc::new(Inputs::new(&pipeline, selector, layout.canvas, options)?);
+        {
+            let mut feeds = lock(&inputs.feeds);
+            inputs.start(&mut feeds.standby);
+            if feeds.standby.attempt.is_none() {
+                bail!("the standby pattern {:?} does not play", options.standby);
+            }
+        }
+        let bus = pipeline.bus().context("the pipeline has no bus")?;
+        let watched = Arc::clone(&inputs);
+        let bus_thread = std::thread::Builder::new()
+            .name("wallplay-bus".to_owned())
+            .spawn(move || Self::watch(&bus, &watched, &events))?;
+        let player = Self {
+            pipeline,
+            inputs,
+            routes,
+            warps,
+            measuring,
+            drawing,
+            last_consumer,
+            bus_thread: Some(bus_thread),
+        };
+        player
+            .pipeline
+            .set_state(gst::State::Playing)
+            .context("starting the pipeline")?;
+        // The source starts once the pipeline plays, so one that cannot
+        // start, such as a missing file, is retried rather than failing it.
+        let mut feeds = lock(&player.inputs.feeds);
+        player.inputs.start(&mut feeds.main);
+        drop(feeds);
+        Ok(player)
+    }
+
+    /// Elements scaling a display's output down to a preview, ending in a
+    /// `fakesink` named `preview-<id>` that keeps the latest frame.
+    fn preview_branch(id: &str, output: Size) -> Result<Vec<gst::Element>> {
+        let longest = output.width.max(output.height).max(1);
+        let even = |value: u32| {
+            let scaled =
+                u64::from(value) * u64::from(PREVIEW_PIXELS.min(longest)) / u64::from(longest);
+            i32::try_from((scaled / 2 * 2).max(2)).unwrap_or(2)
+        };
+        let caps = gst_video::VideoCapsBuilder::new()
+            .format(gst_video::VideoFormat::Rgba)
+            .width(even(output.width))
+            .height(even(output.height))
+            .build();
+        Ok(vec![
+            gst::ElementFactory::make("queue")
+                .property("max-size-buffers", 1_u32)
+                .property_from_str("leaky", "downstream")
+                .build()?,
+            gst::ElementFactory::make("videorate")
+                .property("drop-only", true)
+                .property("max-rate", PREVIEW_RATE)
+                .build()?,
+            make("videoscale")?,
+            gst::ElementFactory::make("capsfilter")
+                .property("caps", caps)
+                .build()?,
+            gst::ElementFactory::make("fakesink")
+                .name(format!("preview-{id}"))
+                .property("sync", false)
+                .property("async", false)
+                .property("enable-last-sample", true)
+                .build()?,
+        ])
+    }
+
+    /// The sink of display `id`, on a signalling port none of `routes` has,
+    /// noting in `last_consumer` when a browser connects to it.
+    fn display_sink(
+        id: &str,
+        generation: u32,
+        routes: &[Route],
+        options: &PlayerOptions,
+        last_consumer: &Arc<Mutex<Option<Instant>>>,
+    ) -> Result<(gst::Element, Endpoint)> {
+        let taken: Vec<u16> = routes
+            .iter()
+            .filter_map(|route| match route.endpoint {
+                Endpoint::Port(port) => Some(port),
+                _ => None,
+            })
+            .collect();
+        let (sink, endpoint) = Self::sink(id, generation, &taken, &options.sink)?;
+        if matches!(endpoint, Endpoint::Port(_) | Endpoint::Uri(_)) {
+            let last_consumer = Arc::clone(last_consumer);
+            sink.connect("consumer-added", false, move |_| {
+                *lock(&last_consumer) = Some(Instant::now());
+                None
+            });
+        }
+        Ok((sink, endpoint))
+    }
+
+    fn sink(
+        id: &str,
+        generation: u32,
+        taken: &[u16],
+        sink: &Sink,
+    ) -> Result<(gst::Element, Endpoint)> {
+        match sink {
+            Sink::AppSink => {
+                let sink = gst::ElementFactory::make("appsink")
+                    .name(format!("sink-{id}"))
+                    .property("max-buffers", 4_u32)
+                    .property("drop", true)
+                    .property("sync", false)
+                    .build()?;
+                Ok((sink, Endpoint::None))
+            }
+            Sink::WebRtc(signalling) => {
+                let sink = gst::ElementFactory::make("webrtcsink")
+                    .name(format!("sink-{id}"))
+                    .property(
+                        "meta",
+                        gst::Structure::builder("meta")
+                            .field("display", id)
+                            .field("generation", generation)
+                            .build(),
+                    )
+                    // Local networks need no STUN, and an unreachable default
+                    // server only slows connections down.
+                    .property("stun-server", None::<String>)
+                    // Keep every display's resolution and frame rate; a wall
+                    // with one blurry or stuttering display looks broken.
+                    .property_from_str("enable-mitigation-modes", "none")
+                    // VP8 plays in every current browser and encodes on every
+                    // platform. H.264 depends on the platform's encoders: on
+                    // macOS, webrtcsink's codec discovery rejects
+                    // vtenc_h264's output, failing the whole pipeline.
+                    .property("video-caps", gst::Caps::from_str("video/x-vp8")?)
+                    .build()?;
+                // RTP timestamps then follow the running time, so browsers
+                // can tell frames apart without a code drawn into them.
+                sink.connect("payloader-setup", false, |values| {
+                    if let Some(payloader) = values
+                        .get(3)
+                        .and_then(|value| value.get::<gst::Element>().ok())
+                        && payloader.has_property("timestamp-offset")
+                    {
+                        payloader.set_property("timestamp-offset", 0_u32);
+                    }
+                    // webrtcsink still applies its own settings.
+                    Some(false.to_value())
+                });
+                let endpoint = match signalling {
+                    Signalling::BuiltIn { host, first_port } => {
+                        let port = free_port(host, *first_port, taken).with_context(|| {
+                            format!("no free signalling port on {host} from {first_port}")
+                        })?;
+                        sink.set_property("run-signalling-server", true);
+                        sink.set_property("signalling-server-host", host);
+                        sink.set_property("signalling-server-port", u32::from(port));
+                        Endpoint::Port(port)
+                    }
+                    Signalling::External(uri) => {
+                        sink.property::<gst::glib::Object>("signaller")
+                            .set_property("uri", uri);
+                        Endpoint::Uri(uri.clone())
+                    }
+                };
+                Ok((sink, endpoint))
+            }
+        }
+    }
+
+    fn watch(bus: &gst::Bus, inputs: &Inputs, events: &impl Fn(PlayerEvent)) {
+        let mut ticked = Instant::now();
+        while !inputs.halted.load(Ordering::Relaxed) {
+            let message = bus.timed_pop(gst::ClockTime::try_from(TICK).ok());
+            match message.as_deref().map(gst::MessageRef::view) {
+                Some(gst::MessageView::Application(application)) => {
+                    match application.structure().map(gst::StructureRef::name) {
+                        Some(name) if name == STOP_MESSAGE => return,
+                        Some(name) if name == ENDED_MESSAGE => inputs.ended(application.src()),
+                        _ => {}
+                    }
+                }
+                Some(gst::MessageView::StateChanged(change))
+                    if change
+                        .src()
+                        .is_some_and(|src| src.type_() == gst::Pipeline::static_type())
+                        && change.current() == gst::State::Playing =>
+                {
+                    events(PlayerEvent::Playing);
+                }
+                Some(gst::MessageView::Eos(_)) => events(PlayerEvent::Finished),
+                Some(gst::MessageView::Error(error))
+                    if !inputs.failed(error.src(), &input_error(error)) =>
+                {
+                    let source = error
+                        .src()
+                        .map(|src| format!("{}: ", src.name()))
+                        .unwrap_or_default();
+                    let details = error
+                        .debug()
+                        .map(|debug| format!(" ({debug})"))
+                        .unwrap_or_default();
+                    events(PlayerEvent::Failed(format!(
+                        "{source}{}{details}",
+                        error.error()
+                    )));
+                }
+                _ => {}
+            }
+            if ticked.elapsed() >= TICK {
+                ticked = Instant::now();
+                inputs.tick();
+            }
+        }
+    }
+
+    /// Play `layout`, filling its canvas as `fill` says, without restarting
+    /// the pipeline, if it has the same displays with the same output sizes.
+    /// Returns whether it could; otherwise the player needs a restart, since
+    /// a display's stream changes size.
+    #[must_use = "when false, the player needs a restart to play the layout"]
+    pub fn update_layout(&self, layout: &Layout, fill: Fill) -> bool {
+        let same_displays = layout.screens.len() == self.routes.len()
+            && layout.screens.iter().all(|screen| {
+                self.route(&screen.id)
+                    .is_some_and(|route| route.output == screen.output)
+            });
+        if !same_displays {
+            return false;
+        }
+        let canvas = Canvas {
+            size: layout.canvas,
+            fill,
+            ..*lock(&self.inputs.canvas)
+        };
+        let resized = lock(&self.inputs.canvas).size != canvas.size;
+        for screen in &layout.screens {
+            let Some(warp) = self.warps.iter().find(|warp| warp.display == screen.id) else {
+                continue;
+            };
+            let quad = layout.source_quad(screen).to_string();
+            let mut pending = lock(&warp.pending);
+            if resized {
+                *pending = Some((canvas.size, quad));
+            } else {
+                *pending = None;
+                drop(pending);
+                warp.element.set_property("quad", quad);
+            }
+        }
+        if *lock(&self.inputs.canvas) != canvas {
+            self.inputs.reshape(canvas);
+        }
+        true
+    }
+
+    /// Play `source` from now on, without restarting the pipeline: the
+    /// displays keep their streams and show the standby until it plays.
+    pub fn set_source(&self, source: &Prepared) {
+        self.inputs.replace(Role::Main, source);
+    }
+
+    /// Show pattern `id` whenever the source is not showing.
+    pub fn set_standby(&self, id: &str) -> Result<()> {
+        self.inputs.replace(Role::Standby, &Prepared::pattern(id)?);
+        Ok(())
+    }
+
+    /// Whether a source that ends starts again.
+    pub fn set_restart(&self, restart: bool) {
+        self.inputs.restart.store(restart, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn source_status(&self) -> SourceStatus {
+        self.inputs.status()
+    }
+
+    #[must_use]
+    pub fn routes(&self) -> &[Route] {
+        &self.routes
+    }
+
+    #[must_use]
+    pub fn route(&self, display: &str) -> Option<&Route> {
+        self.routes.iter().find(|route| route.display == display)
+    }
+
+    /// Start or stop recording when frames leave the pipeline, drawing their
+    /// codes as [`Player::set_codes`] says.
+    pub fn set_measuring(&self, measuring: bool) {
+        self.measuring.store(measuring, Ordering::Relaxed);
+    }
+
+    /// Whether measuring draws frame codes, which browsers need unless they
+    /// tell frames apart by RTP timestamp. On until told otherwise.
+    pub fn set_codes(&self, drawing: bool) {
+        self.drawing.store(drawing, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn pipeline(&self) -> &gst::Pipeline {
+        &self.pipeline
+    }
+
+    /// The element keeping display `display`'s latest preview frame.
+    #[must_use]
+    pub fn preview_sink(&self, display: &str) -> Option<gst::Element> {
+        self.pipeline.by_name(&format!("preview-{display}"))
+    }
+
+    /// Stop playback on another thread, waiting at most `timeout`, and
+    /// return whether it stopped.
+    ///
+    /// `webrtcsink` 0.15.4 can deadlock tearing down a session whose remote
+    /// description is still being applied, as when a browser has just
+    /// connected, and then never finishes stopping. Teardown therefore waits
+    /// until [`SETTLE`] has passed since the last browser connected. Measuring
+    /// and the inputs stop first, so a pipeline that gets stuck anyway neither
+    /// stamps frames nor keeps warping; its threads and signalling ports stay
+    /// in use until the process exits.
+    #[must_use]
+    pub fn stop(self, timeout: Duration) -> bool {
+        self.set_measuring(false);
+        self.inputs.stop();
+        let (stopped, wait) = mpsc::channel();
+        let teardown = std::thread::Builder::new()
+            .name("wallplay-teardown".to_owned())
+            .spawn(move || {
+                let settled = self
+                    .last_consumer
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .map(|connected| SETTLE.saturating_sub(connected.elapsed()));
+                if let Some(wait) = settled {
+                    std::thread::sleep(wait);
+                }
+                drop(self);
+                // The caller may have stopped waiting.
+                if stopped.send(()).is_err() {
+                    gst::info!(gst::CAT_DEFAULT, "a pipeline stopped after its timeout");
+                }
+            });
+        teardown.is_ok() && wait.recv_timeout(timeout).is_ok()
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        // The bus thread notices within a tick; the message, posted before
+        // stopping makes the bus drop messages, wakes it at once.
+        self.inputs.halted.store(true, Ordering::Relaxed);
+        let stop = gst::message::Application::new(gst::Structure::new_empty(STOP_MESSAGE));
+        if self
+            .pipeline
+            .bus()
+            .is_none_or(|bus| bus.post(stop).is_err())
+        {
+            gst::info!(gst::CAT_DEFAULT, "could not wake the bus thread");
+        }
+        if self.pipeline.set_state(gst::State::Null).is_err() {
+            gst::warning!(gst::CAT_DEFAULT, "the pipeline did not stop cleanly");
+        }
+        if let Some(thread) = self.bus_thread.take()
+            && thread.join().is_err()
+        {
+            gst::warning!(gst::CAT_DEFAULT, "the bus thread panicked");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slates_name_urls_briefly() {
+        assert_eq!(short_name("file:///videos/wall/clip.mp4"), "clip.mp4");
+        assert_eq!(short_name("rtsp://camera.local:554/"), "camera.local:554");
+        assert_eq!(
+            short_name("https://h/live/index.m3u8?token=x"),
+            "index.m3u8"
+        );
+        assert_eq!(
+            short_name("srt://10.0.0.5:7001?streamid=read:cam"),
+            "10.0.0.5:7001"
+        );
+    }
+
+    #[test]
+    fn covering_crops_trim_the_longer_edges() {
+        gst::init().expect("gst");
+        let frame = |w, h, par: (i32, i32)| {
+            gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgba, w, h)
+                .par(gst::Fraction::new(par.0, par.1))
+                .build()
+                .expect("info")
+        };
+        let rows = |cut| Sides {
+            top: cut,
+            bottom: cut,
+            ..Sides::default()
+        };
+        let columns = |cut| Sides {
+            left: cut,
+            right: cut,
+            ..Sides::default()
+        };
+        // The race this replaces: 640x360 frames for a 640x300 canvas.
+        assert_eq!(
+            Sides::covering(&frame(640, 360, (1, 1)), 640, 300),
+            rows(30)
+        );
+        assert_eq!(
+            Sides::covering(&frame(640, 300, (1, 1)), 640, 300),
+            Sides::default()
+        );
+        assert_eq!(
+            Sides::covering(&frame(1920, 1080, (1, 1)), 1080, 1920),
+            columns(656)
+        );
+        // Wide pixels make a wider picture: 704 of 720 columns are 16:9.
+        assert_eq!(
+            Sides::covering(&frame(720, 576, (16, 11)), 16, 9),
+            columns(8)
+        );
+        assert_eq!(Sides::covering(&frame(1000, 2, (1, 1)), 1, 1), columns(499));
+        // Nothing would be left of a 3x1 frame on a 1:3 canvas.
+        assert_eq!(
+            Sides::covering(&frame(3, 1, (1, 1)), 1, 3),
+            Sides::default()
+        );
+    }
+
+    #[test]
+    fn running_times_round_to_frames() {
+        let frame = |ms| frame_number(gst::ClockTime::from_mseconds(ms), 30);
+        assert_eq!(frame(0), 0);
+        assert_eq!(frame(33), 1);
+        assert_eq!(frame(1000), 30);
+    }
+}

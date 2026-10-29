@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>wallplay display</title>
+<style>
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: #ddd; font: 16px/1.4 system-ui, sans-serif; }
+  body.pattern, body.play { cursor: none; }
+  #pattern, #video { position: fixed; inset: 0; display: block; width: 100vw; height: 100vh; }
+  /* Fill the page exactly, as the calibration pattern did, whatever the stream's size. */
+  #video { object-fit: fill; background: #000; }
+  #idle { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1em; padding: 1em; text-align: center; }
+  #name { font-size: 10vmin; font-weight: 600; }
+  #status { position: fixed; left: 50%; bottom: 2vh; transform: translateX(-50%); max-width: 90vw; padding: 0.2em 0.8em; border-radius: 0.4em; background: rgba(0, 0, 0, 0.65); color: #aaa; font-size: max(12px, 1.8vmin); text-align: center; }
+  #status.warning { color: #ff6b6b; }
+  /* Between the tags, below the pattern's caption, so it never covers a tag. */
+  body.pattern #status { top: 64%; bottom: auto; max-width: 36vw; background: none; color: #888; }
+  form { display: flex; flex-wrap: wrap; gap: 0.5em; justify-content: center; }
+  input, button { font: inherit; padding: 0.4em 0.8em; }
+</style>
+</head>
+<body class="idle">
+<div id="idle"><div id="name"></div><div id="message"></div></div>
+<img id="pattern" alt="" hidden>
+<video id="video" muted playsinline autoplay hidden></video>
+<div id="status" hidden></div>
+<script>
+"use strict";
+const id = "{{ID}}";
+const $ = selector => document.querySelector(selector);
+const video = $("#video");
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Without an ID in the URL, ask for one, suggesting the one this browser used
+// before so a display keeps its identity.
+if (!id) {
+  let suggestion = null;
+  try { suggestion = localStorage.getItem("wallplay-display"); } catch {}
+  suggestion ??= `display-${Math.random().toString(36).slice(2, 6)}`;
+  $("#name").textContent = "Name this display";
+  $("#message").innerHTML = `<form><input id="choice" maxlength="64" pattern="[A-Za-z0-9._\\-]+" required><button>Use</button></form>
+    <p>Letters, digits, '-', '_' and '.'. Each display needs its own, and keeps it while the URL stays the same.</p>`;
+  $("#choice").value = suggestion;
+  $("form").addEventListener("submit", event => {
+    event.preventDefault();
+    location.replace(`/display/${encodeURIComponent($("#choice").value)}`);
+  });
+  throw new Error("waiting for a display ID");
+}
+try { localStorage.setItem("wallplay-display", id); } catch {}
+document.title = `wallplay ${id}`;
+$("#name").textContent = id;
+
+const isFullscreen = () => Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+
+// Fullscreen and playback need a user gesture: tap, click, or press a key.
+function engage() {
+  const root = document.documentElement;
+  const request = root.requestFullscreen || root.webkitRequestFullscreen;
+  if (request && !isFullscreen()) request.call(root)?.catch?.(() => {});
+  if (!video.hidden && video.paused) video.play().catch(() => {});
+  navigator.wakeLock?.request("screen").catch(() => {});
+}
+for (const type of ["click", "touchend", "keydown"]) addEventListener(type, engage);
+
+let version = 0;
+/** The server run that `version` belongs to; a restarted server answers at once. */
+let epoch = "";
+let current = "";
+let command = null;
+let connected = true;
+let playerState = "";
+let poll = null;
+
+function render() {
+  const parts = [];
+  let warning = !connected;
+  if (!connected) parts.push("cannot reach the server; retrying");
+  if (command?.mode !== "play") {
+    let text = `viewport ${innerWidth}x${innerHeight}`;
+    if (devicePixelRatio !== 1) text += ` (${Math.round(innerWidth * devicePixelRatio)}x${Math.round(innerHeight * devicePixelRatio)} device pixels)`;
+    parts.push(text);
+  }
+  if (command?.mode === "pattern") {
+    const { width, height } = command.output;
+    if (Math.abs((innerWidth * height) / (innerHeight * width) - 1) > 0.01) {
+      parts.push(`made for ${width}x${height}; show the patterns again`);
+      warning = true;
+    }
+  }
+  if (command?.mode === "play" && !playerState.startsWith("playing")) parts.push(playerState);
+  if (!isFullscreen()) parts.push("not fullscreen: tap or click the page");
+  const status = $("#status");
+  status.textContent = `${id}: ${parts.join(" · ")}`;
+  status.hidden = command?.mode === "play" && parts.length === 0;
+  status.classList.toggle("warning", warning);
+}
+
+/** Tell the server about a change now rather than at the next poll. */
+function report() {
+  poll?.abort();
+  render();
+}
+addEventListener("resize", report);
+document.addEventListener("fullscreenchange", report);
+document.addEventListener("webkitfullscreenchange", report);
+
+function setPlayer(state) {
+  if (state === playerState) return;
+  playerState = state;
+  report();
+}
+
+/** A poll that takes longer than the server's longest wait went to a
+ * connection that died without closing, as when the server's machine sleeps
+ * or the network changes. */
+const POLL_TIMEOUT_MS = 40000;
+
+async function pollLoop() {
+  for (;;) {
+    const controller = poll = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, POLL_TIMEOUT_MS);
+    const query = new URLSearchParams({
+      since: version, epoch, w: innerWidth, h: innerHeight, scale: devicePixelRatio,
+      fullscreen: isFullscreen() ? 1 : 0, player: playerState,
+    });
+    try {
+      const response = await fetch(`/api/displays/${id}/poll?${query}`, { cache: "no-store", signal: controller.signal });
+      const reply = await response.json();
+      if (!response.ok) throw new Error(reply.error);
+      version = reply.version;
+      epoch = reply.epoch;
+      const reconnected = !connected;
+      connected = true;
+      apply(reply.command);
+      // apply() redraws only when the command changed, as it may not have
+      // across a server restart.
+      if (reconnected) render();
+    } catch (error) {
+      // An abort from report() asks for an early poll.
+      if (error.name === "AbortError" && !timedOut) continue;
+      connected = false;
+      render();
+      await sleep(2000);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function apply(next) {
+  const text = JSON.stringify(next);
+  if (text === current) return;
+  const previous = command;
+  current = text;
+  command = next;
+  const sameStream = previous?.mode === "play" && next.mode === "play"
+    && JSON.stringify([previous.endpoint, previous.generation, previous.output])
+      === JSON.stringify([next.endpoint, next.generation, next.output]);
+  if (!sameStream) {
+    stream?.close();
+    stream = null;
+  }
+  document.body.className = next.mode;
+  $("#idle").hidden = next.mode !== "idle";
+  $("#pattern").hidden = next.mode !== "pattern";
+  video.hidden = next.mode !== "play";
+  if (next.mode === "idle") $("#message").textContent = next.message;
+  if (next.mode === "pattern") $("#pattern").src = next.pattern;
+  if (next.mode === "play" && !stream) stream = new Stream(signallingUrl(next.endpoint));
+  if (next.mode !== "play") {
+    video.srcObject = null;
+    setPlayer("");
+  }
+  setMeasuring(next.mode === "play" && next.measuring);
+  applyBuffer();
+  render();
+}
+
+function signallingUrl(endpoint) {
+  if (endpoint.uri) return endpoint.uri;
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${location.hostname}:${endpoint.port}`;
+}
+
+// A client of webrtcsink's signalling protocol: list producers, start a
+// session with the one whose metadata names this display, and answer its offer.
+let stream = null;
+class Stream {
+  constructor(url) {
+    this.url = url;
+    this.closed = false;
+    this.reset();
+    this.connect();
+  }
+
+  reset() {
+    clearTimeout(this.patience);
+    this.pc?.close();
+    this.pc = null;
+    this.producer = null;
+    this.session = null;
+    this.pending = [];
+  }
+
+  /**
+   * Start over on a new connection. A signalling server built into a stopped
+   * webrtcsink stays connected but never announces producers again, so a
+   * client must not wait on the old connection.
+   */
+  reconnect() {
+    this.reset();
+    this.ws?.close();
+  }
+
+  connect() {
+    if (this.closed) return;
+    setPlayer("connecting to signalling");
+    const ws = this.ws = new WebSocket(this.url);
+    ws.onmessage = event => this.receive(JSON.parse(event.data)).catch(error => setPlayer(`error: ${error.message}`));
+    ws.onclose = () => {
+      this.reset();
+      if (this.closed) return;
+      setPlayer("signalling closed; retrying");
+      setTimeout(() => this.connect(), 2000);
+    };
+  }
+
+  send(message) {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(message));
+  }
+
+  close() {
+    this.closed = true;
+    if (this.session) this.send({ type: "endSession", sessionId: this.session });
+    this.reset();
+    this.ws?.close();
+  }
+
+  async receive(message) {
+    switch (message.type) {
+      case "welcome":
+        this.send({ type: "setPeerStatus", roles: ["listener"], meta: { display: id } });
+        this.send({ type: "list" });
+        break;
+      case "list":
+        this.join(message.producers);
+        break;
+      case "peerStatusChanged":
+        if (message.roles.includes("producer")) this.join([{ id: message.peerId, meta: message.meta }]);
+        break;
+      case "sessionStarted":
+        if (message.peerId === this.producer) this.session = message.sessionId;
+        break;
+      case "peer":
+        if (!this.producer || (this.session && message.sessionId !== this.session)) return;
+        this.session = message.sessionId;
+        if (message.sdp) await this.answer(message.sdp);
+        if (message.ice) await this.candidate(message.ice);
+        break;
+      case "endSession":
+        if (message.sessionId !== this.session) return;
+        setPlayer("stream ended; reconnecting");
+        this.reconnect();
+        break;
+      case "error":
+        setPlayer(`signalling error: ${message.details}`);
+        break;
+    }
+  }
+
+  join(producers) {
+    if (this.producer) return;
+    const producer = producers.find(producer => producer.meta?.display === id
+      && producer.meta?.generation === command.generation);
+    if (!producer) {
+      setPlayer("waiting for this display's stream");
+      clearTimeout(this.patience);
+      this.patience = setTimeout(() => this.reconnect(), 5000);
+      return;
+    }
+    clearTimeout(this.patience);
+    this.producer = producer.id;
+    this.send({ type: "startSession", peerId: producer.id });
+    setPlayer("starting a session");
+  }
+
+  async answer(sdp) {
+    if (sdp.type !== "offer") return;
+    const pc = this.pc = new RTCPeerConnection();
+    pc.ontrack = event => {
+      video.srcObject = event.streams[0] ?? new MediaStream([event.track]);
+      video.play().catch(() => setPlayer("tap to start playback"));
+      applyBuffer();
+    };
+    pc.onicecandidate = event => {
+      if (event.candidate) {
+        const { candidate, sdpMLineIndex } = event.candidate;
+        this.send({ type: "peer", sessionId: this.session, ice: { candidate, sdpMLineIndex } });
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState !== "connected") setPlayer(`connection ${pc.connectionState}`);
+    };
+    await pc.setRemoteDescription(sdp);
+    await pc.setLocalDescription(await pc.createAnswer());
+    this.send({ type: "peer", sessionId: this.session, sdp: { type: "answer", sdp: pc.localDescription.sdp } });
+    for (const ice of this.pending.splice(0)) await this.candidate(ice);
+  }
+
+  async candidate(ice) {
+    if (!this.pc?.remoteDescription) {
+      this.pending.push(ice);
+      return;
+    }
+    await this.pc.addIceCandidate(ice).catch(() => {});
+  }
+}
+
+/**
+ * Ask the browser to keep the commanded amount of video buffered, or its own
+ * default. Less buffering means less latency and more stutter on a jittery
+ * network. Chrome and Firefox support it; Safari ignores it.
+ */
+let bufferSupported = null;
+function applyBuffer() {
+  for (const receiver of stream?.pc?.getReceivers() ?? []) {
+    bufferSupported = "jitterBufferTarget" in receiver;
+    if (!bufferSupported) continue;
+    try {
+      receiver.jitterBufferTarget = command?.buffer_ms ?? null;
+    } catch {
+      bufferSupported = false;
+    }
+  }
+  if (!video.paused) describePlayback();
+}
+
+function describePlayback() {
+  let text = `playing ${video.videoWidth}x${video.videoHeight}`;
+  const buffer = command?.buffer_ms;
+  if (buffer != null) text += bufferSupported === false ? ", buffer setting unsupported" : `, buffer ${buffer} ms`;
+  setPlayer(text);
+}
+video.addEventListener("playing", describePlayback);
+video.addEventListener("resize", () => video.paused || describePlayback());
+
+// Drift measurement: tell which frame every presented frame is, by its RTP
+// timestamp where the browser reports one and otherwise by the frame code the
+// pipeline then draws, and report when it is expected on screen, on the
+// server's clock.
+const MIN_CONTRAST = 48;
+const CELL = 4;
+const clock = { samples: [], offset: null, rtt: null, ready: false };
+let measuring = false;
+let measureTimer = null;
+let frames = [];
+let rtpFrames = [];
+/** Whether this browser reports RTP timestamps; unknown before a frame. */
+let rtpTimestamps = null;
+let unreadable = 0;
+const codeCanvas = document.createElement("canvas");
+const codeContext = codeCanvas.getContext("2d", { willReadFrequently: true });
+
+/** Keep the clock offset of the fastest recent round trip. */
+async function syncClock() {
+  const sent = performance.now();
+  const response = await fetch("/api/clock", { method: "POST", cache: "no-store" });
+  const { now } = JSON.parse(await response.text());
+  const received = performance.now();
+  clock.samples.push({ rtt: received - sent, offset: now - (sent + received) / 2, at: received });
+  clock.samples = clock.samples.filter(sample => received - sample.at < 30000);
+  const best = clock.samples.reduce((a, b) => (b.rtt < a.rtt ? b : a));
+  clock.offset = best.offset;
+  clock.rtt = best.rtt;
+}
+
+function setMeasuring(on) {
+  measuring = on;
+  if (on && !measureTimer) {
+    clock.samples = [];
+    clock.offset = null;
+    clock.ready = false;
+    // Record frames only once a few round trips have settled the offset.
+    (async () => {
+      for (let i = 0; i < 5; i++) await syncClock().catch(() => {});
+      clock.ready = clock.offset !== null;
+    })();
+    measureTimer = setInterval(sendFrames, 1000);
+  } else if (!on && measureTimer) {
+    clearInterval(measureTimer);
+    measureTimer = null;
+    frames = [];
+    rtpFrames = [];
+    unreadable = 0;
+  }
+}
+
+/** Mean jitter buffer delay since the last call, in milliseconds. */
+const jitter = { pc: null, delay: 0, count: 0 };
+async function jitterBuffer() {
+  const pc = stream?.pc;
+  if (!pc) return null;
+  if (jitter.pc !== pc) Object.assign(jitter, { pc, delay: 0, count: 0 });
+  for (const report of (await pc.getStats()).values()) {
+    if (report.type !== "inbound-rtp" || report.kind !== "video" || report.jitterBufferEmittedCount == null) continue;
+    const delay = report.jitterBufferDelay - jitter.delay;
+    const count = report.jitterBufferEmittedCount - jitter.count;
+    Object.assign(jitter, { delay: report.jitterBufferDelay, count: report.jitterBufferEmittedCount });
+    return count > 0 ? (delay / count) * 1000 : null;
+  }
+  return null;
+}
+
+async function sendFrames() {
+  await syncClock().catch(() => {});
+  const jitterBufferMs = await jitterBuffer().catch(() => null);
+  const batch = {
+    rtt: clock.rtt, jitter_buffer: jitterBufferMs, unreadable, frames: frames.splice(0),
+    rtp: rtpFrames.splice(0), rtp_timestamps: rtpTimestamps,
+  };
+  unreadable = 0;
+  if (!batch.frames.length && !batch.rtp.length && !batch.unreadable) return;
+  await fetch(`/api/displays/${id}/frames`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(batch),
+  }).catch(() => {});
+}
+
+/** The frame code of the frame `video` presents, or null if unreadable. */
+function readCode({ code, output }) {
+  const { bits, block, left, top } = code;
+  const sx = video.videoWidth / output.width;
+  const sy = video.videoHeight / output.height;
+  if (!sx || !sy) return null;
+  const [width, height] = [bits * CELL, 2 * CELL];
+  if (codeCanvas.width !== width || codeCanvas.height !== height) [codeCanvas.width, codeCanvas.height] = [width, height];
+  codeContext.drawImage(video, left * sx, top * sy, bits * block * sx, 2 * block * sy, 0, 0, width, height);
+  const data = codeContext.getImageData(0, 0, width, height).data;
+  // Mean of the middle four pixels of a block's cell.
+  const luma = (column, row) => {
+    let sum = 0;
+    for (let y = 1; y < 3; y++) {
+      for (let x = 1; x < 3; x++) {
+        const index = ((row * CELL + y) * width + column * CELL + x) * 4;
+        sum += data[index] + data[index + 1] + data[index + 2];
+      }
+    }
+    return sum / 12;
+  };
+  let value = 0;
+  for (let bit = 0; bit < bits; bit++) {
+    const [one, zero] = [luma(bit, 0), luma(bit, 1)];
+    if (Math.abs(one - zero) < MIN_CONTRAST) return null;
+    value = value * 2 + (one > zero ? 1 : 0);
+  }
+  return value;
+}
+
+if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
+  const onFrame = (now, metadata) => {
+    if (measuring && clock.ready) {
+      const shown = (metadata.expectedDisplayTime ?? now) + clock.offset;
+      const received = metadata.receiveTime === undefined ? null : metadata.receiveTime + clock.offset;
+      rtpTimestamps = metadata.rtpTimestamp !== undefined;
+      if (rtpTimestamps) {
+        rtpFrames.push([metadata.rtpTimestamp >>> 0, shown, received]);
+      } else {
+        const code = command?.code ? readCode(command) : null;
+        if (code === null) unreadable++;
+        else frames.push([code, shown, received]);
+      }
+    }
+    video.requestVideoFrameCallback(onFrame);
+  };
+  video.requestVideoFrameCallback(onFrame);
+}
+
+render();
+pollLoop();
+</script>
+</body>
+</html>

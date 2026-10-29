@@ -1,0 +1,12 @@
+# Needs uv, Playwright's Chromium, and GStreamer's webrtcsink and libnice
+# elements; the version pin applies only to this check, not the Rust tool.
+[tasks."browser:check"]
+description = "Run the demo end to end with headless Chromium displays and measure drift"
+dir = "{{config_root}}/../.."
+run = """
+cargo build --locked --release -p wallplay -p wallcalibrate
+uv run --no-project --with playwright==1.54.0 \
+  python tools/wallplay/scripts/browser_check.py \
+  --wallplay target/release/wallplay \
+  --wallcalibrate target/release/wallcalibrate
+"""

@@ -1,0 +1,30 @@
+[package]
+name = "wallplay"
+version = { workspace = true }
+description = "Browser playback demo for irregular video walls: calibrate from a photo, then stream every display's wallwarp output over WebRTC."
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+readme = "README.md"
+repository = { workspace = true }
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+gst = { workspace = true }
+gst-plugin-wallwarp = { path = "../../video/wallwarp" }
+gst-video = { workspace = true }
+httparse = "1.10.1"
+image = { workspace = true, features = ["jpeg"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+wall-geometry = { path = "../../utils/wall-geometry" }
+wallcalibrate = { path = "../wallcalibrate" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+image = { workspace = true, features = ["jpeg", "png"] }
+tempfile = "3.27.0"

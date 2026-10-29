@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wallplay</title>
+<style>
+  :root { color-scheme: dark; }
+  [hidden] { display: none !important; }
+  body { margin: 0 auto; max-width: 1100px; padding: 16px; font: 14px/1.45 system-ui, sans-serif; background: #161616; color: #eee; }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  h2 { margin: 0 0 8px; font-size: 16px; }
+  section { margin: 16px 0; padding: 12px 16px; border: 1px solid #333; border-radius: 8px; background: #1e1e1e; overflow-x: auto; }
+  p { margin: 6px 0; }
+  .muted { color: #999; }
+  .error { color: #ff6b6b; }
+  .ok { color: #46c96b; }
+  .warn { color: #ffb02e; }
+  table { width: 100%; border-collapse: collapse; margin: 6px 0; }
+  th, td { padding: 4px 8px; border-bottom: 1px solid #2c2c2c; text-align: left; vertical-align: top; }
+  th { color: #aaa; font-weight: 600; }
+  td.number { font-variant-numeric: tabular-nums; }
+  button, select, input { font: inherit; padding: 3px 10px; max-width: 100%; }
+  label.button { padding: 3px 10px; border: 1px solid #666; border-radius: 4px; background: #333; cursor: pointer; }
+  label.button:has(input:disabled) { opacity: 0.5; cursor: default; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  label { display: inline-flex; gap: 6px; align-items: center; }
+  input[type=number] { width: 6em; }
+  iframe { width: 100%; height: 70vh; border: 1px solid #333; border-radius: 6px; background: #161616; }
+  img.layout { max-width: 100%; max-height: 50vh; display: block; margin-top: 8px; background: #222; }
+  #simulation { position: relative; overflow: hidden; margin-top: 8px; background: #000; border-radius: 6px; }
+  #simulation-photo, #simulation-outlines { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #simulation-outlines { pointer-events: none; }
+  #simulation-outlines polygon { fill: none; stroke: #3c8cff; }
+  #simulation-outlines text { fill: #fff; stroke: #000; paint-order: stroke; font-weight: 600; }
+  #simulation-live img { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  code { background: #2a2a2a; padding: 0 4px; border-radius: 3px; }
+  #message { min-height: 1.45em; }
+</style>
+</head>
+<body>
+<h1>wallplay</h1>
+<p class="muted">Calibrate a video wall from one photo, then play one video across its displays.</p>
+<p id="message"></p>
+
+<section>
+  <h2>Displays</h2>
+  <p>On every display, open <code id="display-url"></code> with its own ID, then tap it to go fullscreen.</p>
+  <table>
+    <thead><tr><th>ID</th><th>State</th><th>Viewport</th><th>Stream</th><th>Notes</th><th></th></tr></thead>
+    <tbody id="displays"></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>1. Show the patterns</h2>
+  <p class="muted">Every online display gets AprilTag markers sized to its viewport. Make every display fullscreen first.</p>
+  <div class="row"><button id="patterns">Show patterns</button><span id="manifest"></span></div>
+</section>
+
+<section>
+  <h2>2. Photograph the wall</h2>
+  <p class="muted">One photo with every display in view, from where the wall will be watched or from straight in front, with the camera's main lens. It is calibrated as soon as it is taken or chosen. Open this page on a phone to use its camera directly.</p>
+  <div class="row">
+    <label class="button">Take photo<input id="camera" type="file" accept="image/jpeg,image/png" capture="environment" hidden></label>
+    <label class="button">Choose photo<input id="photo" type="file" accept="image/jpeg,image/png" hidden></label>
+    <button id="edit">Open corner editor</button>
+  </div>
+  <table>
+    <thead><tr><th>Display</th><th>Status</th><th>Markers</th><th>RMS error</th><th>Notes</th></tr></thead>
+    <tbody id="calibration"></tbody>
+  </table>
+  <iframe id="editor" title="Corner editor" hidden></iframe>
+</section>
+
+<section>
+  <h2>3. Make the layout</h2>
+  <div class="row">
+    <label>Mode <select id="mode" class="layout-option"><option value="viewpoint">viewpoint: looks right from where the photo was taken</option><option value="planar">planar: one flat wall, perspective removed</option></select></label>
+    <label>Anchor <select id="anchor" class="layout-option"></select></label>
+  </div>
+  <p class="muted" id="anchor-help"></p>
+  <div class="row" id="planar" hidden>
+    <label>Anchor's measured size (optional) <input id="reference-width" class="layout-option" type="number" min="0" step="any" placeholder="width"> x <input id="reference-height" class="layout-option" type="number" min="0" step="any" placeholder="height"></label>
+  </div>
+  <div class="row">
+    <label><input id="straighten" class="layout-option" type="checkbox"> Straighten: the displays are meant to be upright and in line</label>
+  </div>
+  <p class="muted">Straightened displays become upright rectangles of their own aspect ratio, turned only in quarter turns, so each shows a plain crop of the video. Small rotations and perspective in the photo, or in the mounting, are ignored.</p>
+  <div class="row">
+    <label>Canvas <select id="canvas-kind" class="layout-option"><option value="tight">exactly the displays, longest side</option><option value="fit">a fixed size, displays centered</option></select></label>
+    <span id="canvas-tight"><input id="canvas-longest" class="layout-option" type="number" min="16" value="1920"> px</span>
+    <span id="canvas-fit" hidden><input id="canvas-width" class="layout-option" type="number" min="16" value="1920"> x <input id="canvas-height" class="layout-option" type="number" min="16" value="1080"></span>
+  </div>
+  <div class="row">
+    <label>Video <select id="fill" class="layout-option"><option value="cover">fills the displays, cropping its edges</option><option value="contain">shows whole, with black bars</option></select></label>
+  </div>
+  <div class="row">
+    <label><input id="incomplete" class="layout-option" type="checkbox"> Leave out displays without corners</label>
+    <button id="layout">Make layout</button>
+    <span id="layout-summary"></span>
+  </div>
+  <img class="layout" id="layout-preview" alt="Layout preview" hidden>
+</section>
+
+<section>
+  <h2>Simulation</h2>
+  <p class="muted">The photo, with every playing display's output drawn where the display is: what the camera would see. Lines continue across gaps where the layout matches the wall from that spot. Changing a layout option above makes a new layout, which the displays take while playing, so this follows within a second.</p>
+  <div class="row">
+    <label>Photo <input id="dim" type="range" min="0" max="100" value="40"></label>
+    <label><input id="outlines" type="checkbox" checked> Outlines</label>
+    <span id="simulation-status" class="muted"></span>
+  </div>
+  <div id="simulation" hidden>
+    <img id="simulation-photo" alt="Calibration photo">
+    <div id="simulation-live"></div>
+    <svg id="simulation-outlines"></svg>
+  </div>
+</section>
+
+<section>
+  <h2>4. Play</h2>
+  <div class="row">
+    <label>Source <select id="source"></select></label>
+    <span id="checks" class="muted"></span>
+  </div>
+  <div class="row" id="url-row" hidden>
+    <input id="url" type="text" size="48" placeholder="https://www.youtube.com/watch?v=…, rtsp://camera/stream, file:///path/video.mp4">
+    <label>Open as <select id="open-as">
+      <option value="uri">detect</option>
+      <option value="media">media, by GStreamer</option>
+      <option value="page">web page, by yt-dlp</option>
+      <option value="whep">WHEP endpoint</option>
+    </select></label>
+    <button id="use-url">Play this</button>
+  </div>
+  <p class="muted" id="url-help" hidden>Files on this server (file:///…), HTTP(S) videos, HLS and DASH playlists, RTSP, SRT and RTMP cameras and encoders, WHEP endpoints (URLs ending in /whep), and YouTube and other pages yt-dlp knows, which take a few seconds to look up. Only the video plays.</p>
+  <div class="row">
+    <label><input id="restart" type="checkbox"> Restart when it ends or fails: clips loop, streams reconnect</label>
+    <label>Standby <select id="standby"></select></label>
+    <span class="muted">shows while the source connects, after it ends, and when it fails</span>
+  </div>
+  <div class="row">
+    <label>Browser buffer <select id="buffer">
+      <option value="">browser default</option>
+      <option value="0">0 ms: least latency</option>
+      <option value="50">50 ms</option>
+      <option value="100">100 ms</option>
+      <option value="200">200 ms: smoothest</option>
+    </select></label>
+    <span class="muted">Applies while playing, without reconnecting; Safari ignores it.</span>
+  </div>
+  <div class="row"><button id="play">Play</button><button id="idle">Stop</button><span id="player"></span></div>
+  <div class="row"><span id="source-status" class="muted"></span></div>
+  <p class="muted">Changing the source, the standby or the restart setting applies at once while playing; the displays keep their streams.</p>
+</section>
+
+<section>
+  <h2>5. Measure and align</h2>
+  <p class="muted">Each display reports which frame it presents, from the frame's RTP timestamp in Chrome and Edge or else from a frame number drawn in its bottom-left corner only while such a display needs it, and when its browser expects every frame on screen, on this server's clock. Latency runs from a frame's capture: <b>Pipeline</b> until it is warped and ready to encode, <b>Arrives</b> until its last packet reaches the browser, <b>On screen</b> until it is expected on screen; <b>Jitter buffer</b> is the browser's own buffering, part of the last step. Offsets compare displays for the same frame; the offset change is how far that moved across the window, and one refresh, about 16.7 ms at 60 Hz, means a display slipped a frame. Panel latency is not included.</p>
+  <p class="muted"><b>Align displays</b> measures too, and gives every display that presents frames earlier than the latest one that much more jitter buffer, a step every few seconds, until all agree within a refresh or so; <b>Added delay</b> is each display's share. It needs browsers that honor a jitter buffer target, which Safari does not, and it is only as exact as each display's clock synchronization (<b>Clock ±</b>).</p>
+  <div class="row"><button id="measure">Start measuring</button><button id="align">Align displays</button><span id="aligning"></span></div>
+  <div class="row"><span id="spread"></span></div>
+  <table>
+    <thead><tr><th>Display</th><th>Frames</th><th>Unreadable</th><th>Clock ±</th><th>Pipeline</th><th>Arrives</th><th>Jitter buffer</th><th>On screen median / p95</th><th>Offset median / p95</th><th>Offset change</th><th>Added delay</th></tr></thead>
+    <tbody id="drift"></tbody>
+  </table>
+</section>
+
+<p class="muted">Files: <a href="/api/manifest">manifest.json</a> · <a href="/api/calibration">calibration.json</a> · <a href="/api/layout">layout.json</a> · <a href="/api/measure">measurement</a></p>
+
+<script>
+"use strict";
+const $ = selector => document.querySelector(selector);
+let state = null;
+let editorSerial = null;
+let layoutSerial = null;
+
+$("#display-url").textContent = `${location.origin}/display/<id>`;
+
+function setMessage(text, error = false) {
+  $("#message").textContent = text;
+  $("#message").className = error ? "error" : "ok";
+}
+
+async function api(method, path, body, contentType = "application/json") {
+  const options = { method, cache: "no-store", headers: {} };
+  if (body !== undefined) {
+    options.body = body instanceof Blob ? body : JSON.stringify(body);
+    options.headers["Content-Type"] = contentType;
+  }
+  const response = await fetch(path, options);
+  const text = await response.text();
+  const value = text ? JSON.parse(text) : null;
+  if (!response.ok) throw new Error(value?.error ?? response.statusText);
+  return value;
+}
+
+function act(button, work, done) {
+  button.disabled = true;
+  setMessage("");
+  work()
+    .then(result => { if (done) setMessage(done(result)); return refresh(); })
+    .catch(error => setMessage(error.message, true))
+    .finally(() => { button.disabled = false; });
+}
+
+function cell(row, text, className) {
+  const td = document.createElement("td");
+  td.textContent = text ?? "";
+  if (className) td.className = className;
+  row.append(td);
+  return td;
+}
+
+const ms = value => (value == null ? "" : `${value.toFixed(1)} ms`);
+const pair = stats => (stats ? `${ms(stats.median)} / ${ms(stats.p95)}` : "");
+
+function renderDisplays() {
+  const body = $("#displays");
+  body.replaceChildren();
+  if (!state.displays.length) {
+    const row = body.insertRow();
+    cell(row, "No display has connected yet.", "muted").colSpan = 6;
+  }
+  for (const display of state.displays) {
+    const row = body.insertRow();
+    cell(row, display.id);
+    cell(row, display.online ? "online" : `offline ${display.seen_seconds_ago} s`, display.online ? "ok" : "muted");
+    const viewport = display.viewport;
+    cell(row, viewport ? `${viewport.width}x${viewport.height} @${viewport.scale}x${viewport.fullscreen ? ", fullscreen" : ""}` : "");
+    cell(row, display.player);
+    cell(row, display.warnings.join("; "), "warn");
+    const actions = cell(row, "");
+    if (!display.online) {
+      const forget = document.createElement("button");
+      forget.textContent = "Forget";
+      forget.addEventListener("click", () => act(forget, () => api("DELETE", `/api/displays/${display.id}`)));
+      actions.append(forget);
+    }
+  }
+}
+
+function renderCalibration() {
+  const manifest = state.manifest;
+  $("#manifest").textContent = manifest
+    ? `Patterns for ${manifest.screens.map(screen => `${screen.id} (${screen.output.width}x${screen.output.height})`).join(", ")}`
+    : "";
+  const body = $("#calibration");
+  body.replaceChildren();
+  const calibration = state.calibration;
+  $("#edit").disabled = !calibration;
+  if (!calibration) return;
+  for (const screen of calibration.screens) {
+    const row = body.insertRow();
+    cell(row, screen.id);
+    cell(row, screen.status, { complete: "ok", manual: "ok", partial: "warn", missing: "error" }[screen.status]);
+    cell(row, `${screen.used} of ${screen.markers}`, "number");
+    cell(row, screen.rms_error == null ? "" : `${screen.rms_error.toFixed(2)} px`, "number");
+    cell(row, screen.notes.join("; "), "muted");
+  }
+  if (!$("#editor").hidden && editorSerial !== calibration.serial) openEditor();
+  const anchor = $("#anchor");
+  const ids = ["", ...calibration.screens.map(screen => screen.id)];
+  if ([...anchor.options].map(option => option.value).join() !== ids.join()) {
+    const selected = anchor.value;
+    anchor.replaceChildren(...ids.map(id => new Option(id || "none", id)));
+    anchor.value = ids.includes(selected) ? selected : "";
+  }
+}
+
+function openEditor() {
+  editorSerial = state.calibration.serial;
+  $("#editor").hidden = false;
+  $("#editor").src = `/calibration?v=${editorSerial}`;
+}
+
+function renderLayout() {
+  const layout = state.layout;
+  const preview = $("#layout-preview");
+  if (!layout) {
+    $("#layout-summary").textContent = "";
+    preview.hidden = true;
+    return;
+  }
+  if (!layoutFormFilled && layout.options) fillLayoutForm(layout.options);
+  layoutFormFilled = true;
+  const parts = [`canvas ${layout.canvas.width}x${layout.canvas.height}`, `${layout.screens.length} displays`];
+  const options = layout.options;
+  if (options?.anchor) parts.push(`${options.mode === "planar" ? "on the plane of" : "leveled to"} ${options.anchor}`);
+  if (options?.straighten) parts.push("straightened");
+  if (layout.omitted.length) parts.push(`left out: ${layout.omitted.join(", ")}`);
+  if (layout.units_per_pixel) parts.push(`${layout.units_per_pixel.toPrecision(4)} units per pixel`);
+  $("#layout-summary").textContent = parts.join(", ");
+  if (layoutSerial !== layout.serial) {
+    layoutSerial = layout.serial;
+    preview.src = `/api/layout.svg?v=${layout.serial}`;
+    preview.hidden = false;
+  }
+}
+
+/** Set while a URL is being typed, so refreshes keep the URL row open. */
+let choosingUrl = false;
+
+/** The source's kind and value, as in {"pattern": "bars"}. */
+function sourceEntry(source) {
+  return Object.entries(source)[0] ?? ["pattern", ""];
+}
+
+function renderSource() {
+  const select = $("#source");
+  const [kind, value] = sourceEntry(state.source.source);
+  if (!select.options.length) {
+    select.append(...state.patterns.map(pattern => new Option(pattern.name, `pattern:${pattern.id}`)));
+    select.append(new Option("URL: a video, stream, camera or web page…", "url"));
+    $("#standby").append(...state.patterns.map(pattern => new Option(pattern.name, pattern.id)));
+  }
+  const launch = [...select.options].find(option => option.value === "launch");
+  if (kind === "launch" && !launch) select.append(new Option("Pipeline from the command line", "launch"));
+  if (document.activeElement !== select) {
+    const current = kind === "pattern" ? `pattern:${value}` : kind === "launch" ? "launch" : "url";
+    select.value = choosingUrl ? "url" : current;
+    $("#url-row").hidden = $("#url-help").hidden = select.value !== "url";
+    if (select.value === "url" && document.activeElement !== $("#url")) {
+      $("#url").value = value;
+      $("#open-as").value = kind;
+    }
+  }
+  const pattern = kind === "pattern" && state.patterns.find(pattern => pattern.id === value);
+  $("#checks").textContent = pattern ? `Shows ${pattern.checks}.` : "";
+  if (document.activeElement !== $("#restart")) $("#restart").checked = state.restart;
+  if (document.activeElement !== $("#standby")) $("#standby").value = state.standby;
+  if (document.activeElement !== $("#buffer")) $("#buffer").value = state.buffer_ms ?? "";
+}
+
+const VIA = { pattern: "test pattern", gstreamer: "GStreamer", "yt-dlp": "found by yt-dlp", whep: "WHEP", pipeline: "pipeline" };
+
+/** What plays, and while playing what it is doing. */
+function renderSourceStatus() {
+  const { source, via, title, live } = state.source;
+  const [, value] = sourceEntry(source);
+  const kind = [live === true ? "live" : live === false ? "clip" : "", VIA[via]].filter(Boolean).join(", ");
+  const parts = [`${title ?? value}${kind ? ` (${kind})` : ""}`];
+  const status = state.player.source;
+  let error = false;
+  if (state.show === "play" && status) {
+    parts.push(status.standby ? `${status.state}, standby showing` : status.state);
+    if (status.error) {
+      parts.push(status.error);
+      error = true;
+    }
+    if (status.restarts) parts.push(`${status.restarts} restart${status.restarts === 1 ? "" : "s"}`);
+  }
+  $("#source-status").textContent = parts.join(" · ");
+  $("#source-status").className = error ? "error" : "muted";
+}
+
+function renderPlayer() {
+  renderSource();
+  renderSourceStatus();
+  const { status, routes } = state.player;
+  const text = [status.state, status.error].filter(Boolean).join(": ");
+  const ports = (routes ?? []).map(route => route.endpoint.port ? `${route.display} on port ${route.endpoint.port}` : route.display);
+  const stuck = state.player.stuck_pipelines
+    ? `${state.player.stuck_pipelines} earlier pipeline(s) did not stop, a known webrtcsink deadlock; restart wallplay to free them`
+    : "";
+  $("#player").textContent = [state.show === "play" ? text : state.show, ports.join(", "), stuck].filter(Boolean).join(" · ");
+  $("#player").className = status.error ? "error" : "muted";
+  $("#measure").textContent = state.measuring ? "Stop measuring" : "Start measuring";
+  $("#measure").disabled = state.show !== "play";
+  const aligning = state.aligning;
+  $("#align").textContent = aligning ? "Stop aligning" : "Align displays";
+  $("#align").disabled = state.show !== "play";
+  $("#aligning").textContent = !aligning ? ""
+    : aligning.spread_ms == null ? "Aligning: waiting for frames from at least two displays."
+    : `${aligning.aligned ? "Aligned" : "Aligning"}: displays ${ms(aligning.spread_ms)} apart at the last check, within ${aligning.tolerance_ms} ms counts as aligned; ${aligning.steps} step${aligning.steps === 1 ? "" : "s"} so far.`;
+  $("#aligning").className = aligning?.aligned ? "ok" : "muted";
+}
+
+async function renderDrift() {
+  if (!state.measuring && !state.aligning) return;
+  const { summary, aligning } = await api("GET", "/api/measure");
+  const body = $("#drift");
+  body.replaceChildren();
+  for (const display of summary.displays) {
+    const row = body.insertRow();
+    cell(row, display.id + (display.id === summary.reference ? " (reference)" : ""));
+    cell(row, display.frames, "number");
+    cell(row, display.unreadable, "number");
+    cell(row, display.clock_rtt_ms == null ? "" : ms(display.clock_rtt_ms / 2), "number");
+    // Stamping happens after the pipeline, so later steps add its delay.
+    const pipeline = display.pipeline_ms?.median ?? 0;
+    const after = stats => stats && { ...stats, median: stats.median + pipeline, p95: stats.p95 + pipeline };
+    cell(row, ms(display.pipeline_ms?.median), "number");
+    cell(row, ms(after(display.receive_ms)?.median), "number");
+    cell(row, ms(display.jitter_buffer_ms), "number");
+    cell(row, pair(after(display.latency_ms)), "number");
+    cell(row, pair(display.offset_ms), "number");
+    cell(row, ms(display.offset_change_ms), "number");
+    cell(row, aligning ? ms(aligning.delays_ms[display.id] ?? 0) : "", "number");
+  }
+  const spread = summary.spread_ms;
+  $("#spread").textContent = spread
+    ? `Spread between displays over the last ${summary.window_seconds} s: median ${ms(spread.median)}, p95 ${ms(spread.p95)}, max ${ms(spread.max)}`
+    : "Waiting for frames from at least two displays.";
+}
+
+async function refresh() {
+  state = await api("GET", "/api/state");
+  renderDisplays();
+  renderCalibration();
+  renderLayout();
+  renderSimulation();
+  renderPlayer();
+  await renderDrift();
+}
+
+$("#patterns").addEventListener("click", event => act(event.target, () => api("POST", "/api/patterns"),
+  result => `Showing patterns on ${result.displays.join(", ")}. Now take or choose a photo of the wall.`));
+
+// Phones open the camera for "Take photo" (`capture`) and ask JPEG for
+// `accept`, so iPhones convert HEIC on the way. Either input calibrates at once.
+for (const input of [$("#camera"), $("#photo")]) {
+  input.addEventListener("change", () => {
+    const file = input.files[0];
+    if (!file) return;
+    input.value = "";
+    act(input, () => api("POST", "/api/photo", file, file.type || "application/octet-stream"),
+      result => (result.calibration.complete
+        ? "Every display was found. Check the corners in the editor if you like, then make the layout."
+        : "Some displays are missing: place them in the corner editor, retake the photo, or leave them out of the layout."));
+    setMessage(`Calibrating ${(file.size / 1e6).toFixed(1)} MB photo…`);
+  });
+}
+
+$("#edit").addEventListener("click", openEditor);
+addEventListener("message", event => {
+  if (event.origin !== location.origin || event.data?.type !== "wallcalibrate-calibration") return;
+  api("PUT", "/api/calibration", event.data.calibration)
+    .then(() => { setMessage("Applied the corrected corners."); return refresh(); })
+    .catch(error => setMessage(error.message, true));
+});
+
+let layoutFormFilled = false;
+
+/** Show the options of the current layout in the form. */
+function fillLayoutForm(options) {
+  $("#mode").value = options.mode;
+  $("#anchor").value = options.anchor ?? "";
+  $("#straighten").checked = options.straighten;
+  $("#incomplete").checked = options.allow_incomplete;
+  $("#fill").value = options.fill;
+  if (Array.isArray(options.canvas)) {
+    $("#canvas-kind").value = "fit";
+    [$("#canvas-width").value, $("#canvas-height").value] = options.canvas;
+  } else {
+    $("#canvas-kind").value = "tight";
+    $("#canvas-longest").value = options.canvas.longest;
+  }
+  [$("#reference-width").value, $("#reference-height").value] = options.reference_size ?? ["", ""];
+  showLayoutForm();
+}
+
+function showLayoutForm() {
+  const planar = $("#mode").value === "planar";
+  $("#planar").hidden = !planar;
+  $("#canvas-tight").hidden = $("#canvas-kind").value !== "tight";
+  $("#canvas-fit").hidden = $("#canvas-kind").value !== "fit";
+  $("#anchor-help").textContent = planar
+    ? "Planar: the anchor is shown unwarped, as a plain crop, and every other display is placed on its plane. Needs an anchor."
+    : "Viewpoint: with an anchor, the layout is leveled to that display's edges, which removes the camera's tilt.";
+}
+
+function layoutRequest() {
+  const number = selector => Number($(selector).value);
+  const request = {
+    mode: $("#mode").value,
+    anchor: $("#anchor").value || null,
+    straighten: $("#straighten").checked,
+    canvas: $("#canvas-kind").value === "tight"
+      ? { longest: number("#canvas-longest") }
+      : [number("#canvas-width"), number("#canvas-height")],
+    fill: $("#fill").value,
+    allow_incomplete: $("#incomplete").checked,
+  };
+  if (request.mode === "planar" && number("#reference-width") > 0 && number("#reference-height") > 0) {
+    request.reference_size = [number("#reference-width"), number("#reference-height")];
+  }
+  return request;
+}
+
+function makeLayout(button) {
+  act(button, () => api("POST", "/api/layout", layoutRequest()),
+    () => (state?.show === "play" ? "Layout updated while playing." : "Layout ready. Press Play."));
+}
+
+$("#layout").addEventListener("click", event => makeLayout(event.target));
+// Once there is a layout, every change makes a new one, so the simulation
+// follows the options.
+for (const input of document.querySelectorAll(".layout-option")) {
+  input.addEventListener("change", () => {
+    showLayoutForm();
+    if (state?.layout && !(input.id === "mode" && $("#mode").value === "planar" && !$("#anchor").value)) {
+      makeLayout($("#layout"));
+    }
+  });
+}
+showLayoutForm();
+
+// The simulation: each display's live preview mapped onto its outline in the
+// photo by the perspective transform taking the output's rectangle there.
+
+/** The homography taking the unit square to `quad` (top-left, top-right,
+ * bottom-right, bottom-left), as in wall-geometry. */
+function squareToQuad([[x0, y0], [x1, y1], [x2, y2], [x3, y3]]) {
+  const [dx1, dx2, dx3] = [x1 - x2, x3 - x2, x0 - x1 + x2 - x3];
+  const [dy1, dy2, dy3] = [y1 - y2, y3 - y2, y0 - y1 + y2 - y3];
+  const den = dx1 * dy2 - dx2 * dy1;
+  const g = (dx3 * dy2 - dx2 * dy3) / den;
+  const h = (dx1 * dy3 - dx3 * dy1) / den;
+  return [x1 - x0 + g * x1, x3 - x0 + h * x3, x0, y1 - y0 + g * y1, y3 - y0 + h * y3, y0, g, h];
+}
+
+/** A CSS transform placing a `width` x `height` element onto `quad`. */
+function quadTransform(quad, width, height) {
+  const [a, b, c, d, e, f, g, h] = squareToQuad(quad);
+  return `matrix3d(${a / width}, ${d / width}, 0, ${g / width}, ${b / height}, ${e / height}, 0, ${h / height}, 0, 0, 1, 0, ${c}, ${f}, 0, 1)`;
+}
+
+const simulation = { photoSerial: null, images: new Map(), loading: new Set() };
+
+function simulationScale() {
+  return $("#simulation").clientWidth / state.calibration.photo.width;
+}
+
+function placePreview(image, corners) {
+  const scale = simulationScale();
+  const quad = corners.map(([x, y]) => [x * scale, y * scale]);
+  image.style.width = `${image.naturalWidth}px`;
+  image.style.height = `${image.naturalHeight}px`;
+  image.style.transform = quadTransform(quad, image.naturalWidth, image.naturalHeight);
+}
+
+function renderSimulation() {
+  const calibration = state.calibration;
+  const container = $("#simulation");
+  container.hidden = !calibration;
+  if (!calibration) {
+    $("#simulation-status").textContent = "Upload a photo to see the simulation.";
+    return;
+  }
+  const { width, height } = calibration.photo;
+  container.style.height = `${(container.clientWidth * height) / width}px`;
+  if (simulation.photoSerial !== calibration.serial) {
+    simulation.photoSerial = calibration.serial;
+    $("#simulation-photo").src = `/api/photo.jpg?v=${calibration.serial}`;
+  }
+  $("#simulation-photo").style.opacity = Number($("#dim").value) / 100;
+  const outlines = $("#simulation-outlines");
+  outlines.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  outlines.hidden = !$("#outlines").checked;
+  const unit = Math.max(width, height) / 400;
+  outlines.innerHTML = "";
+  for (const screen of calibration.screens.filter(screen => screen.corners)) {
+    const polygon = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+    polygon.setAttribute("points", screen.corners.map(point => point.join(",")).join(" "));
+    polygon.setAttribute("stroke-width", unit);
+    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    const [x, y] = screen.corners[0];
+    Object.entries({ x: x + unit * 3, y: y + unit * 12, "font-size": unit * 10, "stroke-width": unit * 2 })
+      .forEach(([key, value]) => label.setAttribute(key, value));
+    label.textContent = screen.id;
+    outlines.append(polygon, label);
+  }
+  const playing = state.show === "play" ? (state.player.routes ?? []).map(route => route.display) : [];
+  for (const [id, image] of simulation.images) {
+    if (!playing.includes(id)) {
+      image.remove();
+      simulation.images.delete(id);
+    }
+  }
+  $("#simulation-status").textContent = playing.length
+    ? "Live, a few frames per second."
+    : "Press Play to see each display's output in place.";
+  for (const image of simulation.images.values()) {
+    const screen = calibration.screens.find(screen => screen.id === image.dataset.id);
+    if (screen?.corners && image.naturalWidth) placePreview(image, screen.corners);
+  }
+}
+
+/** Load the next preview of every playing display, one request at a time each. */
+function refreshPreviews() {
+  if (!state?.calibration || state.show !== "play" || $("#simulation").hidden) return;
+  for (const route of state.player.routes ?? []) {
+    const id = route.display;
+    const screen = state.calibration.screens.find(screen => screen.id === id);
+    if (!screen?.corners || simulation.loading.has(id)) continue;
+    simulation.loading.add(id);
+    fetch(`/api/displays/${id}/preview.jpg`, { cache: "no-store" })
+      .then(response => (response.status === 200 ? response.blob() : null))
+      .then(blob => {
+        if (!blob) return;
+        let image = simulation.images.get(id);
+        if (!image) {
+          image = document.createElement("img");
+          image.dataset.id = id;
+          image.alt = "";
+          $("#simulation-live").append(image);
+          simulation.images.set(id, image);
+        }
+        const previous = image.src;
+        image.onload = () => {
+          placePreview(image, screen.corners);
+          if (previous.startsWith("blob:")) URL.revokeObjectURL(previous);
+        };
+        image.src = URL.createObjectURL(blob);
+      })
+      .catch(() => {})
+      .finally(() => simulation.loading.delete(id));
+  }
+}
+setInterval(refreshPreviews, 250);
+for (const input of [$("#dim"), $("#outlines")]) input.addEventListener("input", () => state && renderSimulation());
+addEventListener("resize", () => state && renderSimulation());
+
+const playing = () => state.show === "play";
+$("#source").addEventListener("change", event => {
+  const value = event.target.value;
+  choosingUrl = value === "url";
+  $("#url-row").hidden = $("#url-help").hidden = !choosingUrl;
+  if (choosingUrl) $("#url").focus();
+  if (value.startsWith("pattern:")) {
+    act(event.target, () => api("POST", "/api/source", { pattern: value.slice("pattern:".length) }),
+      () => (playing() ? "Switched to the pattern." : "Pattern chosen. Press Play."));
+  }
+});
+function useUrl() {
+  const url = $("#url").value.trim();
+  if (!url) return;
+  act($("#use-url"), () => {
+    setMessage("Opening the URL; web pages take a few seconds to look up.");
+    return api("POST", "/api/source", { [$("#open-as").value]: url }).then(result => {
+      choosingUrl = false;
+      return result;
+    });
+  }, () => (playing() ? "Switching; the current source shows until the new one plays." : "URL chosen. Press Play."));
+}
+$("#use-url").addEventListener("click", useUrl);
+$("#url").addEventListener("keydown", event => { if (event.key === "Enter") useUrl(); });
+$("#restart").addEventListener("change", event => act(event.target, () => api("POST", "/api/playback", { restart: event.target.checked })));
+$("#standby").addEventListener("change", event => act(event.target, () => api("POST", "/api/playback", { standby: event.target.value })));
+$("#buffer").addEventListener("change", event => {
+  const value = event.target.value;
+  act(event.target, () => api("POST", "/api/buffer", { ms: value === "" ? null : Number(value) }));
+});
+
+$("#play").addEventListener("click", event => act(event.target, () => api("POST", "/api/play"),
+  () => "Playing. Every display connects to its own stream."));
+$("#idle").addEventListener("click", event => act(event.target, () => api("POST", "/api/idle"), () => "Stopped."));
+$("#measure").addEventListener("click", event => act(event.target, () => api("POST", "/api/measure", { on: !state.measuring })));
+$("#align").addEventListener("click", event => act(event.target, () => api("POST", "/api/align", { on: !state.aligning })));
+
+refresh().catch(error => setMessage(error.message, true));
+setInterval(() => refresh().catch(error => setMessage(error.message, true)), 1000);
+</script>
+</body>
+</html>

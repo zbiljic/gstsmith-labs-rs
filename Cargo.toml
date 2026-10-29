@@ -5,6 +5,7 @@ members = [
     "generic/jsontap",
     "generic/ptssampler",
     "tools/wallcalibrate",
+    "tools/wallplay",
     "utils/segmentation-meta",
     "utils/wall-geometry",
     "video/wallwarp",

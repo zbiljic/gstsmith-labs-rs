@@ -54,6 +54,11 @@ are being established before promotion to
   the result becomes a `wallwarp` layout from the camera's viewpoint or
   rectified onto the wall plane.
 
+- [`wallplay`](tools/wallplay/): Browser playback demo. Displays open a URL
+  with their ID, a control page calibrates them from one photo, each display
+  plays its `wallwarp` output through `webrtcsink`, and the browsers report
+  how far apart they present the same frame.
+
 ## Building
 
 The full workspace requires GStreamer 1.28 or newer. NALSense and wallwarp
