@@ -5,6 +5,7 @@ members = [
     "generic/jsontap",
     "generic/ptssampler",
     "utils/segmentation-meta",
+    "utils/wall-geometry",
 ]
 resolver = "3"
 

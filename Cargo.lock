@@ -2347,6 +2347,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wall-geometry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
