@@ -18,7 +18,7 @@ rust-version = "1.96.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-anyhow = "1"
+anyhow = "1.0.104"
 atomic_refcell = "0.1.14"
 criterion = "0.8"
 gst = { package = "gstreamer", version = "0.25.4", features = ["v1_24"] }
