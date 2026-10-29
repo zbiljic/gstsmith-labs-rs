@@ -47,6 +47,13 @@ are being established before promotion to
       one display. Layouts are described with
       [`wall-geometry`](utils/wall-geometry/).
 
+## Tools
+
+- [`wallcalibrate`](tools/wallcalibrate/): Photo-based video wall
+  calibration. Displays show AprilTag markers, one photo locates them, and
+  the result becomes a `wallwarp` layout from the camera's viewpoint or
+  rectified onto the wall plane.
+
 ## Building
 
 The full workspace requires GStreamer 1.28 or newer. NALSense and wallwarp

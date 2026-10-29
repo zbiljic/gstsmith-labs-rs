@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wallcalibrate preview</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; font: 14px/1.4 system-ui, sans-serif; background: #161616; color: #eee; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 8px 16px; background: #222; border-bottom: 1px solid #333; }
+  header p { margin: 0; }
+  .hint { margin: 0; padding: 4px 16px; color: #aaa; }
+  button { font: inherit; padding: 3px 10px; }
+  #place { display: flex; gap: 8px; }
+  svg { flex: 1; min-height: 0; width: 100%; touch-action: none; }
+  polygon { fill: none; pointer-events: none; }
+  polygon.screen { fill-opacity: 0.12; }
+  polygon.complete { stroke: #3c8cff; fill: #3c8cff; }
+  polygon.partial { stroke: #ffb02e; fill: #ffb02e; }
+  polygon.manual { stroke: #c08cff; fill: #c08cff; }
+  polygon.used { stroke: #46c96b; }
+  polygon.rejected { stroke: #e5484d; }
+  polygon.unknown { stroke: #ffb02e; }
+  circle.handle { fill: #fff; stroke: #000; cursor: grab; }
+  text { fill: #fff; stroke: #000; paint-order: stroke; font-weight: 600; pointer-events: none; }
+</style>
+</head>
+<body>
+<header>
+  <strong>wallcalibrate</strong>
+  <p id="summary"></p>
+  <span id="place"></span>
+  <button id="download" type="button">Download calibration.json</button>
+  <button id="apply" type="button" hidden>Apply</button>
+</header>
+<p class="hint">Green: markers used. Red: rejected. Dashed orange: tags not in the manifest. Drag handles to adjust a display; the large handle is its top-left. Then run <code>wallcalibrate layout</code> on the downloaded file.</p>
+<svg id="view" viewBox="0 0 {{WIDTH}} {{HEIGHT}}" preserveAspectRatio="xMidYMid meet">
+  <rect width="{{WIDTH}}" height="{{HEIGHT}}" fill="#333"/>
+  <image href="{{PHOTO}}" width="{{WIDTH}}" height="{{HEIGHT}}" preserveAspectRatio="none"/>
+  <g id="overlay"></g>
+</svg>
+<script id="calibration" type="application/json">{{CALIBRATION}}</script>
+<script>
+"use strict";
+const calibration = JSON.parse(document.getElementById("calibration").textContent);
+const view = document.getElementById("view");
+const overlay = document.getElementById("overlay");
+const { width, height } = calibration.photo;
+const unit = Math.max(width, height) / 500;
+
+function element(name, attributes, parent = overlay) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, value);
+  parent.append(node);
+  return node;
+}
+
+const pointList = corners => corners.map(([x, y]) => `${x},${y}`).join(" ");
+const center = corners => corners.reduce(([sx, sy], [x, y]) => [sx + x / 4, sy + y / 4], [0, 0]);
+
+function label(screen) {
+  const details = [screen.status];
+  if (screen.rms_error != null) details.push(`rms ${screen.rms_error.toFixed(2)} px`);
+  return `${screen.id} (${details.join(", ")})`;
+}
+
+function photoPoint(event) {
+  const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(view.getScreenCTM().inverse());
+  return [Math.round(point.x * 100) / 100, Math.round(point.y * 100) / 100];
+}
+
+function markManual(screen) {
+  screen.status = "manual";
+  screen.rms_error = null;
+  screen.max_error = null;
+}
+
+// Outlines go in one layer and handles in another above it, so no display's
+// outline can cover another display's handles.
+function drawScreen(screen, outlines, handles) {
+  const outline = element("polygon", { class: `screen ${screen.status}`, points: pointList(screen.corners), "stroke-width": unit * 1.5 }, outlines);
+  const text = element("text", { "text-anchor": "middle", "font-size": unit * 9, "stroke-width": unit * 2.5 }, outlines);
+  const placeText = () => {
+    const [x, y] = center(screen.corners);
+    text.setAttribute("x", x);
+    text.setAttribute("y", y);
+    text.textContent = label(screen);
+  };
+  placeText();
+  screen.corners.forEach(([x, y], index) => {
+    const handle = element("circle", { class: "handle", cx: x, cy: y, r: unit * (index === 0 ? 5 : 3.5), "stroke-width": unit, "data-screen": screen.id, "data-corner": index }, handles);
+    handle.addEventListener("pointerdown", down => {
+      down.preventDefault();
+      handle.setPointerCapture(down.pointerId);
+      const move = event => {
+        screen.corners[index] = photoPoint(event);
+        markManual(screen);
+        outline.setAttribute("class", "screen manual");
+        outline.setAttribute("points", pointList(screen.corners));
+        handle.setAttribute("cx", screen.corners[index][0]);
+        handle.setAttribute("cy", screen.corners[index][1]);
+        placeText();
+      };
+      const end = () => {
+        handle.removeEventListener("pointermove", move);
+        handle.removeEventListener("pointerup", end);
+        handle.removeEventListener("pointercancel", end);
+        summarize();
+      };
+      handle.addEventListener("pointermove", move);
+      handle.addEventListener("pointerup", end);
+      handle.addEventListener("pointercancel", end);
+    });
+  });
+}
+
+function summarize() {
+  const counts = {};
+  for (const screen of calibration.screens) counts[screen.status] = (counts[screen.status] ?? 0) + 1;
+  const parts = Object.entries(counts).map(([status, count]) => `${count} ${status}`);
+  const unknown = calibration.unknown_markers?.length ?? 0;
+  if (unknown) parts.push(`${unknown} unknown tags`);
+  document.getElementById("summary").textContent = parts.join(", ");
+  const place = document.getElementById("place");
+  place.replaceChildren();
+  for (const screen of calibration.screens.filter(screen => !screen.corners)) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = `Place ${screen.id}`;
+    button.title = (screen.notes ?? []).join("\n");
+    button.addEventListener("click", () => {
+      const w = width / 5;
+      const h = (w * screen.output.height) / screen.output.width;
+      const [x, y] = [(width - w) / 2, (height - h) / 2];
+      screen.corners = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+      markManual(screen);
+      draw();
+    });
+    place.append(button);
+  }
+}
+
+function draw() {
+  overlay.replaceChildren();
+  for (const marker of calibration.unknown_markers ?? []) {
+    element("polygon", { class: "unknown", points: pointList(marker.corners), "stroke-width": unit, "stroke-dasharray": `${unit * 4} ${unit * 3}` });
+  }
+  for (const screen of calibration.screens) {
+    for (const marker of screen.markers) {
+      if (marker.corners) element("polygon", { class: marker.state, points: pointList(marker.corners), "stroke-width": unit });
+    }
+  }
+  const outlines = element("g", {});
+  const handles = element("g", {});
+  for (const screen of calibration.screens) if (screen.corners) drawScreen(screen, outlines, handles);
+  summarize();
+}
+
+document.getElementById("download").addEventListener("click", () => {
+  const blob = new Blob([JSON.stringify(calibration, null, 2) + "\n"], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "calibration.json";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 0);
+});
+
+// Embedded in a page from the same server, such as wallplay's control page,
+// the editor hands its result to that page instead.
+const apply = document.getElementById("apply");
+if (window.parent !== window && location.protocol.startsWith("http")) {
+  apply.hidden = false;
+  document.querySelector(".hint").textContent = "Green: markers used. Red: rejected. Dashed orange: tags not in the manifest. Drag handles to adjust a display; the large handle is its top-left. Then press Apply.";
+  apply.addEventListener("click", () => {
+    window.parent.postMessage({ type: "wallcalibrate-calibration", calibration }, location.origin);
+  });
+}
+
+draw();
+</script>
+</body>
+</html>

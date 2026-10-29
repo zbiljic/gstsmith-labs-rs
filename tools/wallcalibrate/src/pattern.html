@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wallcalibrate {{ID}}</title>
+<style>
+html, body { margin: 0; height: 100%; overflow: hidden; background: #fff; cursor: none; }
+svg { display: block; width: 100vw; height: 100vh; }
+#viewport { position: fixed; left: 50%; top: 64%; transform: translateX(-50%); max-width: 36vw; font: 1.8vmin/1.4 system-ui, sans-serif; color: #888; text-align: center; }
+#viewport.warning { color: #c00; }
+</style>
+</head>
+<body>
+{{SVG}}<div id="viewport"></div>
+<script>
+// The pattern must cover the whole display: click or press a key.
+for (const type of ["click", "keydown"]) {
+  addEventListener(type, () => document.documentElement.requestFullscreen?.());
+}
+
+// The manifest's output size should match this viewport's aspect ratio, or
+// the tags are stretched and a planar reference has the wrong shape.
+const output = { width: {{WIDTH}}, height: {{HEIGHT}} };
+const info = document.getElementById("viewport");
+function describe() {
+  const [width, height, scale] = [innerWidth, innerHeight, devicePixelRatio];
+  let text = `viewport ${width}x${height}`;
+  if (scale !== 1) text += ` (${Math.round(width * scale)}x${Math.round(height * scale)} device pixels)`;
+  const mismatch = Math.abs((width * output.height) / (height * output.width) - 1) > 0.01;
+  if (mismatch) text += `: aspect ratio differs from the manifest's ${output.width}x${output.height}; use --screen {{ID}}:${width}x${height}`;
+  info.textContent = text;
+  info.classList.toggle("warning", mismatch);
+}
+addEventListener("resize", describe);
+describe();
+</script>
+</body>
+</html>

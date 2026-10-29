@@ -1,7 +1,7 @@
 monorepo_root = true
 
 [monorepo]
-config_roots = ["analytics/*"]
+config_roots = ["analytics/*", "tools/*"]
 
 [tools]
 "cargo:cargo-c" = "0.10.26"

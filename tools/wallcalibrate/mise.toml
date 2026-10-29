@@ -1,0 +1,5 @@
+# Version pins apply only to the optional OpenCV detector, not the Rust tool.
+[tasks."detector:opencv"]
+description = "Check the OpenCV detector against synthetic calibration photos (needs uv)"
+dir = "{{config_root}}/../.."
+run = "cargo test --locked -p wallcalibrate --test calibrate opencv -- --ignored"
