@@ -9,10 +9,6 @@
   ],
   "enabledManagers": ["cargo", "github-actions", "mise"],
   "minimumReleaseAge": "3 days",
-  "dependencyDashboardApproval": true,
-  "vulnerabilityAlerts": {
-    "dependencyDashboardApproval": true
-  },
   "packageRules": [
     {
       "description": ["Automerge non-major updates"],
