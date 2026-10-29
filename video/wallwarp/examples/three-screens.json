@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "canvas": { "width": 1920, "height": 1080 },
+  "screens": [
+    {
+      "id": "display-c",
+      "output": { "width": 1024, "height": 576 },
+      "corners": [[350, 700], [960, 660], [970, 1000], [360, 1030]]
+    },
+    {
+      "id": "display-a",
+      "output": { "width": 1280, "height": 720 },
+      "corners": [[80, 100], [780, 90], [800, 500], [90, 520]]
+    },
+    {
+      "id": "display-b",
+      "output": { "width": 1920, "height": 1080 },
+      "corners": [[1370, 60], [1330, 920], [1060, 900], [1100, 30]]
+    }
+  ]
+}

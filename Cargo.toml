@@ -6,6 +6,7 @@ members = [
     "generic/ptssampler",
     "utils/segmentation-meta",
     "utils/wall-geometry",
+    "video/wallwarp",
 ]
 resolver = "3"
 

@@ -33,9 +33,11 @@ packages=(
   "gst-plugin-usls|gstusls|usls|uslsobjectdetect uslssegment"
   "gst-plugin-jsontap|gstjsontap|jsontap|jsontap"
   "gst-plugin-ptssampler|gstptssampler|ptssampler|ptssampler"
+  "gst-plugin-wallwarp|gstwallwarp|wallwarp|wallwarp"
 )
 
-# Optional explicit package selection keeps NALSense validation on GStreamer 1.24.
+# Optional explicit package selection keeps NALSense and wallwarp validation on
+# GStreamer 1.24.
 if (( $# > 0 )); then
   selected=()
   for requested in "$@"; do

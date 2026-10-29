@@ -807,6 +807,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gst-plugin-wallwarp"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "gst-plugin-version-helper",
+ "gstreamer",
+ "gstreamer-base",
+ "gstreamer-check",
+ "gstreamer-video",
+ "wall-geometry",
+]
+
+[[package]]
 name = "gstreamer"
 version = "0.25.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

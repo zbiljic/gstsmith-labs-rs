@@ -39,12 +39,21 @@ are being established before promotion to
       segmentation across the usls Image Segmentation families, with native
       mask metadata and same-frame detection prompts.
 
+- [`video`](video/)
+
+  - [`wallwarp`](video/wallwarp/): Irregular video wall distribution.
+    - `wallwarp`: Map a quadrilateral region of the input onto the whole
+      output through a perspective transform, producing the RGBA stream for
+      one display. Layouts are described with
+      [`wall-geometry`](utils/wall-geometry/).
+
 ## Building
 
-The full workspace requires GStreamer 1.28 or newer. NALSense independently
-supports GStreamer 1.24 (`cargo build -p gst-plugin-nalsense`). Development requires
-the GStreamer headers and pkg-config files, the base runtime plugins, H.264 and
-H.265 parsers, and the `gst-inspect-1.0` and `gst-launch-1.0` command-line tools.
+The full workspace requires GStreamer 1.28 or newer. NALSense and wallwarp
+independently support GStreamer 1.24 (`cargo build -p gst-plugin-nalsense`,
+`cargo build -p gst-plugin-wallwarp`). Development requires the GStreamer
+headers and pkg-config files, the base runtime plugins, H.264 and H.265
+parsers, and the `gst-inspect-1.0` and `gst-launch-1.0` command-line tools.
 On Ubuntu, install the corresponding packages:
 
 ```sh
