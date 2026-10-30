@@ -139,7 +139,11 @@ def run(args, directory):
         command += ["--signalling-uri", f"ws://127.0.0.1:{signalling}"]
     else:
         command += ["--signalling-port", str(signalling)]
-    server = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # A file rather than a pipe read at the end: once a pipe fills, wallplay
+    # blocks writing to it, and every thread that logs stops with it.
+    log = directory / "wallplay.log"
+    with log.open("w") as output:
+        server = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, text=True)
     api = Api(f"http://127.0.0.1:{port}")
     try:
         for _ in range(100):
@@ -313,12 +317,12 @@ def run(args, directory):
         return summary
     finally:
         server.terminate()
-        output, _ = server.communicate(timeout=10)
+        server.wait(timeout=10)
         if external:
             external.terminate()
             external.wait(timeout=10)
         if args.verbose:
-            print(output, file=sys.stderr)
+            print(log.read_text(errors="replace"), file=sys.stderr)
 
 
 def main():
