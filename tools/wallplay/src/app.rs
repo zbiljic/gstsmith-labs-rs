@@ -1106,11 +1106,17 @@ impl App {
         }
         let mut state = self.state();
         let restart = state.player.is_some() && state.sound.is_some() != display.is_some();
-        state.sound = display;
+        let previous = std::mem::replace(&mut state.sound, display);
         self.bump(&mut state);
         if restart {
             drop(state);
-            return self.play();
+            // A player that cannot start this way, say without the Opus
+            // encoder, would otherwise fail every later play too.
+            return self.play().inspect_err(|_| {
+                let mut state = self.state();
+                state.sound = previous;
+                self.bump(&mut state);
+            });
         }
         Ok(self.status_locked(&state))
     }

@@ -374,9 +374,11 @@ function applySound() {
 /**
  * Play the stream. Browsers that refuse sound before a user gesture, unless
  * set up to allow it, pause the video instead, so it plays muted until one.
+ * A play interrupted by a new stream is started again with that stream.
  */
 function startPlayback() {
-  video.play().catch(() => {
+  video.play().catch(error => {
+    if (error.name === "AbortError") return;
     if (video.muted) {
       setPlayer("tap to start playback");
       return;

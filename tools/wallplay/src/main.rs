@@ -121,7 +121,8 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
                 sink: Sink::WebRtc(signalling),
                 fill: Fill::default(),
                 resolver,
-                audio: sound.is_some(),
+                // Set from the sound display whenever a player starts.
+                audio: false,
             },
             poll_timeout: Duration::from_secs(25),
             max_output,

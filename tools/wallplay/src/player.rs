@@ -224,6 +224,20 @@ fn check_webrtc_elements(audio: bool) -> Result<()> {
     Ok(())
 }
 
+/// Fail early when an element `options` needs is missing: those WebRTC
+/// playback needs, and with sound the one every source's sound needs, since
+/// otherwise the standby, a pattern, plays and every source fails and
+/// retries for ever.
+fn check_elements(options: &PlayerOptions) -> Result<()> {
+    if matches!(options.sink, Sink::WebRtc(_)) {
+        check_webrtc_elements(options.audio)?;
+    }
+    if options.audio && gst::ElementFactory::find("audiobuffersplit").is_none() {
+        bail!("sound needs audiobuffersplit, from gst-plugins-bad, which is not available");
+    }
+    Ok(())
+}
+
 /// Numbers every pipeline started in this process.
 static GENERATION: AtomicU32 = AtomicU32::new(0);
 
@@ -346,7 +360,7 @@ const AUDIO_PACE: &str = "audio-pace";
 /// The format every sound is converted to, since `webrtcsink` refuses any
 /// change of an audio format while playing, even a field such as the channel
 /// mask that one input's caps leave out and another's carry.
-const AUDIO_CAPS: &str =
+pub const AUDIO_CAPS: &str =
     "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2,channel-mask=(bitmask)0x3";
 
 /// Samples in 20 ms at 48 kHz, one Opus frame.
@@ -1351,10 +1365,11 @@ impl Inputs {
     fn stop_attempt(&self, attempt: Attempt) {
         lock(&self.selection).sound_stops(&attempt.pad);
         attempt.bin.set_locked_state(true);
-        let (pipeline, selector, sound) = (
+        let (pipeline, selector, sound, selection) = (
             self.pipeline.clone(),
             self.selector.clone(),
             self.sound.clone(),
+            Arc::clone(&self.selection),
         );
         let stopping = std::thread::Builder::new()
             .name("wallplay-retire".to_owned())
@@ -1362,6 +1377,10 @@ impl Inputs {
                 if attempt.bin.set_state(gst::State::Null).is_err() {
                     gst::warning!(gst::CAT_DEFAULT, "an input did not stop cleanly");
                 }
+                // The sound's first buffer may have left the bin between
+                // the selection forgetting it and the bin stopping, joining
+                // it again; nothing flows out of a stopped bin.
+                lock(&selection).sound_stops(&attempt.pad);
                 if let Some(ghost) = attempt.bin.static_pad("src")
                     && ghost.unlink(&attempt.pad).is_err()
                 {
@@ -1755,9 +1774,7 @@ impl Player {
     ) -> Result<Self> {
         ensure!(options.fps > 0, "the frame rate must be positive");
         ensure!(!layout.screens.is_empty(), "the layout has no displays");
-        if matches!(options.sink, Sink::WebRtc(_)) {
-            check_webrtc_elements(options.audio)?;
-        }
+        check_elements(options)?;
         let pipeline = gst::Pipeline::with_name("wallplay");
         let measuring = Arc::new(AtomicBool::new(false));
         let drawing = Arc::new(AtomicBool::new(true));
@@ -1896,11 +1913,8 @@ impl Player {
             .link(&pad)?;
         selector.set_property("active-pad", &pad);
         for route in routes {
-            let sink = pipeline
-                .by_name(&format!("sink-{}", route.display))
-                .context("a display without its sink")?;
             let queue = make("queue")?;
-            let input = Self::sound_input(pipeline, &sink, &route.display, kind)?;
+            let input = Self::sound_input(pipeline, &route.display, kind)?;
             pipeline.add(&queue)?;
             tee.link(&queue)?;
             queue
@@ -1911,16 +1925,13 @@ impl Player {
         Ok((selector, pad))
     }
 
-    /// Where display `id`'s sound goes: `sink`'s audio input, or for tests an
-    /// `appsink` named `sound-<id>`.
-    fn sound_input(
-        pipeline: &gst::Pipeline,
-        sink: &gst::Element,
-        id: &str,
-        kind: &Sink,
-    ) -> Result<gst::Pad> {
+    /// Where display `id`'s sound goes: the audio input of its `webrtcsink`,
+    /// named `sink-<id>`, or for tests an `appsink` named `sound-<id>`.
+    fn sound_input(pipeline: &gst::Pipeline, id: &str, kind: &Sink) -> Result<gst::Pad> {
         match kind {
-            Sink::WebRtc(_) => sink
+            Sink::WebRtc(_) => pipeline
+                .by_name(&format!("sink-{id}"))
+                .context("a display without its sink")?
                 .request_pad_simple("audio_%u")
                 .context("webrtcsink has no audio input to give"),
             Sink::AppSink => {

@@ -204,10 +204,7 @@ fn two_displays() -> Layout {
 /// checking that sound comes as 16-bit 48 kHz stereo in 20 ms buffers, in
 /// exactly the same caps whatever plays, since `webrtcsink` refuses a change.
 fn audible(sink: &gst::Element) -> bool {
-    let expected = gst::Caps::from_str(
-        "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2,channel-mask=(bitmask)0x3",
-    )
-    .expect("caps");
+    let expected = gst::Caps::from_str(player::AUDIO_CAPS).expect("caps");
     let mut loud = false;
     let mut whole = 0;
     for _ in 0..10 {
