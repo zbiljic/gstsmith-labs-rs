@@ -177,8 +177,10 @@ that one.
   since servers such as MediaMTX refuse an offer with audio for a stream
   without it. Test patterns, the standby, and sources without sound play
   silence.
-- **In sync**: a source's sound moves to the clock by the same offset as its
-  video, so a clip's sound stays with its picture.
+- **In sync**: a source's sound moves to the clock so that it plays the
+  video's first timestamp when the video does. A clip's sound and picture
+  start together; a live page's video and audio playlists, fetched apart,
+  may start a segment apart, but their timestamps share one timeline.
 - **Browsers** play sound only after a tap, click, or key press on the page,
   unless set up to allow it, such as Chrome with
   `--autoplay-policy=no-user-gesture-required`. Until then the display plays

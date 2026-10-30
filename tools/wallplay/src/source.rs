@@ -206,7 +206,8 @@ impl Resolver {
 fn parse_page_info(json: &[u8]) -> Result<Resolved> {
     let info: PageInfo = serde_json::from_slice(json).context("reading yt-dlp's output")?;
     let has = |codec: &Option<String>| codec.as_deref().is_some_and(|codec| codec != "none");
-    // Formats merged from separate video and audio streams list them apart.
+    // Formats merged from separate video and audio streams list them apart;
+    // a live audio stream may come without its codec named.
     let (format, audio) = if info.format.url.is_some() {
         (info.format, None)
     } else {
@@ -215,7 +216,9 @@ fn parse_page_info(json: &[u8]) -> Result<Resolved> {
         for format in info.requested_formats {
             if video.is_none() && has(&format.vcodec) {
                 video = Some(format);
-            } else if audio.is_none() && has(&format.acodec) {
+            } else if audio.is_none()
+                && (has(&format.acodec) || format.vcodec.as_deref() == Some("none"))
+            {
                 audio = format.url;
             }
         }
@@ -679,6 +682,14 @@ mod tests {
         let merged = parse_page_info(merged).expect("merged formats");
         assert_eq!(merged.uri, "https://cdn/v.mp4");
         assert_eq!(merged.audio.as_deref(), Some("https://cdn/a.webm"));
+        // YouTube's live audio streams come without a codec named.
+        let live = br#"{"is_live": true, "requested_formats": [
+            {"url": "https://cdn/v.m3u8", "vcodec": "avc1", "acodec": "none"},
+            {"url": "https://cdn/a.m3u8", "vcodec": "none", "acodec": null}]}"#;
+        let live = parse_page_info(live).expect("live formats");
+        assert_eq!(live.uri, "https://cdn/v.m3u8");
+        assert_eq!(live.audio.as_deref(), Some("https://cdn/a.m3u8"));
+        assert_eq!(live.live, Some(true));
         parse_page_info(br#"{"title": "Nothing"}"#).expect_err("no stream");
     }
 

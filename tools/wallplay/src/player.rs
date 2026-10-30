@@ -626,12 +626,47 @@ fn start_offset(
     Some((offset.max(0), live))
 }
 
-/// An input's start offset, which its first video buffer decides and its
-/// sound takes too.
+/// The running time, in nanoseconds, that the segment `pad` carries gives
+/// timestamp `pts`, which may lie before the segment.
+fn running_nanos(pad: &gst::Pad, pts: gst::ClockTime) -> Option<i64> {
+    let segment = pad.sticky_event::<gst::event::Segment>(0)?;
+    let running = segment
+        .segment()
+        .downcast_ref::<gst::format::Time>()?
+        .to_running_time_full(pts)?;
+    let nanos = i64::try_from(running.abs().nseconds()).ok()?;
+    Some(if running.is_positive() { nanos } else { -nanos })
+}
+
+/// Where an input's video starts, which its first buffer decides and its
+/// sound follows.
+#[derive(Clone, Copy)]
+struct Anchor {
+    /// How far the video moved.
+    offset: i64,
+    /// The video's first timestamp and the running time it plays at.
+    first: Option<(gst::ClockTime, i64)>,
+}
+
+impl Anchor {
+    /// How far to move the sound leaving `pad` so that it plays the video's
+    /// first timestamp when the video does: streams fetched apart, such as a
+    /// live page's video and audio playlists, start at different positions
+    /// but keep one timeline in their timestamps. Without timestamps to go
+    /// by, the sound moves as far as the video.
+    fn sound_offset(self, pad: &gst::Pad) -> i64 {
+        self.first
+            .and_then(|(pts, plays_at)| Some(plays_at - running_nanos(pad, pts)?))
+            .unwrap_or(self.offset)
+    }
+}
+
+/// An input's start, which its first video buffer decides and its sound
+/// waits for.
 #[derive(Default)]
 struct Start {
-    offset: Option<i64>,
-    /// Sound waiting for the offset: its pad and the probe blocking it.
+    anchor: Option<Anchor>,
+    /// Sound waiting for the anchor: its pad and the probe blocking it.
     waiting: Option<(gst::Pad, gst::PadProbeId)>,
 }
 
@@ -640,7 +675,8 @@ struct Start {
 /// its `paces` would let it race to catch up. A live stream comes in real
 /// time already, and waiting for its latency on top would only delay it, so
 /// it passes its `paces` without waiting. The sound leaving `audio`, if the
-/// input has some, waits for the same offset, so it stays with the picture.
+/// input has some, waits for the video's start and moves to stay with the
+/// picture; see [`Anchor::sound_offset`].
 fn align_start(
     entry: &gst::Element,
     audio: Option<&gst::Element>,
@@ -660,11 +696,11 @@ fn align_start(
                 gst::PadProbeType::BUFFER | gst::PadProbeType::BLOCK,
                 move |pad, info| {
                     let mut start = lock(&start);
-                    if let Some(offset) = start.offset {
-                        pad.set_offset(offset);
+                    if let Some(anchor) = start.anchor {
+                        pad.set_offset(anchor.sound_offset(pad));
                         return gst::PadProbeReturn::Remove;
                     }
-                    // Blocked until the video's probe sets the offset and
+                    // Blocked until the video's probe sets the anchor and
                     // removes this one.
                     start.waiting = info.id.take().map(|id| (pad.clone(), id));
                     gst::PadProbeReturn::Ok
@@ -684,6 +720,12 @@ fn align_start(
         move |pad, info| {
             if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
                 let (offset, live) = start_offset(pad, &sink, buffer, period).unwrap_or((0, false));
+                let anchor = Anchor {
+                    offset,
+                    first: buffer
+                        .pts()
+                        .and_then(|pts| Some((pts, running_nanos(pad, pts)? + offset))),
+                };
                 pad.set_offset(offset);
                 if live {
                     for pace in &paces {
@@ -692,11 +734,11 @@ fn align_start(
                 }
                 let waiting = {
                     let mut start = lock(&start);
-                    start.offset = Some(offset);
+                    start.anchor = Some(anchor);
                     start.waiting.take()
                 };
                 if let Some((sound, probe)) = waiting {
-                    sound.set_offset(offset);
+                    sound.set_offset(anchor.sound_offset(&sound));
                     sound.remove_probe(probe);
                 }
             }
