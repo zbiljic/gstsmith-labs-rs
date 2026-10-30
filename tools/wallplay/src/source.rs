@@ -1,11 +1,12 @@
-//! What feeds the canvas, and how each source opens.
+//! What feeds the canvas and the sound, and how each source opens.
 //!
 //! A URL opens by what it looks like, unless the control page says how:
 //!
 //! - media that `GStreamer` opens itself with `uridecodebin`: files, HTTP(S)
 //!   videos, HLS and DASH streams, RTSP, SRT and RTMP;
 //! - web pages such as `YouTube` and others, whose stream `yt-dlp` finds;
-//! - WHEP endpoints (WebRTC-HTTP egress), which `whepclientsrc` plays.
+//! - WHEP endpoints (WebRTC-HTTP egress), which `whepclientsrc` plays,
+//!   video only.
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -30,7 +31,8 @@ pub enum Source {
     Page(String),
     /// A WHEP endpoint.
     Whep(String),
-    /// A `gst-launch-1.0` description with one unlinked video source pad.
+    /// A `gst-launch-1.0` description with one unlinked video source pad,
+    /// and at most one unlinked audio source pad.
     Launch(String),
 }
 
@@ -129,15 +131,20 @@ impl Default for Resolver {
 }
 
 /// Formats `yt-dlp` picks, best first: video up to 1080 lines, H.264 if it
-/// can, since it decodes in hardware on most machines, and not split into
-/// DASH fragments, which `GStreamer` cannot fetch from a single URL.
-const PAGE_FORMATS: &str = "bv*[height<=?1080][vcodec^=avc1][protocol!*=dash]\
+/// can, since it decodes in hardware on most machines, with the best audio
+/// where a page has it apart, and not split into DASH fragments, which
+/// `GStreamer` cannot fetch from a single URL.
+const PAGE_FORMATS: &str = "bv*[height<=?1080][vcodec^=avc1][protocol!*=dash]+ba[protocol!*=dash]\
+                            /bv*[height<=?1080][vcodec^=avc1][protocol!*=dash]\
+                            /bv*[height<=?1080][protocol!*=dash]+ba[protocol!*=dash]\
                             /bv*[height<=?1080][protocol!*=dash]/b[protocol!*=dash]/b";
 
 /// A page's stream as `yt-dlp` found it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolved {
     pub uri: String,
+    /// The audio, where the page has it apart from the video.
+    pub audio: Option<String>,
     /// HTTP headers the stream's server expects; `YouTube` refuses requests
     /// without its User-Agent.
     pub headers: Vec<(String, String)>,
@@ -151,6 +158,7 @@ struct PageFormat {
     #[serde(default)]
     http_headers: BTreeMap<String, String>,
     vcodec: Option<String>,
+    acodec: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -197,22 +205,25 @@ impl Resolver {
 /// The stream in `yt-dlp -J` output.
 fn parse_page_info(json: &[u8]) -> Result<Resolved> {
     let info: PageInfo = serde_json::from_slice(json).context("reading yt-dlp's output")?;
+    let has = |codec: &Option<String>| codec.as_deref().is_some_and(|codec| codec != "none");
     // Formats merged from separate video and audio streams list them apart.
-    let format = if info.format.url.is_some() {
-        info.format
+    let (format, audio) = if info.format.url.is_some() {
+        (info.format, None)
     } else {
-        info.requested_formats
-            .into_iter()
-            .find(|format| {
-                format
-                    .vcodec
-                    .as_deref()
-                    .is_some_and(|codec| codec != "none")
-            })
-            .context("yt-dlp found no video stream")?
+        let mut video = None;
+        let mut audio = None;
+        for format in info.requested_formats {
+            if video.is_none() && has(&format.vcodec) {
+                video = Some(format);
+            } else if audio.is_none() && has(&format.acodec) {
+                audio = format.url;
+            }
+        }
+        (video.context("yt-dlp found no video stream")?, audio)
     };
     Ok(Resolved {
         uri: format.url.context("yt-dlp found no stream URL")?,
+        audio,
         headers: format.http_headers.into_iter().collect(),
         title: info.title,
         live: info.is_live,
@@ -236,6 +247,8 @@ pub enum Input {
     Pattern(String),
     Uri {
         uri: String,
+        /// The audio, where it comes apart from the video.
+        audio: Option<String>,
         headers: Vec<(String, String)>,
     },
     Whep(String),
@@ -245,25 +258,53 @@ pub enum Input {
 /// RTSP's jitter buffer, down from `rtspsrc`'s two seconds.
 const RTSP_LATENCY_MS: u32 = 200;
 
+/// Whether `pad` carries audio, by its caps or, while they are unknown, its
+/// name, as in `whepclientsrc`'s `audio_0`.
+#[must_use]
+pub fn is_audio(pad: &gst::Pad) -> bool {
+    let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
+    if caps.is_any() || caps.is_empty() {
+        return pad.name().starts_with("audio");
+    }
+    caps.iter()
+        .all(|structure| structure.name().starts_with("audio/"))
+}
+
+/// A `uridecodebin` exposing the streams `caps` allows, in any memory, so a
+/// hardware decoder can negotiate system memory with what follows rather
+/// than end decoding early.
+fn decoder(uri: &str, caps: &str) -> Result<gst::Element> {
+    gst::ElementFactory::make("uridecodebin")
+        .property("uri", uri)
+        .property("caps", gst::Caps::from_str(caps)?)
+        .property("expose-all-streams", false)
+        .build()
+        .context("creating uridecodebin")
+}
+
 impl Input {
     #[must_use]
     pub fn is_pattern(&self) -> bool {
         matches!(self, Self::Pattern(_))
     }
 
-    /// A new element producing this input's video, for a canvas of `canvas`.
-    /// Patterns and pipelines have a `src` pad; other elements add theirs.
-    pub fn element(&self, canvas: Size) -> Result<gst::Element> {
+    /// New elements producing this input's video for a canvas of `canvas`,
+    /// and its audio if `audio` is set. Patterns and pipelines have a `src`
+    /// pad, and pipelines with sound an `audio` pad; other elements add
+    /// their pads as streams appear.
+    pub fn elements(&self, canvas: Size, audio: bool) -> Result<Vec<gst::Element>> {
         let description = match self {
-            Self::Uri { uri, .. } => {
-                return gst::ElementFactory::make("uridecodebin")
-                    .property("uri", uri)
-                    // Any memory, so a hardware decoder can negotiate system memory
-                    // with what follows rather than end decoding early.
-                    .property("caps", gst::Caps::from_str("video/x-raw(ANY)")?)
-                    .property("expose-all-streams", false)
-                    .build()
-                    .context("creating uridecodebin");
+            Self::Uri {
+                uri, audio: apart, ..
+            } => {
+                return match (audio, apart) {
+                    (true, Some(apart)) => Ok(vec![
+                        decoder(uri, "video/x-raw(ANY)")?,
+                        decoder(apart, "audio/x-raw(ANY)")?,
+                    ]),
+                    (true, None) => Ok(vec![decoder(uri, "video/x-raw(ANY); audio/x-raw(ANY)")?]),
+                    (false, _) => Ok(vec![decoder(uri, "video/x-raw(ANY)")?]),
+                };
             }
             Self::Whep(endpoint) => {
                 let source = gst::ElementFactory::make("whepclientsrc").build().context(
@@ -275,24 +316,50 @@ impl Input {
                 // Only video is used, and servers such as MediaMTX refuse an
                 // offer with audio for a stream without it.
                 source.set_property("audio-codecs", gst::Array::new(Vec::<String>::new()));
-                return Ok(source);
+                return Ok(vec![source]);
             }
             Self::Pattern(id) => pattern_launch(id, canvas)?,
             Self::Launch(description) => description.clone(),
         };
-        // Only the video output gets a ghost pad: an unlinked sink, such as
+        // Only the outputs get ghost pads: an unlinked sink, such as
         // textoverlay's text input, would be waited on for ever.
         let bin = gst::parse::bin_from_description(&description, false)
             .with_context(|| format!("invalid source pipeline {description:?}"))?;
-        let output = bin
-            .find_unlinked_pad(gst::PadDirection::Src)
+        let outputs: Vec<gst::Pad> = bin
+            .iterate_elements()
+            .into_iter()
+            .flatten()
+            .flat_map(|element| element.src_pads())
+            .filter(|pad| !pad.is_linked())
+            .collect();
+        let video = outputs
+            .iter()
+            .find(|pad| !is_audio(pad))
             .context("the source pipeline has no video output")?;
         bin.add_pad(
-            &gst::GhostPad::builder_with_target(&output)?
+            &gst::GhostPad::builder_with_target(video)?
                 .name("src")
                 .build(),
         )?;
-        Ok(bin.upcast())
+        if let Some(sound) = outputs.iter().find(|pad| is_audio(pad)) {
+            if audio {
+                bin.add_pad(
+                    &gst::GhostPad::builder_with_target(sound)?
+                        .name("audio")
+                        .build(),
+                )?;
+            } else {
+                // An unlinked output would stop the pipeline; in real time,
+                // so a clip's sound does not race ahead.
+                let discard = gst::ElementFactory::make("fakesink")
+                    .property("sync", true)
+                    .property("async", false)
+                    .build()?;
+                bin.add(&discard)?;
+                sound.link(&discard.static_pad("sink").context("fakesink has no pad")?)?;
+            }
+        }
+        Ok(vec![bin.upcast()])
     }
 
     /// Set up `element`, just added somewhere inside this input's element:
@@ -372,6 +439,7 @@ impl Prepared {
         };
         let media = || Input::Uri {
             uri: url.clone(),
+            audio: None,
             headers: Vec::new(),
         };
         match opened {
@@ -383,6 +451,7 @@ impl Prepared {
                         Via::YtDlp,
                         Input::Uri {
                             uri: found.uri,
+                            audio: found.audio,
                             headers: found.headers,
                         },
                     )
@@ -603,14 +672,49 @@ mod tests {
                 .headers
                 .contains(&("User-Agent".to_owned(), "Mozilla/5.0".to_owned()))
         );
-        let merged = br#"{"title": "Live", "is_live": true, "requested_formats": [
-            {"url": "https://cdn/a.m4a", "vcodec": "none"},
-            {"url": "https://cdn/v.m3u8", "vcodec": "avc1"}]}"#;
-        assert_eq!(
-            parse_page_info(merged).expect("merged formats").uri,
-            "https://cdn/v.m3u8"
-        );
+        assert_eq!(resolved.audio, None);
+        let merged = br#"{"title": "Clip", "is_live": false, "requested_formats": [
+            {"url": "https://cdn/v.mp4", "vcodec": "avc1", "acodec": "none"},
+            {"url": "https://cdn/a.webm", "vcodec": "none", "acodec": "opus"}]}"#;
+        let merged = parse_page_info(merged).expect("merged formats");
+        assert_eq!(merged.uri, "https://cdn/v.mp4");
+        assert_eq!(merged.audio.as_deref(), Some("https://cdn/a.webm"));
         parse_page_info(br#"{"title": "Nothing"}"#).expect_err("no stream");
+    }
+
+    #[test]
+    fn pipelines_give_their_video_and_sound_outputs() {
+        gst::init().expect("GStreamer");
+        let size = Size {
+            width: 320,
+            height: 180,
+        };
+        let launch = Input::Launch("audiotestsrc ! audioconvert videotestsrc".to_owned());
+        let pads = |audio| {
+            let elements = launch.elements(size, audio).expect("elements");
+            let [element] = elements.as_slice() else {
+                panic!("one element");
+            };
+            let mut pads: Vec<String> = element
+                .src_pads()
+                .iter()
+                .map(|pad| pad.name().to_string())
+                .collect();
+            pads.sort();
+            pads
+        };
+        assert_eq!(pads(true), ["audio", "src"]);
+        assert_eq!(pads(false), ["src"]);
+        Input::Launch("audiotestsrc".to_owned())
+            .elements(size, true)
+            .expect_err("no video output");
+        let separate = Input::Uri {
+            uri: "https://cdn/v.mp4".to_owned(),
+            audio: Some("https://cdn/a.webm".to_owned()),
+            headers: Vec::new(),
+        };
+        assert_eq!(separate.elements(size, true).expect("decoders").len(), 2);
+        assert_eq!(separate.elements(size, false).expect("decoder").len(), 1);
     }
 
     #[test]

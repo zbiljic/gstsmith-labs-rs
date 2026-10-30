@@ -55,6 +55,9 @@ pub struct Config {
     pub poll_timeout: Duration,
     /// Longest side of a display's stream; larger viewports are scaled down.
     pub max_output: u32,
+    /// The display that plays the sound at first; without one, the streams
+    /// carry none.
+    pub sound: Option<String>,
 }
 
 /// A display's browser viewport, in CSS pixels.
@@ -168,6 +171,10 @@ struct State {
     restart: bool,
     /// The browsers' jitter buffer target; `None` leaves their default.
     buffer_ms: Option<u32>,
+    /// The display that plays the sound. Every stream carries it, the other
+    /// displays muted, so lip sync holds every display's video back alike;
+    /// without one, the streams carry none.
+    sound: Option<String>,
     /// How the source fills the canvas, chosen with the layout.
     fill: Fill,
     measuring: bool,
@@ -249,6 +256,7 @@ impl State {
                     code: route.code,
                     measuring: self.recording(),
                     buffer_ms: self.buffer_ms(id),
+                    sound: self.sound.as_deref() == Some(id),
                 },
                 None => idle("Not part of the layout."),
             },
@@ -284,6 +292,8 @@ enum Command {
         code: Option<CodeGeometry>,
         measuring: bool,
         buffer_ms: Option<u32>,
+        /// Whether this display plays the stream's sound.
+        sound: bool,
     },
 }
 
@@ -371,6 +381,13 @@ struct BufferRequest {
     ms: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoundRequest {
+    /// The display that plays the sound, or `null` for none.
+    display: Option<String>,
+}
+
 /// Largest jitter buffer target browsers accept.
 const MAX_BUFFER_MS: u32 = 4000;
 
@@ -454,10 +471,11 @@ impl App {
                 serial: 1,
                 request: None,
             });
-        let (source, standby, restart) = (
+        let (source, standby, restart, sound) = (
             config.player.source.clone(),
             config.player.standby.clone(),
             config.player.restart,
+            config.sound.clone(),
         );
         let app = Arc::new(Self {
             config,
@@ -477,6 +495,7 @@ impl App {
                 standby,
                 restart,
                 buffer_ms: None,
+                sound,
                 fill: Fill::default(),
                 measuring: false,
                 aligner: None,
@@ -590,6 +609,10 @@ impl App {
                 .json()
                 .map_err(|error| Failure::new(400, format!("{error:#}")))
                 .and_then(|buffer: BufferRequest| self.set_buffer(buffer.ms)),
+            ("POST", ["api", "sound"]) => request
+                .json()
+                .map_err(|error| Failure::new(400, format!("{error:#}")))
+                .and_then(|sound: SoundRequest| self.set_sound(sound.display)),
             ("POST", ["api", "idle"]) => Ok(self.idle()),
             ("POST", ["api", "measure"]) => request
                 .json()
@@ -958,6 +981,7 @@ impl App {
             standby: state.standby.clone(),
             restart: state.restart,
             fill: state.fill,
+            audio: state.sound.is_some(),
             ..self.config.player.clone()
         };
         let player = Player::start(
@@ -1070,6 +1094,24 @@ impl App {
         let mut state = self.state();
         state.buffer_ms = ms;
         self.bump(&mut state);
+        Ok(self.status_locked(&state))
+    }
+
+    /// Play the sound on `display`, or on none. Turning the sound on or off
+    /// restarts playback, since every stream gains or loses it; moving it to
+    /// another display only unmutes that one.
+    fn set_sound(self: &Arc<Self>, display: Option<String>) -> Reply {
+        if let Some(id) = &display {
+            valid_id(id)?;
+        }
+        let mut state = self.state();
+        let restart = state.player.is_some() && state.sound.is_some() != display.is_some();
+        state.sound = display;
+        self.bump(&mut state);
+        if restart {
+            drop(state);
+            return self.play();
+        }
         Ok(self.status_locked(&state))
     }
 
@@ -1279,6 +1321,7 @@ impl App {
             "restart": state.restart,
             "patterns": source::PATTERNS,
             "buffer_ms": state.buffer_ms,
+            "sound": state.sound,
         }))
     }
 }

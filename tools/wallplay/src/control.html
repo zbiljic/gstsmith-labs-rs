@@ -134,7 +134,7 @@
     </select></label>
     <button id="use-url">Play this</button>
   </div>
-  <p class="muted" id="url-help" hidden>Files on this server (file:///…), HTTP(S) videos, HLS and DASH playlists, RTSP, SRT and RTMP cameras and encoders, WHEP endpoints (URLs ending in /whep), and YouTube and other pages yt-dlp knows, which take a few seconds to look up. Only the video plays.</p>
+  <p class="muted" id="url-help" hidden>Files on this server (file:///…), HTTP(S) videos, HLS and DASH playlists, RTSP, SRT and RTMP cameras and encoders, WHEP endpoints (URLs ending in /whep), and YouTube and other pages yt-dlp knows, which take a few seconds to look up. WHEP endpoints play without sound.</p>
   <div class="row">
     <label><input id="restart" type="checkbox"> Restart when it ends or fails: clips loop, streams reconnect</label>
     <label>Standby <select id="standby"></select></label>
@@ -150,9 +150,13 @@
     </select></label>
     <span class="muted">Applies while playing, without reconnecting; Safari ignores it.</span>
   </div>
+  <div class="row">
+    <label>Sound <select id="sound"><option value="">off</option></select></label>
+    <span class="muted">Plays on one display; the others get it muted, so lip sync holds every display's video back alike. Turning it on or off restarts playback.</span>
+  </div>
   <div class="row"><button id="play">Play</button><button id="idle">Stop</button><span id="player"></span></div>
   <div class="row"><span id="source-status" class="muted"></span></div>
-  <p class="muted">Changing the source, the standby or the restart setting applies at once while playing; the displays keep their streams.</p>
+  <p class="muted">Changing the source, the standby or the restart setting, or moving the sound to another display, applies at once while playing; the displays keep their streams.</p>
 </section>
 
 <section>
@@ -331,6 +335,17 @@ function renderSource() {
   if (document.activeElement !== $("#restart")) $("#restart").checked = state.restart;
   if (document.activeElement !== $("#standby")) $("#standby").value = state.standby;
   if (document.activeElement !== $("#buffer")) $("#buffer").value = state.buffer_ms ?? "";
+  renderSound();
+}
+
+/** The layout's displays, and the one playing the sound if it is not among them. */
+function renderSound() {
+  const select = $("#sound");
+  const ids = [...new Set([...(state.layout?.screens.map(screen => screen.id) ?? []), state.sound].filter(Boolean))];
+  if ([...select.options].slice(1).map(option => option.value).join() !== ids.join()) {
+    select.replaceChildren(new Option("off", ""), ...ids.map(id => new Option(id, id)));
+  }
+  if (document.activeElement !== select) select.value = state.sound ?? "";
 }
 
 const VIA = { pattern: "test pattern", gstreamer: "GStreamer", "yt-dlp": "found by yt-dlp", whep: "WHEP", pipeline: "pipeline" };
@@ -652,6 +667,10 @@ $("#standby").addEventListener("change", event => act(event.target, () => api("P
 $("#buffer").addEventListener("change", event => {
   const value = event.target.value;
   act(event.target, () => api("POST", "/api/buffer", { ms: value === "" ? null : Number(value) }));
+});
+$("#sound").addEventListener("change", event => {
+  const display = event.target.value || null;
+  act(event.target, () => api("POST", "/api/sound", { display }));
 });
 
 $("#play").addEventListener("click", event => act(event.target, () => api("POST", "/api/play"),

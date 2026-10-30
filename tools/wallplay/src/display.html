@@ -55,11 +55,16 @@ $("#name").textContent = id;
 
 const isFullscreen = () => Boolean(document.fullscreenElement || document.webkitFullscreenElement);
 
-// Fullscreen and playback need a user gesture: tap, click, or press a key.
+// Fullscreen, playback and sound need a user gesture: tap, click, or press a
+// key.
 function engage() {
   const root = document.documentElement;
   const request = root.requestFullscreen || root.webkitRequestFullscreen;
   if (request && !isFullscreen()) request.call(root)?.catch?.(() => {});
+  if (soundRefused) {
+    soundRefused = false;
+    applySound();
+  }
   if (!video.hidden && video.paused) video.play().catch(() => {});
   navigator.wakeLock?.request("screen").catch(() => {});
 }
@@ -91,6 +96,7 @@ function render() {
     }
   }
   if (command?.mode === "play" && !playerState.startsWith("playing")) parts.push(playerState);
+  if (command?.mode === "play" && soundRefused) parts.push("tap or click for sound");
   if (!isFullscreen()) parts.push("not fullscreen: tap or click the page");
   const status = $("#status");
   status.textContent = `${id}: ${parts.join(" · ")}`;
@@ -176,6 +182,7 @@ function apply(next) {
     setPlayer("");
   }
   setMeasuring(next.mode === "play" && next.measuring);
+  applySound();
   applyBuffer();
   render();
 }
@@ -291,9 +298,13 @@ class Stream {
   async answer(sdp) {
     if (sdp.type !== "offer") return;
     const pc = this.pc = new RTCPeerConnection();
+    // The video and its sound arrive as two tracks of one stream; setting
+    // the same stream again would restart the element.
     pc.ontrack = event => {
-      video.srcObject = event.streams[0] ?? new MediaStream([event.track]);
-      video.play().catch(() => setPlayer("tap to start playback"));
+      const media = event.streams[0] ?? new MediaStream([event.track]);
+      if (video.srcObject !== media) video.srcObject = media;
+      applySound();
+      startPlayback();
       applyBuffer();
     };
     pc.onicecandidate = event => {
@@ -339,10 +350,49 @@ function applyBuffer() {
   if (!video.paused) describePlayback();
 }
 
+/**
+ * Set when the browser refused to play sound before a user gesture; the
+ * video then plays muted until a tap, click or key press.
+ */
+let soundRefused = false;
+
+/**
+ * Play the stream's sound if this display is the one that should, and keep
+ * it muted otherwise. Every display receives the sound, so the browsers'
+ * lip sync holds their video back alike.
+ */
+function applySound() {
+  const wanted = command?.mode === "play" && Boolean(command.sound);
+  if (!wanted) soundRefused = false;
+  const muted = !wanted || soundRefused;
+  if (video.muted === muted) return;
+  video.muted = muted;
+  if (!muted && video.srcObject) startPlayback();
+  if (!video.paused) describePlayback();
+}
+
+/**
+ * Play the stream. Browsers that refuse sound before a user gesture, unless
+ * set up to allow it, pause the video instead, so it plays muted until one.
+ */
+function startPlayback() {
+  video.play().catch(() => {
+    if (video.muted) {
+      setPlayer("tap to start playback");
+      return;
+    }
+    soundRefused = true;
+    video.muted = true;
+    render();
+    startPlayback();
+  });
+}
+
 function describePlayback() {
   let text = `playing ${video.videoWidth}x${video.videoHeight}`;
   const buffer = command?.buffer_ms;
   if (buffer != null) text += bufferSupported === false ? ", buffer setting unsupported" : `, buffer ${buffer} ms`;
+  if (command?.sound) text += soundRefused ? ", sound waits for a tap" : ", with sound";
   setPlayer(text);
 }
 video.addEventListener("playing", describePlayback);

@@ -119,6 +119,87 @@ def synthetic_photo(api, wallcalibrate, directory):
     return photo.read_bytes()
 
 
+SOUND_JS = """async () => {
+    const reports = [...(await stream?.pc?.getStats() ?? new Map()).values()];
+    const audio = reports.find(report => report.type === "inbound-rtp" && report.kind === "audio");
+    return {
+        muted: video.muted,
+        tracks: (video.srcObject?.getTracks() ?? []).map(track => track.kind).sort(),
+        packets: audio?.packetsReceived ?? 0,
+        energy: audio?.totalAudioEnergy ?? 0,
+    };
+}"""
+
+
+def wait_pages(what, pages, check, timeout=30):
+    """Wait until `check` holds for every page's sound report."""
+    deadline = time.monotonic() + timeout
+    while True:
+        reports = {display: page.evaluate(SOUND_JS) for display, page in pages.items()}
+        if all(check(display, report) for display, report in reports.items()):
+            return reports
+        if time.monotonic() > deadline:
+            details = {display: page.evaluate("""async () => ({
+                transceivers: stream?.pc?.getTransceivers().map(t => [t.mid, t.receiver.track.kind, t.direction, t.currentDirection]),
+                inbound: [...(await stream?.pc?.getStats() ?? new Map()).values()].filter(r => r.type === "inbound-rtp")
+                    .map(r => [r.kind, r.packetsReceived, r.mid]),
+                state: stream?.pc?.connectionState,
+            })""") for display, page in pages.items()}
+            raise RuntimeError(f"timed out waiting for {what}: {reports} {details}")
+        time.sleep(0.5)
+
+
+def generations_of(state):
+    """Every display's pipeline generation; empty while playback restarts."""
+    return {route["display"]: route["generation"] for route in state["player"]["routes"] or []}
+
+
+def sound(api, control, pages, directory):
+    """Play a clip with a tone on one display, the other receiving it muted;
+    turning sound on or off restarts playback, moving it does not."""
+    clip = directory / "sound.webm"
+    subprocess.run(["gst-launch-1.0", "-q", "webmmux", "name=mux", "!", "filesink", f"location={clip}",
+                    "videotestsrc", "num-buffers=300", "pattern=ball", "!",
+                    "video/x-raw,width=320,height=180,framerate=30/1", "!", "vp8enc", "!", "mux.",
+                    "audiotestsrc", "num-buffers=500", "freq=440", "!", "audioconvert", "!", "opusenc", "!", "mux."],
+                   check=True)
+    control.check("#restart")
+    api.wait("restarting", lambda state: state["restart"] is True)
+    api.call("POST", "/api/source", {"media": clip.as_uri()})
+    before = generations_of(api.call("GET", "/api/state"))
+    control.select_option("#sound", "left")
+    api.wait("playback with sound", lambda state: state["sound"] == "left"
+             and generations_of(state) not in ({}, before)
+             and all(d["player"].startswith("playing") for d in state["displays"]), timeout=60)
+    # Browsers measure the energy they play, which is none where muted.
+    played = wait_pages("the tone on the left", pages, lambda display, report:
+                        report["tracks"] == ["audio", "video"] and report["packets"] > 100
+                        and report["muted"] == (display != "left") and (report["energy"] > 0) == (display == "left"))
+    api.call("POST", "/api/measure", {"on": True})
+    time.sleep(6)
+    measured = api.call("GET", "/api/measure")["summary"]
+    for display in measured["displays"]:
+        if display["frames"] < 30:
+            raise RuntimeError(f"{display['id']} stopped presenting with sound: {display}")
+    print("sound on the left display:", ", ".join(f"{d}: {r['packets']} audio packets" for d, r in played.items()),
+          "; latency", ", ".join(f"{d['id']} {d['latency_ms']['median']:.0f} ms" for d in measured["displays"]),
+          f"; spread {measured['spread_ms']['median']:.1f} ms", file=sys.stderr)
+    # Moving the sound only unmutes the other display.
+    playing = generations_of(api.call("GET", "/api/state"))
+    control.select_option("#sound", "right")
+    wait_pages("the sound on the right", pages, lambda display, report: report["muted"] == (display != "right"))
+    if generations_of(api.call("GET", "/api/state")) != playing:
+        raise RuntimeError("moving the sound restarted the pipeline")
+    # Turning it off restarts playback without sound.
+    control.select_option("#sound", "")
+    api.wait("playback without sound", lambda state: state["sound"] is None
+             and generations_of(state) not in ({}, playing)
+             and all(d["player"].startswith("playing") for d in state["displays"]), timeout=60)
+    wait_pages("streams without sound", pages, lambda display, report: report["tracks"] == ["video"])
+    api.call("POST", "/api/source", {"pattern": "sweep"})
+    print("moved the sound without reconnecting, and turned it off", file=sys.stderr)
+
+
 def run(args, directory):
     port = free_port()
     signalling = free_port(len(DISPLAYS))
@@ -278,6 +359,8 @@ def run(args, directory):
                 page.screenshot(path=directory / f"standby-{display}.png")
             print("switched sources without reconnecting:",
                   ", ".join(f"{d['id']} {d['frames']} frames on standby" for d in switched), file=sys.stderr)
+
+            sound(api, control, pages, directory)
 
             # Aligning: the right display is made late on purpose, by raising
             # its own jitter buffer target, and aligning delays the left one

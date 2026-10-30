@@ -3,9 +3,13 @@
 //!
 //! ```text
 //! source  ! identity ! videoconvert [! videocrop] ! videoscale [! videorate] ! RGBA canvas [! clocksync] ! selector.
+//! source  ! identity ! audioconvert ! audioresample ! S16 48 kHz stereo ! audiobuffersplit ! clocksync ! sound.   (with audio)
 //! standby ! identity ! videoconvert ! videoscale ! RGBA canvas ! selector.
+//! audiotestsrc wave=silence ! clocksync ! sound.   (with audio)
 //! input-selector name=selector ! tee
 //!   tee. ! queue ! wallwarp ! webrtcsink meta="meta,display=<id>"   (per display)
+//! input-selector name=sound ! tee
+//!   tee. ! queue ! webrtcsink's audio input   (per display, with audio)
 //! ```
 //!
 //! The source and the standby are each a bin that is swapped while playing,
@@ -15,6 +19,14 @@
 //! growing delay, and one that ends restarts if asked to, so clips loop and
 //! streams reconnect. Built-in patterns skip `videorate` and `clocksync`,
 //! which only files and other sources need, and which add latency.
+//!
+//! With audio, every display's stream carries the sound of what shows, or
+//! silence for the standby and for sources without sound: `webrtcsink`
+//! announces a display only once each of its inputs has had data. The
+//! silence is paced like a clip rather than live, since a live source would
+//! raise the latency every sink waits for, the video's too. Sound comes in
+//! 20 ms buffers, one Opus frame each, so browsers receive it evenly and
+//! buffer less of it, which their lip sync makes the video wait for.
 //!
 //! Every `webrtcsink` is its own producer, announced to the signalling server
 //! with the display's ID in its metadata, and encodes separately for every
@@ -39,7 +51,7 @@ use wall_geometry::{Layout, Screen, Size};
 
 use crate::drift::Measurement;
 use crate::framecode::{self, CodeGeometry};
-use crate::source::{Input, Prepared, Resolver, SLATE_TEXT, Source, Via};
+use crate::source::{self, Input, Prepared, Resolver, SLATE_TEXT, Source, Via};
 
 /// Where browsers find the signalling server.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +68,8 @@ pub enum Signalling {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Sink {
     WebRtc(Signalling),
-    /// An `appsink` named `sink-<id>`, for tests.
+    /// An `appsink` named `sink-<id>`, and with sound one named `sound-<id>`,
+    /// for tests.
     AppSink,
 }
 
@@ -72,6 +85,9 @@ pub struct PlayerOptions {
     pub fill: Fill,
     /// Finds web pages' streams again when they fail, since their URLs expire.
     pub resolver: Resolver,
+    /// Send the sound to every display. Browsers then hold each display's
+    /// video back to keep it in sync with the sound, muted or not.
+    pub audio: bool,
 }
 
 /// How a source whose aspect ratio differs from the canvas fills it.
@@ -189,7 +205,7 @@ const STOP_MESSAGE: &str = "wallplay-stop";
 
 /// Fail early, with what to install, when an element WebRTC playback needs
 /// is missing; otherwise every browser session fails on its own.
-fn check_webrtc_elements() -> Result<()> {
+fn check_webrtc_elements(audio: bool) -> Result<()> {
     if gst::ElementFactory::find("webrtcsink").is_none() {
         bail!("webrtcsink is not available; install the rswebrtc plugin from gst-plugins-rs");
     }
@@ -201,6 +217,9 @@ fn check_webrtc_elements() -> Result<()> {
             "webrtcbin needs libnice's GStreamer elements, which are not available; install \
              libnice's GStreamer plugin, often packaged apart from GStreamer itself"
         );
+    }
+    if audio && gst::ElementFactory::find("opusenc").is_none() {
+        bail!("sound needs opusenc, from GStreamer's opus plugin, which is not available");
     }
     Ok(())
 }
@@ -320,6 +339,18 @@ const ENDED_MESSAGE: &str = "wallplay-input-ended";
 
 /// Name of the `clocksync` that plays sources in real time.
 const PACE: &str = "pace";
+
+/// Name of the `clocksync` that plays sources' sound in real time.
+const AUDIO_PACE: &str = "audio-pace";
+
+/// The format every sound is converted to, since `webrtcsink` refuses any
+/// change of an audio format while playing, even a field such as the channel
+/// mask that one input's caps leave out and another's carry.
+const AUDIO_CAPS: &str =
+    "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2,channel-mask=(bitmask)0x3";
+
+/// Samples in 20 ms at 48 kHz, one Opus frame.
+const AUDIO_SAMPLES: i32 = 960;
 
 /// Prefix of input bins' names, which end in the attempt's number.
 const INPUT_PREFIX: &str = "input-";
@@ -533,6 +564,26 @@ impl Sides {
     }
 }
 
+/// Elements converting an input's sound to [`AUDIO_CAPS`] in buffers of
+/// `audiobuffersplit`'s default 20 ms, starting with an `identity` that
+/// [`align_start`] gives the video's offset, and ending in a `clocksync`
+/// named [`AUDIO_PACE`] that plays it in real time, as [`PACE`] plays the
+/// video.
+fn audio_chain() -> Result<Vec<gst::Element>> {
+    Ok(vec![
+        make("identity")?,
+        make("audioconvert")?,
+        make("audioresample")?,
+        gst::ElementFactory::make("capsfilter")
+            .property("caps", gst::Caps::from_str(AUDIO_CAPS)?)
+            .build()?,
+        make("audiobuffersplit")?,
+        gst::ElementFactory::make("clocksync")
+            .name(AUDIO_PACE)
+            .build()?,
+    ])
+}
+
 /// How far to move a stream whose first buffer is `buffer`, leaving `pad`,
 /// so that it starts with the next canvas frame of `period`, or a little
 /// later if it is not live: a file starts at running time zero wherever the
@@ -561,15 +612,51 @@ fn start_offset(
     Some((offset.max(0), live))
 }
 
+/// An input's start offset, which its first video buffer decides and its
+/// sound takes too.
+#[derive(Default)]
+struct Start {
+    offset: Option<i64>,
+    /// Sound waiting for the offset: its pad and the probe blocking it.
+    waiting: Option<(gst::Pad, gst::PadProbeId)>,
+}
+
 /// Move the stream leaving `entry` to the clock on its first buffer. An
 /// input added to a playing pipeline would otherwise start in the past, and
-/// `pace` would let it race to catch up. A live stream comes in real time
-/// already, and waiting for its latency on top would only delay it, so it
-/// passes `pace` without waiting.
-fn align_start(entry: &gst::Element, pace: Option<gst::Element>, fps: u32) -> Result<()> {
+/// its `paces` would let it race to catch up. A live stream comes in real
+/// time already, and waiting for its latency on top would only delay it, so
+/// it passes its `paces` without waiting. The sound leaving `audio`, if the
+/// input has some, waits for the same offset, so it stays with the picture.
+fn align_start(
+    entry: &gst::Element,
+    audio: Option<&gst::Element>,
+    paces: Vec<gst::Element>,
+    fps: u32,
+) -> Result<()> {
     let period = gst::ClockTime::SECOND
         .mul_div_floor(1, u64::from(fps.max(1)))
         .context("frame rate too large")?;
+    let start: Arc<Mutex<Start>> = Arc::default();
+    if let Some(audio) = audio {
+        let start = Arc::clone(&start);
+        audio
+            .static_pad("src")
+            .context("identity has no source pad")?
+            .add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BLOCK,
+                move |pad, info| {
+                    let mut start = lock(&start);
+                    if let Some(offset) = start.offset {
+                        pad.set_offset(offset);
+                        return gst::PadProbeReturn::Remove;
+                    }
+                    // Blocked until the video's probe sets the offset and
+                    // removes this one.
+                    start.waiting = info.id.take().map(|id| (pad.clone(), id));
+                    gst::PadProbeReturn::Ok
+                },
+            );
+    }
     let src = entry
         .static_pad("src")
         .context("identity has no source pad")?;
@@ -581,12 +668,22 @@ fn align_start(entry: &gst::Element, pace: Option<gst::Element>, fps: u32) -> Re
     src.add_probe(
         gst::PadProbeType::BUFFER | gst::PadProbeType::BLOCK,
         move |pad, info| {
-            if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data
-                && let Some((offset, live)) = start_offset(pad, &sink, buffer, period)
-            {
+            if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
+                let (offset, live) = start_offset(pad, &sink, buffer, period).unwrap_or((0, false));
                 pad.set_offset(offset);
-                if let Some(pace) = pace.as_ref().filter(|_| live) {
-                    pace.set_property("sync", false);
+                if live {
+                    for pace in &paces {
+                        pace.set_property("sync", false);
+                    }
+                }
+                let waiting = {
+                    let mut start = lock(&start);
+                    start.offset = Some(offset);
+                    start.waiting.take()
+                };
+                if let Some((sound, probe)) = waiting {
+                    sound.set_offset(offset);
+                    sound.remove_probe(probe);
                 }
             }
             gst::PadProbeReturn::Remove
@@ -595,15 +692,32 @@ fn align_start(entry: &gst::Element, pace: Option<gst::Element>, fps: u32) -> Re
     Ok(())
 }
 
-/// Link `source`'s video pads to `entry` as they appear, and anything else,
-/// such as a WHEP stream's audio, to a `fakesink`.
-fn link_dynamic(source: &gst::Element, entry: &gst::Element, bin: &gst::Bin) -> Result<()> {
-    let sink = entry
+/// Link `source`'s pads to an input's chains as they appear: its first
+/// video stream to `video`, its first sound to `audio` if the displays get
+/// sound, and anything else, such as a second language, to a `fakesink`.
+fn link_dynamic(
+    source: &gst::Element,
+    video: &gst::Element,
+    audio: Option<&gst::Element>,
+    bin: &gst::Bin,
+) -> Result<()> {
+    let video = video
         .static_pad("sink")
         .context("identity has no sink pad")?;
+    let audio = audio
+        .map(|audio| audio.static_pad("sink").context("identity has no sink pad"))
+        .transpose()?;
     let bin = bin.downgrade();
     source.connect_pad_added(move |_source, pad| {
-        if !pad.name().starts_with("audio") && !sink.is_linked() && pad.link(&sink).is_ok() {
+        let entry = if source::is_audio(pad) {
+            audio.as_ref()
+        } else {
+            Some(&video)
+        };
+        if let Some(entry) = entry
+            && !entry.is_linked()
+            && pad.link(entry).is_ok()
+        {
             return;
         }
         let Some(bin) = bin.upgrade() else {
@@ -638,6 +752,16 @@ enum Showing {
     Outgoing,
 }
 
+/// The sound's selector, which follows the video's.
+struct Sound {
+    selector: gst::Element,
+    /// Where the silence joins, played for inputs without sound.
+    silence: gst::Pad,
+    /// Where each input's sound joins, by where its video joins, once its
+    /// sound flows.
+    inputs: Vec<(gst::Pad, gst::Pad)>,
+}
+
 /// The selector and which input it shows.
 struct Selection {
     selector: gst::Element,
@@ -646,19 +770,62 @@ struct Selection {
     standby: Option<gst::Pad>,
     outgoing: Option<gst::Pad>,
     showing: Showing,
+    sound: Option<Sound>,
 }
 
 impl Selection {
     fn show(&mut self, showing: Showing) {
         self.showing = showing;
-        let pad = match showing {
+        if let Some(pad) = self.shown() {
+            self.selector.set_property("active-pad", pad);
+        }
+        self.follow();
+    }
+
+    /// Where the input showing joins.
+    fn shown(&self) -> Option<&gst::Pad> {
+        match self.showing {
             Showing::Main => self.main.as_ref(),
             Showing::Standby => self.standby.as_ref(),
             Showing::Outgoing => self.outgoing.as_ref(),
-        };
-        if let Some(pad) = pad {
-            self.selector.set_property("active-pad", pad);
         }
+    }
+
+    /// Play the sound of the input showing, or silence.
+    fn follow(&self) {
+        let Some(sound) = &self.sound else {
+            return;
+        };
+        let shown = self.shown();
+        let pad = sound
+            .inputs
+            .iter()
+            .find(|(video, _)| Some(video) == shown)
+            .map_or(&sound.silence, |(_, audio)| audio);
+        if sound
+            .selector
+            .property::<Option<gst::Pad>>("active-pad")
+            .as_ref()
+            != Some(pad)
+        {
+            sound.selector.set_property("active-pad", pad);
+        }
+    }
+
+    /// The input whose video joins at `video` has sound, joining at `audio`.
+    fn sound_flows(&mut self, video: gst::Pad, audio: gst::Pad) {
+        if let Some(sound) = &mut self.sound {
+            sound.inputs.push((video, audio));
+        }
+        self.follow();
+    }
+
+    /// The input whose video joined at `video` stops.
+    fn sound_stops(&mut self, video: &gst::Pad) {
+        if let Some(sound) = &mut self.sound {
+            sound.inputs.retain(|(joined, _)| joined != video);
+        }
+        self.follow();
     }
 
     /// A frame left the input that joins at `pad`.
@@ -775,6 +942,107 @@ fn watch_output(
     );
 }
 
+/// Watch the sound leaving an input's bin: its first buffer lets it play
+/// whenever the input shows, and the end of the stream is held back from the
+/// selector, as the video's is.
+fn watch_sound(
+    ghost: &gst::Pad,
+    video: gst::Pad,
+    audio: gst::Pad,
+    selection: Arc<Mutex<Selection>>,
+) {
+    let flowing = AtomicBool::new(false);
+    ghost.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+        move |_pad, info| match &info.data {
+            Some(gst::PadProbeData::Buffer(_)) => {
+                if !flowing.swap(true, Ordering::Relaxed) {
+                    lock(&selection).sound_flows(video.clone(), audio.clone());
+                }
+                gst::PadProbeReturn::Ok
+            }
+            Some(gst::PadProbeData::Event(event)) if event.type_() == gst::EventType::Eos => {
+                gst::PadProbeReturn::Drop
+            }
+            _ => gst::PadProbeReturn::Ok,
+        },
+    );
+}
+
+/// Join the sound leaving `ghost` to the sound's `selector`; returns where.
+fn join_sound(ghost: &gst::GhostPad, selector: &gst::Element) -> Result<gst::Pad> {
+    let pad = selector
+        .request_pad_simple("sink_%u")
+        .context("input-selector has no input to give")?;
+    if let Err(error) = ghost.link(&pad) {
+        selector.release_request_pad(&pad);
+        return Err(error.into());
+    }
+    Ok(pad)
+}
+
+/// Fill an input's `bin` with `input`'s sources and the chains converting
+/// them for `canvas`, its sound too if `with_sound` is set; returns the
+/// bin's ghost pads for the video, `src`, and the sound, `audio`.
+fn assemble(
+    bin: &gst::Bin,
+    input: &Input,
+    canvas: Canvas,
+    with_sound: bool,
+) -> Result<(gst::GhostPad, Option<gst::GhostPad>)> {
+    let sources = input.elements(canvas.size, with_sound)?;
+    let chain = canvas.chain(input)?;
+    let audio = with_sound.then(audio_chain).transpose()?;
+    bin.add_many(&sources)?;
+    for chain in std::iter::once(&chain).chain(&audio) {
+        bin.add_many(chain)?;
+        gst::Element::link_many(chain)?;
+    }
+    let (Some(entry), Some(last)) = (chain.first(), chain.last()) else {
+        bail!("empty canvas chain");
+    };
+    let audio_entry = audio.as_ref().and_then(|audio| audio.first());
+    for source in &sources {
+        if source.static_pad("src").is_none() {
+            link_dynamic(source, entry, audio_entry, bin)?;
+            continue;
+        }
+        source
+            .link_pads(Some("src"), entry, Some("sink"))
+            .context("the source pipeline has no video output")?;
+        if let Some(audio_entry) = audio_entry
+            && source.static_pad("audio").is_some()
+        {
+            source.link_pads(Some("audio"), audio_entry, Some("sink"))?;
+        }
+    }
+    let ghost = gst::GhostPad::with_target(
+        &last
+            .static_pad("src")
+            .context("capsfilter has no source pad")?,
+    )?;
+    bin.add_pad(&ghost)?;
+    let audio_ghost = match audio.as_ref().and_then(|audio| audio.last()) {
+        Some(last) => {
+            let target = last
+                .static_pad("src")
+                .context("clocksync has no source pad")?;
+            let ghost = gst::GhostPad::builder_with_target(&target)?
+                .name("audio")
+                .build();
+            bin.add_pad(&ghost)?;
+            Some(ghost)
+        }
+        None => None,
+    };
+    let paces = [PACE, AUDIO_PACE]
+        .into_iter()
+        .filter_map(|name| bin.by_name(name))
+        .collect();
+    align_start(entry, audio_entry, paces, canvas.fps)?;
+    Ok((ghost, audio_ghost))
+}
+
 /// A URL's file name, or its host if it has none, for the slate.
 fn short_name(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
@@ -793,6 +1061,9 @@ struct Attempt {
     bin: gst::Bin,
     /// Where it joins the selector.
     pad: gst::Pad,
+    /// Where its sound joins the sound's selector, if the displays get sound
+    /// and it is not a pattern.
+    sound: Option<gst::Pad>,
     started: Instant,
     /// When its latest frame left the bin.
     last_frame: Arc<Mutex<Option<Instant>>>,
@@ -866,6 +1137,8 @@ struct Feeds {
 struct Inputs {
     pipeline: gst::Pipeline,
     selector: gst::Element,
+    /// The sound's selector, if the displays get sound.
+    sound: Option<gst::Element>,
     canvas: Mutex<Canvas>,
     resolver: Resolver,
     restart: AtomicBool,
@@ -877,15 +1150,19 @@ struct Inputs {
 }
 
 impl Inputs {
+    /// Inputs joining `selector`, and `sound`'s selector, with the pad its
+    /// silence joins at, if the displays get sound.
     fn new(
         pipeline: &gst::Pipeline,
         selector: gst::Element,
+        sound: Option<(gst::Element, gst::Pad)>,
         canvas: Size,
         options: &PlayerOptions,
     ) -> Result<Self> {
         Ok(Self {
             pipeline: pipeline.clone(),
             selector: selector.clone(),
+            sound: sound.as_ref().map(|(selector, _)| selector.clone()),
             canvas: Mutex::new(Canvas {
                 size: canvas,
                 fps: options.fps,
@@ -905,6 +1182,11 @@ impl Inputs {
                 standby: None,
                 outgoing: None,
                 showing: Showing::Standby,
+                sound: sound.map(|(selector, silence)| Sound {
+                    selector,
+                    silence,
+                    inputs: Vec::new(),
+                }),
             })),
             status: Mutex::new(SourceStatus::default()),
         })
@@ -915,6 +1197,17 @@ impl Inputs {
             Role::Main => &mut feeds.main,
             Role::Standby => &mut feeds.standby,
         }
+    }
+
+    /// Start the standby, pattern `id`, which must play.
+    fn start_standby(&self, id: &str) -> Result<()> {
+        let mut feeds = lock(&self.feeds);
+        self.start(&mut feeds.standby);
+        ensure!(
+            feeds.standby.attempt.is_some(),
+            "the standby pattern {id:?} does not play"
+        );
+        Ok(())
     }
 
     /// Start a new attempt at `feed`'s source.
@@ -932,7 +1225,7 @@ impl Inputs {
         }
     }
 
-    /// Build a bin playing `input`, join it to the selector and start it.
+    /// Build a bin playing `input`, join it to the selectors and start it.
     fn attach(&self, role: Role, serial: u64, input: &Input) -> Result<Attempt> {
         let bin = gst::Bin::with_name(&format!("{INPUT_PREFIX}{}-{serial}", role.name()));
         // A source still prerolling, or one that never will, must not take
@@ -943,30 +1236,21 @@ impl Inputs {
             configured.configure(element);
         });
         let canvas = *lock(&self.canvas);
-        let source = input.element(canvas.size)?;
-        let chain = canvas.chain(input)?;
-        bin.add(&source)?;
-        bin.add_many(&chain)?;
-        gst::Element::link_many(&chain)?;
-        let (Some(entry), Some(last)) = (chain.first(), chain.last()) else {
-            bail!("empty canvas chain");
-        };
-        if source.static_pad("src").is_some() {
-            source
-                .link(entry)
-                .context("the source pipeline has no video output")?;
-        } else {
-            link_dynamic(&source, entry, &bin)?;
-        }
-        let ghost = gst::GhostPad::with_target(
-            &last
-                .static_pad("src")
-                .context("capsfilter has no source pad")?,
-        )?;
-        bin.add_pad(&ghost)?;
-        align_start(entry, bin.by_name(PACE), canvas.fps)?;
+        let with_sound = self.sound.is_some() && !input.is_pattern();
+        let (ghost, audio_ghost) = assemble(&bin, input, canvas, with_sound)?;
         self.pipeline.add(&bin)?;
+        let sound = match (&audio_ghost, &self.sound) {
+            (Some(ghost), Some(selector)) => match join_sound(ghost, selector) {
+                Ok(sound) => Some(sound),
+                Err(error) => {
+                    self.pipeline.remove(&bin)?;
+                    return Err(error);
+                }
+            },
+            _ => None,
+        };
         let Some(pad) = self.selector.request_pad_simple("sink_%u") else {
+            self.release_sound(sound.as_ref());
             self.pipeline.remove(&bin)?;
             bail!("input-selector has no input to give");
         };
@@ -978,8 +1262,17 @@ impl Inputs {
             Arc::clone(&last_frame),
             Arc::clone(&self.selection),
         );
+        if let (Some(ghost), Some(sound)) = (&audio_ghost, &sound) {
+            watch_sound(
+                ghost.upcast_ref(),
+                pad.clone(),
+                sound.clone(),
+                Arc::clone(&self.selection),
+            );
+        }
         if let Err(error) = ghost.link(&pad) {
             self.selector.release_request_pad(&pad);
+            self.release_sound(sound.as_ref());
             self.pipeline.remove(&bin)?;
             return Err(error.into());
         }
@@ -992,10 +1285,18 @@ impl Inputs {
         Ok(Attempt {
             bin,
             pad,
+            sound,
             started: Instant::now(),
             last_frame,
             slate: String::new(),
         })
+    }
+
+    /// Give back where an input's sound joined the sound's selector.
+    fn release_sound(&self, sound: Option<&gst::Pad>) {
+        if let (Some(pad), Some(selector)) = (sound, &self.sound) {
+            selector.release_request_pad(pad);
+        }
     }
 
     /// Stop `feed`'s current attempt on another thread, since stopping a
@@ -1048,8 +1349,13 @@ impl Inputs {
     }
 
     fn stop_attempt(&self, attempt: Attempt) {
+        lock(&self.selection).sound_stops(&attempt.pad);
         attempt.bin.set_locked_state(true);
-        let (pipeline, selector) = (self.pipeline.clone(), self.selector.clone());
+        let (pipeline, selector, sound) = (
+            self.pipeline.clone(),
+            self.selector.clone(),
+            self.sound.clone(),
+        );
         let stopping = std::thread::Builder::new()
             .name("wallplay-retire".to_owned())
             .spawn(move || {
@@ -1062,6 +1368,14 @@ impl Inputs {
                     gst::warning!(gst::CAT_DEFAULT, "an input was not linked");
                 }
                 selector.release_request_pad(&attempt.pad);
+                if let (Some(pad), Some(sound)) = (&attempt.sound, &sound) {
+                    if let Some(ghost) = attempt.bin.static_pad("audio")
+                        && ghost.unlink(pad).is_err()
+                    {
+                        gst::warning!(gst::CAT_DEFAULT, "an input's sound was not linked");
+                    }
+                    sound.release_request_pad(pad);
+                }
                 if pipeline.remove(&attempt.bin).is_err() {
                     gst::warning!(gst::CAT_DEFAULT, "an input was already removed");
                 }
@@ -1442,7 +1756,7 @@ impl Player {
         ensure!(options.fps > 0, "the frame rate must be positive");
         ensure!(!layout.screens.is_empty(), "the layout has no displays");
         if matches!(options.sink, Sink::WebRtc(_)) {
-            check_webrtc_elements()?;
+            check_webrtc_elements(options.audio)?;
         }
         let pipeline = gst::Pipeline::with_name("wallplay");
         let measuring = Arc::new(AtomicBool::new(false));
@@ -1506,14 +1820,18 @@ impl Player {
                 code,
             });
         }
-        let inputs = Arc::new(Inputs::new(&pipeline, selector, layout.canvas, options)?);
-        {
-            let mut feeds = lock(&inputs.feeds);
-            inputs.start(&mut feeds.standby);
-            if feeds.standby.attempt.is_none() {
-                bail!("the standby pattern {:?} does not play", options.standby);
-            }
-        }
+        let sound = options
+            .audio
+            .then(|| Self::sound(&pipeline, &routes, &options.sink))
+            .transpose()?;
+        let inputs = Arc::new(Inputs::new(
+            &pipeline,
+            selector,
+            sound,
+            layout.canvas,
+            options,
+        )?);
+        inputs.start_standby(&options.standby)?;
         let bus = pipeline.bus().context("the pipeline has no bus")?;
         let watched = Arc::clone(&inputs);
         let bus_thread = std::thread::Builder::new()
@@ -1539,6 +1857,84 @@ impl Player {
         player.inputs.start(&mut feeds.main);
         drop(feeds);
         Ok(player)
+    }
+
+    /// Silence, the selector that picks between it and the inputs' sound,
+    /// and a branch from it to the sink of every display in `routes`;
+    /// returns the selector and where the silence joins it.
+    fn sound(
+        pipeline: &gst::Pipeline,
+        routes: &[Route],
+        kind: &Sink,
+    ) -> Result<(gst::Element, gst::Pad)> {
+        // Paced like a clip rather than live: a live source would raise the
+        // latency every sink waits for.
+        let silence = gst::ElementFactory::make("audiotestsrc")
+            .name("silence")
+            .property_from_str("wave", "silence")
+            .property("samplesperbuffer", AUDIO_SAMPLES)
+            .build()?;
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property("caps", gst::Caps::from_str(AUDIO_CAPS)?)
+            .build()?;
+        let pace = make("clocksync")?;
+        let selector = gst::ElementFactory::make("input-selector")
+            .name("sound")
+            .property("sync-streams", false)
+            .build()?;
+        let tee = gst::ElementFactory::make("tee")
+            .property("allow-not-linked", true)
+            .build()?;
+        pipeline.add_many([&silence, &caps, &pace, &selector, &tee])?;
+        gst::Element::link_many([&silence, &caps, &pace])?;
+        selector.link(&tee)?;
+        let pad = selector
+            .request_pad_simple("sink_%u")
+            .context("input-selector has no input to give")?;
+        pace.static_pad("src")
+            .context("clocksync has no source pad")?
+            .link(&pad)?;
+        selector.set_property("active-pad", &pad);
+        for route in routes {
+            let sink = pipeline
+                .by_name(&format!("sink-{}", route.display))
+                .context("a display without its sink")?;
+            let queue = make("queue")?;
+            let input = Self::sound_input(pipeline, &sink, &route.display, kind)?;
+            pipeline.add(&queue)?;
+            tee.link(&queue)?;
+            queue
+                .static_pad("src")
+                .context("queue has no source pad")?
+                .link(&input)?;
+        }
+        Ok((selector, pad))
+    }
+
+    /// Where display `id`'s sound goes: `sink`'s audio input, or for tests an
+    /// `appsink` named `sound-<id>`.
+    fn sound_input(
+        pipeline: &gst::Pipeline,
+        sink: &gst::Element,
+        id: &str,
+        kind: &Sink,
+    ) -> Result<gst::Pad> {
+        match kind {
+            Sink::WebRtc(_) => sink
+                .request_pad_simple("audio_%u")
+                .context("webrtcsink has no audio input to give"),
+            Sink::AppSink => {
+                let sink = gst::ElementFactory::make("appsink")
+                    .name(format!("sound-{id}"))
+                    .property("max-buffers", 5_u32)
+                    .property("drop", true)
+                    .property("sync", false)
+                    .property("async", false)
+                    .build()?;
+                pipeline.add(&sink)?;
+                sink.static_pad("sink").context("appsink has no sink pad")
+            }
+        }
     }
 
     /// Elements scaling a display's output down to a preview, ending in a

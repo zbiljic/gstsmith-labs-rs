@@ -4,10 +4,10 @@
 is a web browser that opens one URL with its own ID. A control page shows the
 calibration patterns, takes a photo of the wall, makes a layout, and plays one
 video across all displays: a test pattern, a file, a live stream or network
-camera, or a web page such as YouTube. Each display's part comes from its own
-[`wallwarp`](../../video/wallwarp/) branch and reaches its browser through
-`webrtcsink`. A measurement mode reports how far apart the browsers present
-the same frame, and can align them.
+camera, or a web page such as YouTube, with its sound on one display. Each
+display's part comes from its own [`wallwarp`](../../video/wallwarp/) branch
+and reaches its browser through `webrtcsink`. A measurement mode reports how
+far apart the browsers present the same frame, and can align them.
 
 It is a test application, not a video wall manager: the server, the pages,
 and the signalling choices stay out of the `wallwarp` element, and the
@@ -25,6 +25,8 @@ browser.
 - For YouTube and some other web pages,
   [yt-dlp](https://github.com/yt-dlp/yt-dlp) on the `PATH`, or named with
   `--yt-dlp`. For WHEP endpoints, `whepclientsrc`, also from `rswebrtc`.
+- For sound, GStreamer's Opus encoder, `opusenc`, and `audiobuffersplit`
+  from gst-plugins-bad.
 - Browsers with WebRTC VP8 and `requestVideoFrameCallback`: current Chrome,
   Edge, Safari, and Firefox. The displays and the server must reach each
   other on the local network; no STUN or TURN server is used.
@@ -70,6 +72,7 @@ It prints the control page's address, for example `http://192.168.1.20:8000/`.
 --source PATTERN|URL|PIPELINE  what to play first [default: bars]
 --standby PATTERN        shown whenever the source is not [default: slate]
 --play-once              leave the standby showing when the source ends
+--sound DISPLAY          play the sound on this display; without it, no sound
 --yt-dlp PROGRAM         finds the video of web pages [default: yt-dlp]
 --fps N                  canvas frame rate [default: 30]
 --max-output PIXELS      longest side of each display's stream [default: 1920]
@@ -78,10 +81,10 @@ It prints the control page's address, for example `http://192.168.1.20:8000/`.
 ```
 
 `--source` takes a test pattern's ID, a URL (see [Sources](#sources)), or a
-`gst-launch-1.0` description with one video output, such as
-`"videotestsrc is-live=true pattern=snow"`. The control page can switch
-between patterns and URLs, but not set a pipeline description: over an
-unauthenticated page, a pipeline could write files.
+`gst-launch-1.0` description with one video output and at most one audio
+output, such as `"videotestsrc is-live=true pattern=snow"`. The control page
+can switch between patterns and URLs, but not set a pipeline description:
+over an unauthenticated page, a pipeline could write files.
 
 The state directory keeps `manifest.json`, the photo, `detections.json`,
 `calibration.json`, and `layout.json` under `wallcalibrate`'s names, so a
@@ -103,7 +106,7 @@ A URL under **Source** opens by what it looks like, or as **Open as** says:
 | HTTP(S) ending in `/whep` | `whepclientsrc` (WebRTC-HTTP egress) | `http://mediamtx:8889/cam/whep` |
 | Any other HTTP(S) page | yt-dlp, then `uridecodebin` | YouTube videos and live streams, Vimeo, and [many more](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md) |
 
-Only video plays; audio is dropped.
+Their sound plays when it is turned on, except WHEP's; see [Sound](#sound).
 
 - **Web pages** take a few seconds to look up. yt-dlp picks video up to 1080
   lines, H.264 where it can, since it decodes in hardware on most machines.
@@ -157,6 +160,45 @@ The timecode and the slate's text sit in the canvas center, so they show
 only when a display covers the center. Both need GStreamer's Pango plugin,
 which some systems package separately; without it the timecode pattern shows
 plain bars and the slate a plain dark screen.
+
+## Sound
+
+Pick the display that plays the sound under **Sound** on the control page, or
+with `--sound`. Every display's stream then carries the sound, and every
+display but that one keeps it muted: a browser holds a stream's video back to
+keep it in sync with its sound, muted or not, so displays that all receive
+it stay in step. Turning the sound on or off restarts playback, since every
+stream gains or loses its audio; moving it to another display only unmutes
+that one.
+
+- **What sounds**: files and streams with sound, web pages, whose sound
+  yt-dlp often finds apart from the video and which then plays from a second
+  URL, and pipelines with an audio output. WHEP endpoints play without sound,
+  since servers such as MediaMTX refuse an offer with audio for a stream
+  without it. Test patterns, the standby, and sources without sound play
+  silence.
+- **In sync**: a source's sound moves to the clock by the same offset as its
+  video, so a clip's sound stays with its picture.
+- **Browsers** play sound only after a tap, click, or key press on the page,
+  unless set up to allow it, such as Chrome with
+  `--autoplay-policy=no-user-gesture-required`. Until then the display plays
+  muted and says so.
+
+With two headless Chromium displays on one machine showing a test pattern,
+sound raised the median latency from 91 to 113 ms over four runs each, the
+browsers holding the video back 9–37 ms for lip sync. Each browser buffers
+the sound for itself, so the displays, all but level without sound, stayed
+within one 60 Hz refresh of each other; [aligning](#aligning-displays)
+corrects the rest.
+
+Sound is converted to 48 kHz stereo, since `webrtcsink` cannot change an
+audio format while playing, and cut into 20 ms buffers, one Opus frame each.
+Browsers then receive it evenly and buffer less of it, which their lip sync
+makes the video wait for: in 21.3 ms buffers, the video waited 46–57 ms
+instead of 30–35 ms. The silence is paced like a clip rather than live:
+`webrtcsink` sends each frame at its running time plus the latency GStreamer
+configures for every sink when the pipeline starts, and a live audio source
+raised that latency by its 21.3 ms buffer, the video's too.
 
 ## Layouts
 
@@ -345,6 +387,12 @@ Tested with GStreamer 1.28.8 and `rswebrtc` 0.15.4:
 - **Mitigation modes:** `webrtcsink` lowers resolution and frame rate under
   congestion by default; `wallplay` turns that off, so every display keeps its
   picture.
+- **Audio inputs:** a sink announces its producer only after every input has
+  had data, so an audio input needs silence when there is no sound. It
+  refuses any change of an audio input's caps, even a channel mask that the
+  silence's caps leave out and a converted source's carry, and its sound then
+  stops. `webrtcbin` gives every track the session's CNAME as its stream ID,
+  so browsers lip-sync a sink's audio and video without further setup.
 
 ## HTTP API
 
@@ -363,6 +411,7 @@ Tested with GStreamer 1.28.8 and `rswebrtc` 0.15.4:
 | `POST /api/source` | `{"pattern": ID}`, or a URL as `{"uri": URL}` to open it by its look, `{"media": URL}`, `{"page": URL}` or `{"whep": URL}`; switches while playing |
 | `POST /api/playback` | `{"restart": bool, "standby": ID}`, either one; applies while playing |
 | `POST /api/buffer` | `{"ms": N}` or `{"ms": null}`: the browsers' jitter buffer target |
+| `POST /api/sound` | `{"display": ID}` or `{"display": null}`: the display that plays the sound; turning it on or off restarts playback |
 | `POST /api/measure`, `GET /api/measure` | `{"on": bool}`; measurement summary, with the aligner's progress while aligning |
 | `POST /api/align` | `{"on": bool}`: align the displays' presentation while playing |
 | `POST /api/clock`, `POST /api/displays/ID/frames` | Used by display pages while measuring |
@@ -384,8 +433,10 @@ aligner, HTTP parsing, and how URLs open, and run the whole workflow over
 HTTP against a real pipeline with `appsink`s in place of `webrtcsink`. That
 covers registration, patterns, a synthetic photo, corrections, layout,
 playback, frame codes matching running times, measurement and aligning from
-simulated browser reports, a new layout while playing, and a source that
-ends, restarts, fails, and is replaced while playing.
+simulated browser reports, a new layout while playing, a source that ends,
+restarts, fails, and is replaced while playing, sound that follows the source
+with its picture's offset and turns to silence on standby, and sound moving
+between displays.
 
 With `webrtcsink`, libnice, `uv`, and Playwright's Chromium installed, a full
 check runs the real pages in headless Chromium:
@@ -400,17 +451,21 @@ plays, and measures. It applies a new layout while playing and checks that
 the displays keep their streams, then reloads one display, restarts
 playback, and checks that both present frames again. It switches to
 another pattern and to a clip played once from the control page, and checks
-that the displays keep their streams and show the standby when it ends.
-Finally it makes one display 100 ms late and checks that aligning brings both
-together. `--signalling-server` repeats it with an external
-`gst-webrtc-signalling-server`, and `--output DIR` keeps screenshots.
+that the displays keep their streams and show the standby when it ends. It
+plays a clip with a tone and its sound on one display, checks that both
+displays receive the tone and only that one plays it, moves the sound to the
+other display, and turns it off. Finally it makes one display 100 ms late and
+checks that aligning brings both together. `--signalling-server` repeats it
+with an external `gst-webrtc-signalling-server`, and `--output DIR` keeps
+screenshots.
 
 ## Limitations
 
 - One source and one layout at a time. A layout that changes a display's
   stream size, or adds or leaves out a display, restarts playback, and every
   browser reconnects.
-- No audio.
+- Sound plays on one display, and every display's video waits for it; WHEP
+  sources play without it.
 - No local cameras or screen capture; a camera on the network plays over
   RTSP, SRT, or WHEP.
 - Patterns come from `videotestsrc`; there is no pattern drawn per display,

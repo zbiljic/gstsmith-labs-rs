@@ -28,11 +28,14 @@ Options:
                              rtsp://camera/stream, an HLS playlist, a WHEP
                              endpoint ending in /whep, or a web page such as
                              YouTube; or a gst-launch-1.0 description with one
-                             video output [default: bars]
+                             video output and at most one audio output
+                             [default: bars]
   --standby PATTERN          Shown while the source connects, after it ends
                              and when it fails [default: slate]
   --play-once                Leave the standby showing when the source ends,
                              instead of looping clips and reconnecting streams
+  --sound DISPLAY            Play the sound on this display; the others get it
+                             muted. Without it, the streams carry no sound
   --yt-dlp PROGRAM           Finds the video of web pages [default: yt-dlp]
   --fps N                    Canvas frame rate [default: 30]
   --max-output PIXELS        Longest side of each display's stream [default: 1920]
@@ -64,6 +67,7 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
     let mut source = DEFAULT_SOURCE.to_owned();
     let mut standby = DEFAULT_STANDBY.to_owned();
     let mut restart = true;
+    let mut sound = None;
     let mut resolver = Resolver::default();
     let mut fps = 30;
     let mut max_output = 1920;
@@ -76,6 +80,7 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
             "--source" => source = value(&arg, args.next())?,
             "--standby" => standby = value(&arg, args.next())?,
             "--play-once" => restart = false,
+            "--sound" => sound = Some(value::<String>(&arg, args.next())?),
             "--yt-dlp" => resolver.program = value(&arg, args.next())?,
             "--fps" => fps = value(&arg, args.next())?,
             "--max-output" => max_output = value(&arg, args.next())?,
@@ -90,6 +95,11 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
     }
     if wallplay::source::pattern(&standby).is_none() {
         bail!("--standby {standby:?} is not a pattern");
+    }
+    if let Some(sound) = &sound
+        && !wall_geometry::is_valid_screen_id(sound)
+    {
+        bail!("--sound {sound:?} is not a display ID");
     }
     let signalling = match external {
         Some(uri) => Signalling::External(uri),
@@ -111,9 +121,11 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
                 sink: Sink::WebRtc(signalling),
                 fill: Fill::default(),
                 resolver,
+                audio: sound.is_some(),
             },
             poll_timeout: Duration::from_secs(25),
             max_output,
+            sound,
         },
     }))
 }

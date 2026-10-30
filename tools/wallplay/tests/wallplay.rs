@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::str::FromStr as _;
 use std::sync::Once;
 use std::time::Duration;
 
@@ -39,6 +40,7 @@ fn options() -> PlayerOptions {
         sink: Sink::AppSink,
         fill: Fill::default(),
         resolver: Resolver::default(),
+        audio: false,
     }
 }
 
@@ -58,6 +60,7 @@ fn serve_polling(
         player: options(),
         poll_timeout,
         max_output: 1920,
+        sound: None,
     })
     .expect("app");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -177,22 +180,181 @@ fn coded_frames(pipeline: &gst::Pipeline, ids: &[&str], count: usize) -> Vec<Cod
     frames
 }
 
+/// A landscape and a portrait display on a 640x360 canvas, as JSON.
+fn two_displays_json() -> String {
+    json!({
+        "version": 1,
+        "canvas": {"width": 640, "height": 360},
+        "screens": [
+            {"id": "left", "output": {"width": 320, "height": 180},
+             "corners": [[0, 0], [320, 0], [320, 180], [0, 180]]},
+            {"id": "right", "output": {"width": 180, "height": 320},
+             "corners": [[640, 0], [640, 360], [400, 360], [400, 0]]}
+        ]
+    })
+    .to_string()
+}
+
 /// A landscape and a portrait display on a 640x360 canvas.
 fn two_displays() -> Layout {
-    Layout::from_json(
-        &json!({
-            "version": 1,
-            "canvas": {"width": 640, "height": 360},
-            "screens": [
-                {"id": "left", "output": {"width": 320, "height": 180},
-                 "corners": [[0, 0], [320, 0], [320, 180], [0, 180]]},
-                {"id": "right", "output": {"width": 180, "height": 320},
-                 "corners": [[640, 0], [640, 360], [400, 360], [400, 0]]}
-            ]
-        })
-        .to_string(),
+    Layout::from_json(&two_displays_json()).expect("layout")
+}
+
+/// Whether any of the next ten buffers of sound from `sink` is not silent,
+/// checking that sound comes as 16-bit 48 kHz stereo in 20 ms buffers, in
+/// exactly the same caps whatever plays, since `webrtcsink` refuses a change.
+fn audible(sink: &gst::Element) -> bool {
+    let expected = gst::Caps::from_str(
+        "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2,channel-mask=(bitmask)0x3",
     )
-    .expect("layout")
+    .expect("caps");
+    let mut loud = false;
+    let mut whole = 0;
+    for _ in 0..10 {
+        let sample = sink
+            .emit_by_name::<Option<gst::Sample>>(
+                "try-pull-sample",
+                &[&gst::ClockTime::from_seconds(5)],
+            )
+            .expect("sound");
+        let caps = sample.caps().expect("caps");
+        assert!(caps.is_strictly_equal(&expected), "{caps}");
+        let buffer = sample.buffer().expect("buffer");
+        whole += usize::from(buffer.size() == 960 * 4);
+        loud |= buffer
+            .map_readable()
+            .expect("map")
+            .iter()
+            .any(|byte| *byte != 0);
+    }
+    assert!(whole >= 8, "{whole} of 10 buffers last 20 ms");
+    loud
+}
+
+/// How far the pipeline moved the stream reaching `sink`, from the running
+/// time and timestamp of its next buffer, in nanoseconds.
+fn moved(sink: &gst::Element) -> i128 {
+    let sample = sink
+        .emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&gst::ClockTime::from_seconds(5)])
+        .expect("sample");
+    let pts = sample
+        .buffer()
+        .and_then(gst::BufferRef::pts)
+        .expect("timestamp");
+    let running = sample
+        .segment()
+        .and_then(|segment| segment.downcast_ref::<gst::format::Time>())
+        .and_then(|segment| segment.to_running_time(pts))
+        .expect("running time");
+    i128::from(running.nseconds()) - i128::from(pts.nseconds())
+}
+
+#[test]
+fn sound_follows_what_shows() {
+    init();
+    let layout = two_displays();
+    let measurement = std::sync::Arc::default();
+    // A clip with a tone, not live, so its sound must start with its picture
+    // rather than at the start of the pipeline.
+    let clip = Prepared::prepare(
+        &Source::Launch("videotestsrc pattern=ball audiotestsrc freq=440".to_owned()),
+        &Resolver::default(),
+    )
+    .expect("clip");
+    let player = Player::start(
+        &layout,
+        &PlayerOptions {
+            source: clip.clone(),
+            audio: true,
+            // Cropping needs gst-plugins-good, which CI does not install.
+            fill: Fill::Contain,
+            ..options()
+        },
+        &measurement,
+        Clock::new(),
+        |_| {},
+    )
+    .expect("player");
+    let pipeline = player.pipeline();
+    let sounds = ["left", "right"].map(|id| {
+        pipeline
+            .by_name(&format!("sound-{id}"))
+            .expect("sound sink")
+    });
+    assert!(eventually(10, || player.source_status().state == "playing"));
+    for sound in &sounds {
+        assert!(eventually(5, || audible(sound)), "the clip's tone");
+    }
+    // Moved to the clock as far as its picture, since both start at zero;
+    // a frame of the standby, shown while the clip stalls, moved less.
+    let video = pipeline.by_name("sink-left").expect("sink");
+    let mut moves = (0, 0);
+    assert!(
+        eventually(5, || {
+            moves = (moved(&sounds[0]), moved(&video));
+            (moves.0 - moves.1).abs() < 50_000_000
+        }),
+        "sound moved {} ns, picture {} ns",
+        moves.0,
+        moves.1
+    );
+    // A pattern has no sound: the displays get silence.
+    player.set_source(&Prepared::pattern("ball").expect("pattern"));
+    assert!(eventually(10, || !audible(&sounds[0])), "silence");
+    // So does the standby, while a source fails.
+    let missing = Prepared::prepare(
+        &Source::Media("file:///nonexistent/wallplay.mp4".to_owned()),
+        &Resolver::default(),
+    )
+    .expect("missing file");
+    player.set_source(&missing);
+    assert!(eventually(10, || player.source_status().state == "retrying"));
+    assert!(!audible(&sounds[0]), "silence on standby");
+    // And the clip's sound comes back with it.
+    player.set_source(&clip);
+    assert!(eventually(10, || audible(&sounds[0])), "the tone again");
+}
+
+#[test]
+fn sound_moves_between_displays_and_turns_on_and_off() {
+    let state = tempfile::tempdir().expect("state directory");
+    std::fs::write(state.path().join("layout.json"), two_displays_json()).expect("layout");
+    let (app, address) = serve(state.path());
+    let sound =
+        |display: Value| json_request(address, "POST", "/api/sound", &json!({"display": display}));
+    assert_eq!(sound(json!("a b")).0, 400);
+    ok(address, "POST", "/api/play", &Value::Null);
+    let command = |id| poll(address, id, 320, 180);
+    let silent = command("left")["generation"].clone();
+    assert_eq!(command("left")["sound"], false);
+    assert!(
+        app.pipeline()
+            .and_then(|pipeline| pipeline.by_name("sound"))
+            .is_none()
+    );
+    // Turning it on restarts playback: every stream gains sound.
+    assert_eq!(sound(json!("left")).0, 200);
+    let loud = command("left")["generation"].clone();
+    assert_ne!(loud, silent);
+    assert_eq!(command("left")["sound"], true);
+    assert_eq!(command("right")["sound"], false);
+    let pipeline = app.pipeline().expect("pipeline");
+    assert!(pipeline.by_name("sound-left").is_some() && pipeline.by_name("sound-right").is_some());
+    // Moving it to another display keeps the streams.
+    assert_eq!(sound(json!("right")).0, 200);
+    assert_eq!(command("left")["generation"], loud);
+    assert_eq!(command("left")["sound"], false);
+    assert_eq!(command("right")["sound"], true);
+    // Turning it off restarts playback without it.
+    let (status, state_json) = sound(Value::Null);
+    assert_eq!(status, 200);
+    assert_eq!(state_json["sound"], Value::Null);
+    assert_ne!(command("left")["generation"], loud);
+    assert!(
+        app.pipeline()
+            .and_then(|pipeline| pipeline.by_name("sound"))
+            .is_none()
+    );
 }
 
 /// Whether `done` becomes true within `seconds`.
