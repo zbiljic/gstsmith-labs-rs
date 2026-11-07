@@ -4,10 +4,12 @@ The `wallwarp` plugin provides `wallwarp`, which produces the stream for one
 display of an irregular video wall. It maps a quadrilateral region of the
 input frame onto the whole output frame through a perspective transform, so a
 display can be cropped, scaled, rotated, or keystoned onto the shared source.
-Run one instance per display behind a `tee`.
+Run one instance per display behind a `tee`. [`glwallwarp`](#glwallwarp) does
+the same on the GPU through OpenGL.
 
-The element is experimental. It requires GStreamer 1.24 or newer, and needs
-only the core, base, and video libraries. Layout files and the geometry behind
+The elements are experimental. They require GStreamer 1.24 or newer;
+`wallwarp` needs only the core, base, and video libraries, and `glwallwarp`
+the OpenGL plugin from gst-plugins-base at run time. Layout files and the geometry behind
 them live in [`wall-geometry`](../../utils/wall-geometry/), which does not
 depend on GStreamer.
 
@@ -166,6 +168,53 @@ To show a video file with the canvas aspect ratio instead, replace the
 `filesrc location=movie.mp4 ! decodebin ! videoconvert ! videoscale`, ahead of
 the caps filter.
 
+## glwallwarp
+
+`glwallwarp` draws the same frames as `wallwarp` with an OpenGL shader, and
+takes the same properties except `n-threads`, all changeable while streaming.
+It is a bin of standard elements:
+
+```text
+glupload ! glcolorconvert ! glshader ! glcolorconvert ! gldownload
+```
+
+so it takes any raw video in system or GL memory, and gives whatever format
+and memory downstream asks for: RGBA or I420 in system memory for an
+encoder, or GL memory for further GL elements. Upload and download pass
+through when a side is already in GL memory, so behind a `tee`, one
+`glupload` before the `tee` uploads each frame once for every display:
+
+```sh
+GST_PLUGIN_PATH="$PWD/target/debug" gst-launch-1.0 \
+  videotestsrc num-buffers=60 \
+  ! video/x-raw,format=RGBA,width=1920,height=1080 \
+  ! glupload ! tee name=t \
+  t. ! queue ! glwallwarp quad="0.04,0.09 0.41,0.08 0.42,0.46 0.05,0.48" \
+         output-width=1280 output-height=720 \
+     ! video/x-raw,format=I420 ! fakesink \
+  t. ! queue ! glwallwarp quad="0.57,0.03 0.71,0.06 0.69,0.85 0.55,0.83" \
+         output-width=1280 output-height=720 \
+     ! video/x-raw,format=I420 ! fakesink
+```
+
+It samples by the same rules. Nearest sampling picks the same source pixels
+as `wallwarp`; a sample within a tiny fraction of a pixel short of a pixel
+boundary may take the next one, and so may more of them on a GLES 2 device
+without high-precision fragment shaders. Bilinear blends differ by at most
+one level per channel on the GPUs tested; the GPU weighs them at its own
+precision, which OpenGL leaves to the hardware. Output pixels are square
+unless downstream requires otherwise. Two differences remain: an output
+dimension left at `0` that nothing downstream fixes keeps the input's
+display aspect ratio rather than the input dimension, and the identity quad
+still draws every frame.
+
+The homography, background, and sampling are shader uniforms, so changing
+them costs nothing; a new output size renegotiates the element's output on
+the next frame, without asking anything upstream of it to renegotiate.
+Without the OpenGL plugin the element fails to reach READY, naming the
+missing element; without a usable GL display or context, OpenGL's own
+elements report the error.
+
 ## Design notes
 
 - `wallwarp` subclasses `GstVideoFilter` in never-in-place mode, like
@@ -209,13 +258,28 @@ Locating the samples again for a new `quad` or frame size takes about 3 ms
 for a bilinear 1280x720 output and 8 ms for 1920x1080, on the thread that
 sets the `quad` or negotiates the caps.
 
+For a wall, compare whole pipelines: one 1920x1080 source, three bilinear
+1920x1080 displays, each converted to I420 and encoded with `vp8enc` in
+real-time mode as a browser stream needs, measured in CPU time per source
+frame on the same machine with an integrated GPU:
+
+| Warp | CPU time | Of which encoding | Wall time |
+|---|---:|---:|---:|
+| `wallwarp`, then `videoconvert` | 43 ms | about 16 ms | 12 ms |
+| `glupload ! tee`, then `glwallwarp` to I420 | 14 ms | about 14 ms | 3.4 ms |
+
+On the GPU the warp and the conversion to I420 leave the CPU almost
+entirely; what remains is encoding. Machines whose GPU has its own memory
+pay more to copy frames back.
+
 ## Limitations
 
 - RGBA in system memory only; convert other formats with `videoconvert`.
   Alpha is interpolated without premultiplication. Interlaced input is
   processed as progressive frames.
-- Sampling runs on the CPU, with no GPU path yet. Each `tee` branch runs in
-  its own `queue` thread, and `n-threads` adds threads within a branch.
+- `wallwarp` runs on the CPU: each `tee` branch in its own `queue` thread,
+  and `n-threads` adds threads within a branch. `glwallwarp` needs OpenGL,
+  so keep `wallwarp` where there is none.
 - Sources wider than 65534 or taller than 65535 pixels are not supported.
 - Bilinear sampling does not prefilter, so outputs much smaller than their
   source region alias.
@@ -236,6 +300,11 @@ negotiation, changes of every property while streaming, timestamps, flags,
 flushing, EOS, and the three-screen layout
 through a `tee` with independent branches. Every pixel of several warps is
 compared with a direct per-pixel sampler, on one thread and on several.
+`glwallwarp`'s tests compare its frames with `wallwarp`'s for several quads,
+sizes, and both samplings, a 4K source halved, property changes while
+streaming, and one upload feeding two displays through a `tee`; they also
+check output formats, memory and pixel aspect ratios, and skip where no
+OpenGL context can be made.
 
 Benchmark perspective and rotated outputs from a 1080p source, on one thread
 and on four, plus identity passthrough:

@@ -1,12 +1,14 @@
-//! `GStreamer` perspective warp mapping a source quadrilateral onto one video
-//! wall display.
+//! `GStreamer` perspective warps mapping a source quadrilateral onto one video
+//! wall display, on the CPU (`wallwarp`) or in OpenGL (`glwallwarp`).
 
 use gst::glib;
 
+mod glwallwarp;
 mod wallwarp;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
-    wallwarp::register(plugin)
+    wallwarp::register(plugin)?;
+    glwallwarp::register(plugin)
 }
 
 gst::plugin_define!(

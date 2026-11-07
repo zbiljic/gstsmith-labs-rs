@@ -46,6 +46,9 @@ are being established before promotion to
       output through a perspective transform, producing the RGBA stream for
       one display. Layouts are described with
       [`wall-geometry`](utils/wall-geometry/).
+    - [`glwallwarp`](video/wallwarp/README.md#glwallwarp): The same warp on the
+      GPU through OpenGL, taking and giving any raw format in system or GL
+      memory.
 
 ## Tools
 

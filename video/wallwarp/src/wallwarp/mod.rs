@@ -1,5 +1,6 @@
 use gst::glib;
 use gst::prelude::*;
+use wall_geometry::{Homography, Quad};
 
 mod imp;
 mod warp;
@@ -20,6 +21,19 @@ pub enum Interpolation {
         nick = "bilinear"
     )]
     Bilinear = 1,
+}
+
+/// A quad from its property text, checked to have a perspective transform.
+pub(crate) fn parse_quad(text: &str) -> Result<Quad, String> {
+    let quad = text.parse::<Quad>().map_err(|err| err.to_string())?;
+    Homography::unit_square_to_quad(&quad).map_err(|err| err.to_string())?;
+    Ok(quad)
+}
+
+/// Big-endian ARGB to RGBA bytes.
+pub(crate) fn rgba(argb: u32) -> [u8; 4] {
+    let [a, r, g, b] = argb.to_be_bytes();
+    [r, g, b, a]
 }
 
 glib::wrapper! {

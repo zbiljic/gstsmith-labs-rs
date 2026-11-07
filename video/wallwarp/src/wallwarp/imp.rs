@@ -9,8 +9,8 @@ use gst_video::prelude::*;
 use gst_video::subclass::prelude::*;
 use wall_geometry::{Homography, Quad};
 
-use super::Interpolation;
 use super::warp::{Plane, PlaneMut, Warp};
+use super::{Interpolation, parse_quad, rgba};
 
 const DEFAULT_QUAD: &str = "0,0,1,0,1,1,0,1";
 const DEFAULT_OUTPUT_SIZE: u32 = 0;
@@ -90,18 +90,6 @@ pub struct WallWarp {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn parse_quad(text: &str) -> Result<Quad, String> {
-    let quad = text.parse::<Quad>().map_err(|err| err.to_string())?;
-    Homography::unit_square_to_quad(&quad).map_err(|err| err.to_string())?;
-    Ok(quad)
-}
-
-/// Big-endian ARGB to RGBA bytes.
-fn rgba(argb: u32) -> [u8; 4] {
-    let [a, r, g, b] = argb.to_be_bytes();
-    [r, g, b, a]
 }
 
 /// A fixed dimension, or any dimension when `value` is zero.
