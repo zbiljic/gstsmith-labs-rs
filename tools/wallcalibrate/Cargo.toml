@@ -13,7 +13,7 @@ publish = false
 [dependencies]
 anyhow = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png"] }
-kornia-apriltag = "0.1.10"
+kornia-apriltag = "0.2.0"
 kornia-image = "0.1.10"
 serde = { workspace = true }
 serde_json = { workspace = true }
