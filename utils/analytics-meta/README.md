@@ -28,6 +28,17 @@ A schema-tagged JSON document stored as an Mtd in
   layout or adding a callback renames the impl to `x-json-2` and the slot key
   to `.v2`, together.
 
+## Segmentation
+
+`segmentation::add` attaches a full-frame binary GRAY8 mask as a
+`SegmentationMtd` (region 0 background, region 1 foreground), and
+`segmentation::mask` returns an owned reference to a mask buffer.
+Dimensions, pixels and strides are validated before FFI; tests exercise deep
+copies and buffer lifetimes. Replace this module with the upstream safe
+binding when one exists.
+
+## Tests
+
 `fixtures/` holds two test-only plugin libraries. Their test loads both with
 `gst::Plugin::load_file`, races the first use of the type from two threads in
 fresh processes, and exchanges documents in both directions. It also seeds

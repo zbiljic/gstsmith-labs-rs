@@ -141,8 +141,8 @@ Fixed prompts have no source detection. BiRefNet produces semantic metadata
 with class `foreground` and unknown confidence (-1).
 
 Consumers use standard analytics metadata, including `segmentationoverlay`.
-The small [segmentation-meta](../../utils/segmentation-meta/) crate supplies the
-safe binding missing from gstreamer-analytics 0.25.4. Its isolated FFI boundary
+The [analytics-meta](../../utils/analytics-meta/) crate supplies the safe
+segmentation binding missing from gstreamer-analytics 0.25.4. Its isolated FFI boundary
 owns mask buffers correctly across carrier copies; plugin crates retain their
 `unsafe_code = forbid` policy.
 
@@ -151,7 +151,7 @@ owns mask buffers correctly across carrier copies; plugin crates retain their
 Ordinary tests run without external assets:
 
 ```sh
-cargo test --locked -p gst-plugin-usls -p segmentation-meta --all-targets
+cargo test --locked -p gst-plugin-usls -p analytics-meta --all-targets
 mise run //analytics/usls:inspect
 ```
 

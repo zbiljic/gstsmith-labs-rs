@@ -4,6 +4,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+use analytics_meta::segmentation;
 use anyhow::{Context, Result, ensure};
 use gst::{glib, prelude::*};
 use gst_analytics::prelude::*;
@@ -526,7 +527,7 @@ fn attach_metadata(
     };
     for region in regions {
         ensure!(region.score.is_finite(), "invalid segmentation confidence");
-        let mask = segmentation_meta::add(&mut relation, region.pixels, width, height, semantic)?;
+        let mask = segmentation::add(&mut relation, region.pixels, width, height, semantic)?;
         let class = relation
             .add_cls_mtd(
                 &[-1.0, region.score],
@@ -720,7 +721,7 @@ mod tests {
                 .context("meta")?;
             let masks = meta
                 .iter::<gst_analytics::AnalyticsAnyMtd>()
-                .filter_map(|m| segmentation_meta::mask(&meta, m.id()).map(|b| (m.id(), b)))
+                .filter_map(|m| segmentation::mask(&meta, m.id()).map(|b| (m.id(), b)))
                 .collect::<Vec<_>>();
             ensure!(
                 masks.len() == usize::from(label.is_some()),

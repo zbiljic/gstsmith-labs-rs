@@ -1,3 +1,4 @@
+use analytics_meta::segmentation;
 use anyhow::{Context, Result, ensure};
 use gst::prelude::*;
 use gst_analytics::prelude::*;
@@ -116,7 +117,7 @@ fn real_segmentation() -> Result<()> {
                 .context("segmentation metadata")?;
             let masks = meta
                 .iter::<gst_analytics::AnalyticsAnyMtd>()
-                .filter_map(|m| segmentation_meta::mask(&meta, m.id()).map(|mask| (m.id(), mask)))
+                .filter_map(|m| segmentation::mask(&meta, m.id()).map(|mask| (m.id(), mask)))
                 .collect::<Vec<_>>();
             ensure!(!masks.is_empty(), "sample must yield segmentation masks");
             let prompted =
@@ -328,7 +329,7 @@ fn every_family_executes_its_native_contract_and_preserves_prompt_relations() ->
             .context("meta")?;
         let masks = meta
             .iter::<gst_analytics::AnalyticsAnyMtd>()
-            .filter_map(|m| segmentation_meta::mask(&meta, m.id()).map(|mask| (m.id(), mask)))
+            .filter_map(|m| segmentation::mask(&meta, m.id()).map(|mask| (m.id(), mask)))
             .collect::<Vec<_>>();
         ensure!(!masks.is_empty(), "{profile}: expected masks");
         for (id, mask) in &masks {
@@ -405,7 +406,7 @@ fn prompt_budget_fixed_override_and_empty_frames() -> Result<()> {
             .context("meta")?;
         let masks = meta
             .iter::<gst_analytics::AnalyticsAnyMtd>()
-            .filter(|m| segmentation_meta::mask(&meta, m.id()).is_some())
+            .filter(|m| segmentation::mask(&meta, m.id()).is_some())
             .collect::<Vec<_>>();
         ensure!(masks.len() == expected, "prompt source and memory budget");
         if prompt.is_some() {

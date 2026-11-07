@@ -24,6 +24,7 @@ import_library = false
 requires_private = "gstreamer-1.0 >= 1.28, gstreamer-base-1.0 >= 1.28, gstreamer-video-1.0 >= 1.28, gstreamer-analytics-1.0 >= 1.28, gobject-2.0, glib-2.0, gmodule-2.0"
 
 [dependencies]
+analytics-meta = { path = "../../utils/analytics-meta" }
 anyhow = { workspace = true }
 gst = { workspace = true, features = ["v1_28"] }
 gst-analytics = { workspace = true }
@@ -31,7 +32,6 @@ gst-base = { workspace = true, features = ["v1_28"] }
 gst-video = { workspace = true, features = ["v1_28"] }
 image = { workspace = true }
 ort = { workspace = true }
-segmentation-meta = { path = "../../utils/segmentation-meta" }
 usls = { workspace = true }
 
 # Non-macOS platforms reject CoreML before session creation. Cargo still forwards

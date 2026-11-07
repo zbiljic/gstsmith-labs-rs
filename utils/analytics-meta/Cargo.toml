@@ -1,7 +1,7 @@
 [package]
 name = "analytics-meta"
 version = { workspace = true }
-description = "Safe GStreamer 1.28 analytics metadata bridges: JSON documents shared across plugins."
+description = "Safe GStreamer 1.28 analytics metadata bridges: shared JSON documents and segmentation."
 authors = { workspace = true }
 edition = { workspace = true }
 rust-version = { workspace = true }
@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 gst = { workspace = true }
 gst-analytics = { workspace = true }
+gst-video = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
