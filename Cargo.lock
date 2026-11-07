@@ -1234,6 +1234,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gst-plugin-relationmeta"
+version = "0.1.0"
+dependencies = [
+ "analytics-meta",
+ "anyhow",
+ "gst-plugin-version-helper",
+ "gstreamer",
+ "gstreamer-analytics",
+ "gstreamer-base",
+ "gstreamer-check",
+]
+
+[[package]]
 name = "gst-plugin-usls"
 version = "0.1.0"
 dependencies = [

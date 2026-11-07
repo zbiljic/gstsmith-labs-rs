@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "analytics/nalsense",
+    "analytics/relationmeta",
     "analytics/usls",
     "generic/jsontap",
     "generic/ptssampler",
