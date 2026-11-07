@@ -29,6 +29,13 @@ are being established before promotion to
       dormant, then replay it and resume live forwarding when activity wakes
       the gate.
 
+  - [`relationmeta`](analytics/relationmeta/): Events and overlays from
+    analytics relation metadata of any producer.
+    - `relationmetaevents`: Emit presence, count, track and classification
+      events with time- and frame-based hysteresis.
+    - `relationmetaoverlay`: Draw boxes, outlines, relation arrows, labels,
+      text and captions in the style of the Cactus web demo.
+
   - [`usls`](analytics/usls/): Inference elements powered by
     [usls](https://github.com/jamjamjon/usls).
     - [`uslsobjectdetect`](analytics/usls/OBJECT_DETECTION.md): Supports compatible RF-DETR,
