@@ -645,7 +645,7 @@ fn covering_crops_follow_the_canvas() {
     )
     .expect("clip");
     let measurement = std::sync::Arc::default();
-    let player = Player::start(
+    let mut player = Player::start(
         &two_displays(),
         &PlayerOptions {
             source: clip,
@@ -684,7 +684,7 @@ fn playing_on_a_new_layout(fill: Fill) {
         &Resolver::default(),
     )
     .expect("clip");
-    let player = Player::start(
+    let mut player = Player::start(
         &layout,
         &PlayerOptions {
             source: clip,
@@ -742,17 +742,200 @@ fn playing_on_a_new_layout(fill: Fill) {
         assert_eq!(*code, frame_number(*pts, 30) % framecode::MODULUS);
         assert!(matches!((size.width, size.height), (320, 180) | (180, 320)));
     }
-    // Another stream size needs a new pipeline.
-    let resized = Layout::from_json(
-        &two_displays()
-            .to_json()
-            .expect("JSON")
-            .replace(r#""width": 320"#, r#""width": 160"#)
-            .replace(r#""height": 180"#, r#""height": 90"#),
+}
+
+/// The size of the next frame from display `id`.
+fn frame_size(player: &Player, id: &str) -> Size {
+    let sink = player
+        .pipeline()
+        .by_name(&format!("sink-{id}"))
+        .expect("sink");
+    pull(&sink).2
+}
+
+fn preview_size(player: &Player, id: &str) -> Option<(u32, u32)> {
+    let sample = player
+        .preview_sink(id)?
+        .property::<Option<gst::Sample>>("last-sample")?;
+    let info = gst_video::VideoInfo::from_caps(sample.caps()?).ok()?;
+    Some((info.width(), info.height()))
+}
+
+#[test]
+fn stream_sizes_change_while_playing() {
+    init();
+    let measurement = std::sync::Arc::default();
+    let mut player = Player::start(
+        &two_displays(),
+        &options(),
+        &measurement,
+        Clock::new(),
+        |_| {},
     )
-    .expect("layout");
+    .expect("player");
+    let pipeline = player.pipeline().clone();
+    let left = pipeline.by_name("warp-left").expect("warp");
+    let new_size = Size {
+        width: 240,
+        height: 136,
+    };
+    assert_eq!(
+        frame_size(&player, "left"),
+        Size {
+            width: 320,
+            height: 180
+        }
+    );
+    let mut resized = two_displays();
+    resized.screens.first_mut().expect("left").output = new_size;
     assert_ne!(resized, two_displays());
-    assert!(!player.update_layout(&resized, fill));
+    assert!(player.update_layout(&resized, Fill::default()));
+    let route = player.route("left").expect("left");
+    assert_eq!(route.output, new_size);
+    assert_eq!(route.code, CodeGeometry::for_output(240, 136));
+    assert!(eventually(10, || frame_size(&player, "left") == new_size));
+    assert!(eventually(10, || preview_size(&player, "left") == Some((240, 136))));
+    // The same elements play on, and the other display is untouched.
+    assert_eq!(pipeline.by_name("warp-left").as_ref(), Some(&left));
+    assert_eq!(player.source_status().restarts, 0);
+    assert_eq!(
+        frame_size(&player, "right"),
+        Size {
+            width: 180,
+            height: 320
+        }
+    );
+    // Frame codes follow the new size.
+    player.set_measuring(true);
+    for (pts, (code, size)) in coded_frames(player.pipeline(), &["left", "right"], 5)
+        .iter()
+        .flatten()
+    {
+        assert_eq!(*code, frame_number(*pts, 30) % framecode::MODULUS);
+        assert!(*size == new_size || size.width == 180);
+    }
+}
+
+#[test]
+fn stream_sizes_change_under_running_frames() {
+    init();
+    let measurement = std::sync::Arc::default();
+    let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reported = std::sync::Arc::clone(&failures);
+    let mut player = Player::start(
+        &two_displays(),
+        &options(),
+        &measurement,
+        Clock::new(),
+        move |event| {
+            if let player::PlayerEvent::Failed(error) = event {
+                reported.lock().expect("failures").push(error);
+            }
+        },
+    )
+    .expect("player");
+    assert_eq!(frame_size(&player, "left").width, 320);
+    // Each change meets frames of the previous size already on their way.
+    let mut layout = two_displays();
+    let mut size = Size {
+        width: 320,
+        height: 180,
+    };
+    for step in 0..60 {
+        size = Size {
+            width: 240 + 8 * (step % 2),
+            height: 136,
+        };
+        layout.screens.first_mut().expect("left").output = size;
+        assert!(player.update_layout(&layout, Fill::default()));
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    assert!(
+        eventually(10, || frame_size(&player, "left") == size),
+        "frames stopped"
+    );
+    assert_eq!(*failures.lock().expect("failures"), Vec::<String>::new());
+}
+
+/// `two_displays()` with a third display, or without "right".
+fn with_third() -> Layout {
+    let mut layout = two_displays();
+    let mut third = layout.screens.first().expect("left").clone();
+    "third".clone_into(&mut third.id);
+    layout.screens.insert(1, third);
+    layout
+}
+
+fn without_right() -> Layout {
+    let mut layout = two_displays();
+    layout.screens.retain(|screen| screen.id != "right");
+    layout
+}
+
+#[test]
+fn displays_come_and_go_while_playing() {
+    init();
+    for audio in [false, true] {
+        let measurement = std::sync::Arc::default();
+        let mut player = Player::start(
+            &two_displays(),
+            &PlayerOptions { audio, ..options() },
+            &measurement,
+            Clock::new(),
+            |_| {},
+        )
+        .expect("player");
+        let pipeline = player.pipeline().clone();
+        let left = pipeline.by_name("sink-left").expect("sink");
+        assert!(eventually(10, || player.pipeline().current_state()
+            == gst::State::Playing));
+        let hears = |id: &str| {
+            let sink = pipeline.by_name(&format!("sound-{id}")).expect("sound");
+            sink.emit_by_name::<Option<gst::Sample>>(
+                "try-pull-sample",
+                &[&gst::ClockTime::from_seconds(5)],
+            )
+            .is_some()
+        };
+
+        // A third display joins, between the two in layout order.
+        assert!(player.update_layout(&with_third(), Fill::default()));
+        let order: Vec<_> = player.routes().iter().map(|route| &route.display).collect();
+        assert_eq!(order, ["left", "third", "right"]);
+        let route = player.route("third").expect("third");
+        assert_eq!(route.output, player.route("left").expect("left").output);
+        assert_eq!(
+            route.generation,
+            player.route("left").expect("left").generation
+        );
+        assert_eq!(frame_size(&player, "third").width, 320);
+        assert!(eventually(10, || preview_size(&player, "third").is_some()));
+        assert!(!audio || hears("third"));
+
+        // One leaves; the rest play on.
+        assert!(player.update_layout(&without_right(), Fill::default()));
+        assert!(player.route("right").is_none());
+        assert!(pipeline.by_name("sink-right").is_none());
+        assert!(pipeline.by_name("warp-right").is_none());
+        assert!(pipeline.by_name("sound-right").is_none());
+        assert!(player.route("third").is_none());
+        assert_eq!(frame_size(&player, "left").width, 320);
+
+        // It can come back at once, as its old elements are out of the way.
+        assert!(player.update_layout(&two_displays(), Fill::default()));
+        assert_eq!(frame_size(&player, "right").height, 320);
+        assert!(!audio || hears("right"));
+        assert_eq!(pipeline.by_name("sink-left").as_ref(), Some(&left));
+        // The new branches report nothing wrong, and frames carry codes.
+        player.set_measuring(true);
+        coded_frames(player.pipeline(), &["left", "right"], 3);
+
+        // No displays at all needs a new pipeline.
+        let mut empty = two_displays();
+        empty.screens.clear();
+        assert!(!player.update_layout(&empty, Fill::default()));
+        assert!(player.route("left").is_some());
+    }
 }
 
 #[test]

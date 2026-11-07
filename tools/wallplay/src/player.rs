@@ -7,7 +7,9 @@
 //! standby ! identity ! videoconvert ! videoscale ! RGBA canvas ! selector.
 //! audiotestsrc wave=silence ! clocksync ! sound.   (with audio)
 //! input-selector name=selector ! tee
-//!   tee. ! queue ! wallwarp ! webrtcsink meta="meta,display=<id>"   (per display)
+//!   tee. ! queue ! wallwarp ! capsfilter ! tee   (per display)
+//!     tee. ! queue ! webrtcsink meta="meta,display=<id>"
+//!     tee. ! queue ! videorate ! videoscale ! capsfilter ! fakesink   (preview)
 //! input-selector name=sound ! tee
 //!   tee. ! queue ! webrtcsink's audio input   (per display, with audio)
 //! ```
@@ -19,6 +21,13 @@
 //! growing delay, and one that ends restarts if asked to, so clips loop and
 //! streams reconnect. Built-in patterns skip `videorate` and `clocksync`,
 //! which only files and other sources need, and which add latency.
+//!
+//! Displays come and go with the layout: each has a branch of its own, added
+//! to and removed from the running pipeline, so the others keep their
+//! streams. A display's stream size is the caps of the `capsfilter` after its
+//! `wallwarp`, which changes width and height as one step; `webrtcsink`
+//! accepts that without a new WebRTC negotiation, its encoders start again
+//! at the new size, and browsers follow.
 //!
 //! With audio, every display's stream carries the sound of what shows, or
 //! silence for the standby and for sources without sound: `webrtcsink`
@@ -261,58 +270,155 @@ fn free_port(host: &str, start: u16, taken: &[u16]) -> Option<u16> {
 pub struct Player {
     pipeline: gst::Pipeline,
     inputs: Arc<Inputs>,
+    /// In layout order.
     routes: Vec<Route>,
-    /// Every display's warp, in layout order.
-    warps: Vec<Warp>,
+    branches: Vec<Branch>,
+    /// Feeds every display's branch.
+    tee: gst::Element,
+    /// Feeds every display's sound, if there is sound.
+    sound_tee: Option<gst::Element>,
+    generation: u32,
+    fps: u32,
+    sink: Sink,
     measuring: Arc<AtomicBool>,
     drawing: Arc<AtomicBool>,
+    measurement: Arc<Mutex<Measurement>>,
+    clock: Clock,
     /// When a browser last started a session.
     last_consumer: Arc<Mutex<Option<Instant>>>,
     bus_thread: Option<JoinHandle<()>>,
 }
 
-/// A display's `wallwarp` and the quad it takes next.
-struct Warp {
+/// A quad and the canvas size it is for.
+type PendingQuad = Arc<Mutex<Option<(Size, String)>>>;
+
+/// One display's elements in the pipeline.
+struct Branch {
     display: String,
-    element: gst::Element,
+    warp: gst::Element,
     /// A quad for another canvas size, taken when frames of that size
     /// arrive, so no frame is warped with the other canvas's quad.
-    pending: Arc<Mutex<Option<(Size, String)>>>,
+    pending: PendingQuad,
+    /// Gives the warp's output the display's size.
+    output: gst::Element,
+    /// Gives the preview its size.
+    preview: gst::Element,
+    /// The `tee` pads feeding the branch.
+    feeds: Vec<gst::Pad>,
+    /// Upstream elements first.
+    elements: Vec<gst::Element>,
 }
 
-impl Warp {
-    fn install(element: &gst::Element, display: &str) -> Result<Self> {
-        let pending: Arc<Mutex<Option<(Size, String)>>> = Arc::default();
-        let waiting = Arc::clone(&pending);
-        let warp = element.downgrade();
-        element
-            .static_pad("sink")
-            .context("wallwarp has no sink pad")?
-            .add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-                if let Some(gst::PadProbeData::Event(event)) = &info.data
-                    && let gst::EventView::Caps(caps) = event.view()
-                    && let Ok(video) = gst_video::VideoInfo::from_caps(caps.caps())
+/// Have `warp` take a quad queued in the returned slot once frames of the
+/// quad's canvas size reach it.
+fn follow_canvas(warp: &gst::Element) -> Result<PendingQuad> {
+    let pending = PendingQuad::default();
+    let waiting = Arc::clone(&pending);
+    let element = warp.downgrade();
+    warp.static_pad("sink")
+        .context("wallwarp has no sink pad")?
+        .add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(gst::PadProbeData::Event(event)) = &info.data
+                && let gst::EventView::Caps(caps) = event.view()
+                && let Ok(video) = gst_video::VideoInfo::from_caps(caps.caps())
+            {
+                let mut waiting = lock(&waiting);
+                let size = Size {
+                    width: video.width(),
+                    height: video.height(),
+                };
+                if let Some((canvas, quad)) = waiting.take_if(|(canvas, _)| *canvas == size)
+                    && let Some(warp) = element.upgrade()
                 {
-                    let mut waiting = lock(&waiting);
-                    let size = Size {
-                        width: video.width(),
-                        height: video.height(),
-                    };
-                    if let Some((canvas, quad)) = waiting.take_if(|(canvas, _)| *canvas == size)
-                        && let Some(warp) = warp.upgrade()
-                    {
-                        gst::debug!(gst::CAT_DEFAULT, "new quad for {canvas:?}");
-                        warp.set_property("quad", quad);
-                    }
+                    gst::debug!(gst::CAT_DEFAULT, "new quad for {canvas:?}");
+                    warp.set_property("quad", quad);
                 }
-                gst::PadProbeReturn::Ok
-            });
-        Ok(Self {
-            display: display.to_owned(),
-            element: element.clone(),
-            pending,
-        })
+            }
+            gst::PadProbeReturn::Ok
+        });
+    Ok(pending)
+}
+
+/// Let frames of another size through to `webrtcsink`, whose inputs accept
+/// them but answer caps queries with the current caps alone, which would
+/// fail any renegotiation upstream. `pad` is what feeds the input.
+fn allow_new_sizes(pad: &gst::Pad) {
+    pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_pad, info| {
+        let Some(gst::PadProbeData::Query(query)) = info.data.as_mut() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        match query.view_mut() {
+            gst::QueryViewMut::Caps(query) => {
+                let caps = query.filter_owned().unwrap_or_else(gst::Caps::new_any);
+                query.set_result(&caps);
+                gst::PadProbeReturn::Handled
+            }
+            gst::QueryViewMut::AcceptCaps(query) => {
+                query.set_result(true);
+                gst::PadProbeReturn::Handled
+            }
+            _ => gst::PadProbeReturn::Ok,
+        }
+    });
+}
+
+/// A `capsfilter` whose caps change while playing. Frames of the previous
+/// caps may already be on their way to it, and with the default mode it would
+/// refuse them, stopping the stream for good.
+fn size_filter(caps: gst::Caps) -> Result<gst::Element> {
+    Ok(gst::ElementFactory::make("capsfilter")
+        .property("caps", caps)
+        .property_from_str("caps-change-mode", "delayed")
+        .build()?)
+}
+
+/// Caps giving a warp's output the size `output`.
+fn output_caps(output: Size) -> Result<gst::Caps> {
+    Ok(gst_video::VideoCapsBuilder::new()
+        .format(gst_video::VideoFormat::Rgba)
+        .width(i32::try_from(output.width)?)
+        .height(i32::try_from(output.height)?)
+        .build())
+}
+
+/// Caps of the preview of a display of size `output`.
+fn preview_caps(output: Size) -> gst::Caps {
+    let longest = output.width.max(output.height).max(1);
+    let even = |value: u32| {
+        let scaled = u64::from(value) * u64::from(PREVIEW_PIXELS.min(longest)) / u64::from(longest);
+        i32::try_from((scaled / 2 * 2).max(2)).unwrap_or(2)
+    };
+    gst_video::VideoCapsBuilder::new()
+        .format(gst_video::VideoFormat::Rgba)
+        .width(even(output.width))
+        .height(even(output.height))
+        .build()
+}
+
+/// How long a `tee` may take to finish pushing to a branch being removed.
+const DETACH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Unlink and release a `tee`'s pad between two buffers.
+fn detach(pad: &gst::Pad) -> Result<()> {
+    let (done, wait) = mpsc::channel();
+    pad.add_probe(gst::PadProbeType::IDLE, move |pad, _info| {
+        if let Some(peer) = pad.peer()
+            && pad.unlink(&peer).is_err()
+        {
+            gst::warning!(gst::CAT_DEFAULT, "could not unlink {}", pad.name());
+        }
+        // The caller may have stopped waiting.
+        if done.send(()).is_err() {
+            gst::info!(gst::CAT_DEFAULT, "a branch detached after its timeout");
+        }
+        gst::PadProbeReturn::Remove
+    });
+    wait.recv_timeout(DETACH_TIMEOUT)
+        .context("a branch did not detach in time")?;
+    if let Some(tee) = pad.parent_element() {
+        tee.release_request_pad(pad);
     }
+    Ok(())
 }
 
 fn make(factory: &str) -> Result<gst::Element> {
@@ -1714,8 +1820,9 @@ impl Inputs {
 struct Stamper {
     display: String,
     fps: u32,
-    info: gst_video::VideoInfo,
-    code: CodeGeometry,
+    /// The current frames' layout and where their code goes, or `None`
+    /// before the first caps and when frames are too small for a code.
+    frames: Mutex<Option<(gst_video::VideoInfo, CodeGeometry)>>,
     measuring: Arc<AtomicBool>,
     /// Whether to draw the frame code, for browsers that cannot tell frames
     /// apart by their RTP timestamps.
@@ -1725,27 +1832,20 @@ struct Stamper {
 }
 
 impl Stamper {
-    /// Record when `warp`'s output for `screen` leaves it while measuring,
-    /// drawing its frame code if asked; returns where the code goes, or `None`
-    /// when the output is too small for it.
+    /// Record when `warp`'s output for display `display` leaves it while
+    /// measuring, drawing its frame code if asked.
     fn install(
         warp: &gst::Element,
-        screen: &Screen,
+        display: &str,
         fps: u32,
         (measuring, drawing): (&Arc<AtomicBool>, &Arc<AtomicBool>),
         measurement: &Arc<Mutex<Measurement>>,
         clock: Clock,
-    ) -> Result<Option<CodeGeometry>> {
-        let (width, height) = (screen.output.width, screen.output.height);
-        let Some(code) = CodeGeometry::for_output(width, height) else {
-            return Ok(None);
-        };
+    ) -> Result<()> {
         let stamper = Self {
-            display: screen.id.clone(),
+            display: display.to_owned(),
             fps,
-            info: gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgba, width, height)
-                .build()?,
-            code,
+            frames: Mutex::new(None),
             measuring: Arc::clone(measuring),
             drawing: Arc::clone(drawing),
             measurement: Arc::clone(measurement),
@@ -1754,19 +1854,39 @@ impl Stamper {
         let pad = warp
             .static_pad("src")
             .context("wallwarp has no source pad")?;
-        pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
-            if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
-                stamper.stamp(pad, buffer);
-            }
-            gst::PadProbeReturn::Ok
+        pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+            move |pad, info| {
+                match info.data.as_mut() {
+                    Some(gst::PadProbeData::Buffer(buffer)) => stamper.stamp(pad, buffer),
+                    Some(gst::PadProbeData::Event(event)) => {
+                        if let gst::EventView::Caps(caps) = event.view() {
+                            stamper.follow(caps.caps());
+                        }
+                    }
+                    _ => {}
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+        Ok(())
+    }
+
+    fn follow(&self, caps: &gst::CapsRef) {
+        *lock(&self.frames) = gst_video::VideoInfo::from_caps(caps).ok().and_then(|info| {
+            let code = CodeGeometry::for_output(info.width(), info.height())?;
+            Some((info, code))
         });
-        Ok(Some(code))
     }
 
     fn stamp(&self, pad: &gst::Pad, buffer: &mut gst::Buffer) {
         if !self.measuring.load(Ordering::Relaxed) {
             return;
         }
+        let frames = lock(&self.frames);
+        let Some((info, code)) = frames.as_ref() else {
+            return;
+        };
         let Some(running) = buffer.pts().and_then(|pts| {
             let segment = pad.sticky_event::<gst::event::Segment>(0)?;
             segment
@@ -1787,7 +1907,7 @@ impl Stamper {
         });
         if self.drawing.load(Ordering::Relaxed) {
             let Ok(mut video) =
-                gst_video::VideoFrameRef::from_buffer_ref_writable(buffer.make_mut(), &self.info)
+                gst_video::VideoFrameRef::from_buffer_ref_writable(buffer.make_mut(), info)
             else {
                 return;
             };
@@ -1798,7 +1918,7 @@ impl Stamper {
             let (Some(stride), Ok(pixels)) = (stride, video.plane_data_mut(0)) else {
                 return;
             };
-            framecode::stamp(pixels, stride, &self.code, frame);
+            framecode::stamp(pixels, stride, code, frame);
         }
         lock(&self.measurement).stamped(&self.display, frame, self.clock.now_ms(), delay);
     }
@@ -1832,61 +1952,15 @@ impl Player {
             .build()?;
         pipeline.add_many([&selector, &tee])?;
         selector.link(&tee)?;
-        let mut routes: Vec<Route> = Vec::new();
-        let mut warps = Vec::new();
-        for screen in &layout.screens {
-            let (width, height) = (screen.output.width, screen.output.height);
-            let queue = gst::ElementFactory::make("queue")
-                .property("max-size-buffers", 2_u32)
-                .property("max-size-bytes", 0_u32)
-                .property("max-size-time", 0_u64)
-                .property_from_str("leaky", "downstream")
-                .build()?;
-            let warp = gst::ElementFactory::make("wallwarp")
-                .name(format!("warp-{}", screen.id))
-                .property("quad", layout.source_quad(screen).to_string())
-                .property("output-width", width)
-                .property("output-height", height)
-                .build()
-                .context("creating wallwarp")?;
-            let (sink, endpoint) =
-                Self::display_sink(&screen.id, generation, &routes, options, &last_consumer)?;
-            // The warped output goes to the display and, a few times a
-            // second and scaled down, to a preview for the control page.
-            let split = make("tee")?;
-            let to_sink = make("queue")?;
-            let preview = Self::preview_branch(&screen.id, screen.output)?;
-            pipeline.add_many([&queue, &warp, &split, &to_sink, &sink])?;
-            pipeline.add_many(&preview)?;
-            tee.link(&queue)?;
-            gst::Element::link_many([&queue, &warp, &split, &to_sink, &sink])?;
-            split.link(preview.first().context("empty preview branch")?)?;
-            gst::Element::link_many(&preview)?;
-            let code = Stamper::install(
-                &warp,
-                screen,
-                options.fps,
-                (&measuring, &drawing),
-                measurement,
-                clock,
-            )?;
-            warps.push(Warp::install(&warp, &screen.id)?);
-            routes.push(Route {
-                display: screen.id.clone(),
-                output: screen.output,
-                endpoint,
-                generation,
-                code,
-            });
-        }
-        let sound = options
-            .audio
-            .then(|| Self::sound(&pipeline, &routes, &options.sink))
-            .transpose()?;
+        let sound = options.audio.then(|| Self::sound(&pipeline)).transpose()?;
+        let (sound_selector, sound_tee) = match sound {
+            Some((selector, pad, tee)) => (Some((selector, pad)), Some(tee)),
+            None => (None, None),
+        };
         let inputs = Arc::new(Inputs::new(
             &pipeline,
             selector,
-            sound,
+            sound_selector,
             layout.canvas,
             options,
         )?);
@@ -1896,16 +1970,26 @@ impl Player {
         let bus_thread = std::thread::Builder::new()
             .name("wallplay-bus".to_owned())
             .spawn(move || Self::watch(&bus, &watched, &events))?;
-        let player = Self {
+        let mut player = Self {
             pipeline,
             inputs,
-            routes,
-            warps,
+            routes: Vec::new(),
+            branches: Vec::new(),
+            tee,
+            sound_tee,
+            generation,
+            fps: options.fps,
+            sink: options.sink.clone(),
             measuring,
             drawing,
+            measurement: Arc::clone(measurement),
+            clock,
             last_consumer,
             bus_thread: Some(bus_thread),
         };
+        for screen in &layout.screens {
+            player.add_display(layout, screen)?;
+        }
         player
             .pipeline
             .set_state(gst::State::Playing)
@@ -1918,14 +2002,146 @@ impl Player {
         Ok(player)
     }
 
+    /// Add `screen`'s branch to the pipeline, playing or not. The branch is
+    /// linked from its end to its start, so frames find it ready.
+    fn add_display(&mut self, layout: &Layout, screen: &Screen) -> Result<()> {
+        let id = screen.id.as_str();
+        let queue = gst::ElementFactory::make("queue")
+            .property("max-size-buffers", 2_u32)
+            .property("max-size-bytes", 0_u32)
+            .property("max-size-time", 0_u64)
+            .property_from_str("leaky", "downstream")
+            .build()?;
+        let warp = gst::ElementFactory::make("wallwarp")
+            .name(format!("warp-{id}"))
+            .property("quad", layout.source_quad(screen).to_string())
+            .build()
+            .context("creating wallwarp")?;
+        let output = size_filter(output_caps(screen.output)?)?;
+        let (sink, endpoint) = self.display_sink(id)?;
+        // The warped output goes to the display and, a few times a second
+        // and scaled down, to a preview for the control page.
+        let split = make("tee")?;
+        let to_sink = make("queue")?;
+        let (preview, preview_filter) = Self::preview_branch(id, screen.output)?;
+        let mut elements = vec![
+            queue.clone(),
+            warp.clone(),
+            output.clone(),
+            split.clone(),
+            to_sink.clone(),
+            sink.clone(),
+        ];
+        elements.extend(preview.iter().cloned());
+        self.pipeline.add_many(&elements)?;
+        gst::Element::link_many([&queue, &warp, &output, &split, &to_sink, &sink])?;
+        split.link(preview.first().context("empty preview branch")?)?;
+        gst::Element::link_many(&preview)?;
+        if matches!(self.sink, Sink::WebRtc(_)) {
+            allow_new_sizes(
+                &to_sink
+                    .static_pad("src")
+                    .context("queue has no source pad")?,
+            );
+        }
+        Stamper::install(
+            &warp,
+            id,
+            self.fps,
+            (&self.measuring, &self.drawing),
+            &self.measurement,
+            self.clock,
+        )?;
+        let pending = follow_canvas(&warp)?;
+        let mut feeds = Vec::new();
+        let mut sound_queue = None;
+        if let Some(tee) = &self.sound_tee {
+            let queue = make("queue")?;
+            let input = Self::sound_input(&self.pipeline, id, &self.sink)?;
+            self.pipeline.add(&queue)?;
+            queue
+                .static_pad("src")
+                .context("queue has no source pad")?
+                .link(&input)?;
+            elements.insert(0, queue.clone());
+            elements.extend(self.pipeline.by_name(&format!("sound-{id}")));
+            sound_queue = Some((tee.clone(), queue));
+        }
+        for element in elements.iter().rev() {
+            element.sync_state_with_parent()?;
+        }
+        let feed = |tee: &gst::Element, queue: &gst::Element| -> Result<gst::Pad> {
+            let pad = tee
+                .request_pad_simple("src_%u")
+                .context("tee has no output to give")?;
+            pad.link(&queue.static_pad("sink").context("queue has no sink pad")?)?;
+            Ok(pad)
+        };
+        if let Some((tee, queue)) = &sound_queue {
+            feeds.push(feed(tee, queue)?);
+        }
+        feeds.push(feed(&self.tee, &queue)?);
+        self.branches.push(Branch {
+            display: id.to_owned(),
+            warp,
+            pending,
+            output,
+            preview: preview_filter,
+            feeds,
+            elements,
+        });
+        self.routes.push(Route {
+            display: id.to_owned(),
+            output: screen.output,
+            endpoint,
+            generation: self.generation,
+            code: CodeGeometry::for_output(screen.output.width, screen.output.height),
+        });
+        Ok(())
+    }
+
+    /// Take display `display` out of the pipeline, stopping its elements in
+    /// the background: a `webrtcsink` can take its time, as [`Player::stop`]
+    /// says, and the other displays keep playing meanwhile.
+    fn remove_display(&mut self, display: &str) -> Result<()> {
+        self.routes.retain(|route| route.display != display);
+        let Some(index) = self
+            .branches
+            .iter()
+            .position(|branch| branch.display == display)
+        else {
+            return Ok(());
+        };
+        let branch = self.branches.swap_remove(index);
+        for pad in &branch.feeds {
+            detach(pad)?;
+        }
+        self.pipeline.remove_many(&branch.elements)?;
+        let wait = self.settle_time();
+        std::thread::Builder::new()
+            .name("wallplay-branch-teardown".to_owned())
+            .spawn(move || {
+                std::thread::sleep(wait);
+                for element in &branch.elements {
+                    if element.set_state(gst::State::Null).is_err() {
+                        gst::warning!(gst::CAT_DEFAULT, "{} did not stop", element.name());
+                    }
+                }
+            })?;
+        Ok(())
+    }
+
+    /// How long until no session can still be negotiating.
+    fn settle_time(&self) -> Duration {
+        lock(&self.last_consumer).map_or(Duration::ZERO, |connected| {
+            SETTLE.saturating_sub(connected.elapsed())
+        })
+    }
+
     /// Silence, the selector that picks between it and the inputs' sound,
-    /// and a branch from it to the sink of every display in `routes`;
-    /// returns the selector and where the silence joins it.
-    fn sound(
-        pipeline: &gst::Pipeline,
-        routes: &[Route],
-        kind: &Sink,
-    ) -> Result<(gst::Element, gst::Pad)> {
+    /// and the `tee` after it; returns the selector, where the silence joins
+    /// it, and the `tee`.
+    fn sound(pipeline: &gst::Pipeline) -> Result<(gst::Element, gst::Pad, gst::Element)> {
         // Paced like a clip rather than live: a live source would raise the
         // latency every sink waits for.
         let silence = gst::ElementFactory::make("audiotestsrc")
@@ -1954,17 +2170,7 @@ impl Player {
             .context("clocksync has no source pad")?
             .link(&pad)?;
         selector.set_property("active-pad", &pad);
-        for route in routes {
-            let queue = make("queue")?;
-            let input = Self::sound_input(pipeline, &route.display, kind)?;
-            pipeline.add(&queue)?;
-            tee.link(&queue)?;
-            queue
-                .static_pad("src")
-                .context("queue has no source pad")?
-                .link(&input)?;
-        }
-        Ok((selector, pad))
+        Ok((selector, pad, tee))
     }
 
     /// Where display `id`'s sound goes: the audio input of its `webrtcsink`,
@@ -1991,20 +2197,11 @@ impl Player {
     }
 
     /// Elements scaling a display's output down to a preview, ending in a
-    /// `fakesink` named `preview-<id>` that keeps the latest frame.
-    fn preview_branch(id: &str, output: Size) -> Result<Vec<gst::Element>> {
-        let longest = output.width.max(output.height).max(1);
-        let even = |value: u32| {
-            let scaled =
-                u64::from(value) * u64::from(PREVIEW_PIXELS.min(longest)) / u64::from(longest);
-            i32::try_from((scaled / 2 * 2).max(2)).unwrap_or(2)
-        };
-        let caps = gst_video::VideoCapsBuilder::new()
-            .format(gst_video::VideoFormat::Rgba)
-            .width(even(output.width))
-            .height(even(output.height))
-            .build();
-        Ok(vec![
+    /// `fakesink` named `preview-<id>` that keeps the latest frame; returns
+    /// them and the `capsfilter` giving the preview its size.
+    fn preview_branch(id: &str, output: Size) -> Result<(Vec<gst::Element>, gst::Element)> {
+        let filter = size_filter(preview_caps(output))?;
+        let elements = vec![
             gst::ElementFactory::make("queue")
                 .property("max-size-buffers", 1_u32)
                 .property_from_str("leaky", "downstream")
@@ -2014,37 +2211,31 @@ impl Player {
                 .property("max-rate", PREVIEW_RATE)
                 .build()?,
             make("videoscale")?,
-            gst::ElementFactory::make("capsfilter")
-                .property("caps", caps)
-                .build()?,
+            filter.clone(),
             gst::ElementFactory::make("fakesink")
                 .name(format!("preview-{id}"))
                 .property("sync", false)
                 .property("async", false)
                 .property("enable-last-sample", true)
                 .build()?,
-        ])
+        ];
+        Ok((elements, filter))
     }
 
-    /// The sink of display `id`, on a signalling port none of `routes` has,
-    /// noting in `last_consumer` when a browser connects to it.
-    fn display_sink(
-        id: &str,
-        generation: u32,
-        routes: &[Route],
-        options: &PlayerOptions,
-        last_consumer: &Arc<Mutex<Option<Instant>>>,
-    ) -> Result<(gst::Element, Endpoint)> {
-        let taken: Vec<u16> = routes
+    /// The sink of display `id`, on a signalling port no route has, noting
+    /// when a browser connects to it.
+    fn display_sink(&self, id: &str) -> Result<(gst::Element, Endpoint)> {
+        let taken: Vec<u16> = self
+            .routes
             .iter()
             .filter_map(|route| match route.endpoint {
                 Endpoint::Port(port) => Some(port),
                 _ => None,
             })
             .collect();
-        let (sink, endpoint) = Self::sink(id, generation, &taken, &options.sink)?;
+        let (sink, endpoint) = Self::sink(id, self.generation, &taken, &self.sink)?;
         if matches!(endpoint, Endpoint::Port(_) | Endpoint::Uri(_)) {
-            let last_consumer = Arc::clone(last_consumer);
+            let last_consumer = Arc::clone(&self.last_consumer);
             sink.connect("consumer-added", false, move |_| {
                 *lock(&last_consumer) = Some(Instant::now());
                 None
@@ -2066,6 +2257,7 @@ impl Player {
                     .property("max-buffers", 4_u32)
                     .property("drop", true)
                     .property("sync", false)
+                    .property("async", false)
                     .build()?;
                 Ok((sink, Endpoint::None))
             }
@@ -2172,18 +2364,30 @@ impl Player {
     }
 
     /// Play `layout`, filling its canvas as `fill` says, without restarting
-    /// the pipeline, if it has the same displays with the same output sizes.
-    /// Returns whether it could; otherwise the player needs a restart, since
-    /// a display's stream changes size.
+    /// the pipeline: displays that stay keep their streams, also through a
+    /// change of size, and displays leave and join. Returns whether that
+    /// worked; otherwise the player needs a restart.
     #[must_use = "when false, the player needs a restart to play the layout"]
-    pub fn update_layout(&self, layout: &Layout, fill: Fill) -> bool {
-        let same_displays = layout.screens.len() == self.routes.len()
-            && layout.screens.iter().all(|screen| {
-                self.route(&screen.id)
-                    .is_some_and(|route| route.output == screen.output)
-            });
-        if !same_displays {
-            return false;
+    pub fn update_layout(&mut self, layout: &Layout, fill: Fill) -> bool {
+        match self.apply_layout(layout, fill) {
+            Ok(()) => true,
+            Err(error) => {
+                gst::warning!(gst::CAT_DEFAULT, "could not change the layout: {error:#}");
+                false
+            }
+        }
+    }
+
+    fn apply_layout(&mut self, layout: &Layout, fill: Fill) -> Result<()> {
+        ensure!(!layout.screens.is_empty(), "the layout has no displays");
+        let leaving: Vec<String> = self
+            .routes
+            .iter()
+            .map(|route| route.display.clone())
+            .filter(|display| layout.screen(display).is_none())
+            .collect();
+        for display in &leaving {
+            self.remove_display(display)?;
         }
         let canvas = Canvas {
             size: layout.canvas,
@@ -2192,23 +2396,51 @@ impl Player {
         };
         let resized = lock(&self.inputs.canvas).size != canvas.size;
         for screen in &layout.screens {
-            let Some(warp) = self.warps.iter().find(|warp| warp.display == screen.id) else {
+            let Some(branch) = self
+                .branches
+                .iter()
+                .find(|branch| branch.display == screen.id)
+            else {
+                self.add_display(layout, screen)?;
                 continue;
             };
             let quad = layout.source_quad(screen).to_string();
-            let mut pending = lock(&warp.pending);
-            if resized {
-                *pending = Some((canvas.size, quad));
-            } else {
-                *pending = None;
-                drop(pending);
-                warp.element.set_property("quad", quad);
+            {
+                let mut pending = lock(&branch.pending);
+                if resized {
+                    *pending = Some((canvas.size, quad));
+                } else {
+                    *pending = None;
+                    drop(pending);
+                    branch.warp.set_property("quad", quad);
+                }
+            }
+            if let Some(route) = self
+                .routes
+                .iter_mut()
+                .find(|route| route.display == screen.id)
+                && route.output != screen.output
+            {
+                branch
+                    .preview
+                    .set_property("caps", preview_caps(screen.output));
+                branch
+                    .output
+                    .set_property("caps", output_caps(screen.output)?);
+                route.output = screen.output;
+                route.code = CodeGeometry::for_output(screen.output.width, screen.output.height);
             }
         }
+        self.routes.sort_by_key(|route| {
+            layout
+                .screens
+                .iter()
+                .position(|screen| screen.id == route.display)
+        });
         if *lock(&self.inputs.canvas) != canvas {
             self.inputs.reshape(canvas);
         }
-        true
+        Ok(())
     }
 
     /// Play `source` from now on, without restarting the pipeline: the
@@ -2284,14 +2516,7 @@ impl Player {
         let teardown = std::thread::Builder::new()
             .name("wallplay-teardown".to_owned())
             .spawn(move || {
-                let settled = self
-                    .last_consumer
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .map(|connected| SETTLE.saturating_sub(connected.elapsed()));
-                if let Some(wait) = settled {
-                    std::thread::sleep(wait);
-                }
+                std::thread::sleep(self.settle_time());
                 drop(self);
                 // The caller may have stopped waiting.
                 if stopped.send(()).is_err() {

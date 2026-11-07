@@ -225,13 +225,19 @@ raised that latency by its 21.3 ms buffer, the video's too.
   scales it in with black bars. Test patterns are drawn at the canvas size and
   always fill it.
 
-A new layout for the same displays, with the same stream sizes, applies while
-playing: each display's `wallwarp` takes its new corners with the first frame
-of the new canvas size, the source is converted to that size in place, so a
-clip does not start over, and the browsers keep their streams. Test patterns
-restart at the new size, and so does a source whose **Video** fill changed. A
-layout that adds or leaves out a display, or changes a display's stream size,
-restarts playback.
+A new layout applies while playing, and playback does not restart:
+
+- Each display's `wallwarp` takes its new corners with the first frame of the
+  new canvas size, and the source is converted to that size in place, so a
+  clip does not start over. Test patterns restart at the new size, and so does
+  a source whose **Video** fill changed.
+- A display whose stream size changed keeps its WebRTC connection: its encoder
+  starts again at the new size, and the browser follows from the next key
+  frame.
+- A display the layout leaves out goes back to waiting, and one it adds starts
+  a stream of its own. The other displays keep their connections, though they
+  can pause briefly while a new display's stream starts: its codec discovery
+  and first encoder compete with theirs for the CPU.
 
 ## Simulation
 
@@ -241,8 +247,8 @@ camera saw: what the camera would see from where the photo was taken. A
 viewpoint layout continues lines across gaps from there; straightening or a
 planar layout of displays that are not quite in one plane shows where it
 does not. Previews come from the playback pipeline, scaled to 480 pixels and
-at most four frames per second, so the displays must be playing; a layout
-change restarts playback, and the simulation follows within seconds.
+at most four frames per second, so the displays must be playing; the
+simulation follows a new layout within seconds.
 
 ## Signalling
 
@@ -463,9 +469,7 @@ screenshots.
 
 ## Limitations
 
-- One source and one layout at a time. A layout that changes a display's
-  stream size, or adds or leaves out a display, restarts playback, and every
-  browser reconnects.
+- One source and one layout at a time.
 - Sound plays on one display, and every display's video waits for it; WHEP
   sources play without it.
 - No local cameras or screen capture; a camera on the network plays over

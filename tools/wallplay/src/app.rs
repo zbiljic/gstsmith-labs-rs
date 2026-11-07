@@ -926,16 +926,24 @@ impl App {
         });
         state.fill = request.fill;
         if state.show == Show::Play {
-            // The running pipeline takes a layout for the same displays and
-            // stream sizes; the browsers keep their streams.
-            let updated = match (&state.player, &state.layout) {
-                (Some(player), Some(layout)) => player.update_layout(&layout.layout, state.fill),
+            // The running pipeline takes the layout: the browsers of
+            // displays that stay keep their streams, and the others hear
+            // from the next command.
+            let State {
+                player,
+                layout,
+                fill,
+                ..
+            } = &mut *state;
+            let updated = match (player, layout) {
+                (Some(player), Some(layout)) => player.update_layout(&layout.layout, *fill),
                 _ => false,
             };
             if !updated {
                 drop(state);
                 return self.play();
             }
+            self.bump(&mut state);
         }
         Ok(self.status_locked(&state))
     }

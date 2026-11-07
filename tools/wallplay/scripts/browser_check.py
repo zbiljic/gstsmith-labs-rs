@@ -11,8 +11,8 @@ one display page per headless Chromium browser (one landscape, one
 portrait), and runs the whole workflow through the HTTP API: patterns, a
 synthetic photo of the displays from `wallcalibrate synth`, calibration,
 layout, WebRTC playback through webrtcsink, the control page's simulation,
-drift measurement, changing the layout and the source while playing, and
-aligning a display made late on purpose. Prints the measurement summary as JSON and exits
+drift measurement, changing the layout, stream sizes, the displays, and the
+source while playing, and aligning a display made late on purpose. Prints the measurement summary as JSON and exits
 non-zero when a step fails. With `--signalling-server`, every display uses
 one external `gst-webrtc-signalling-server` instead of its sink's built-in
 server; with `--buffer`, the browsers get that jitter buffer target while
@@ -200,6 +200,124 @@ def sound(api, control, pages, directory):
     print("moved the sound without reconnecting, and turned it off", file=sys.stderr)
 
 
+STREAM_JS = """async () => {
+    window.firstPeer ??= stream?.pc;
+    const reports = [...(await stream?.pc?.getStats() ?? new Map()).values()];
+    const inbound = reports.find(report => report.type === "inbound-rtp" && report.kind === "video");
+    return {
+        mode: document.body.className,
+        same_peer: Boolean(stream?.pc) && window.firstPeer === stream.pc,
+        size: [video.videoWidth, video.videoHeight],
+        connection: stream?.pc?.connectionState,
+        received: inbound?.packetsReceived,
+        decoded: inbound?.framesDecoded,
+        key_frames: inbound?.keyFramesDecoded,
+        dropped: inbound?.framesDropped,
+        frame_size: [inbound?.frameWidth, inbound?.frameHeight],
+        player: document.querySelector("#status")?.textContent,
+    };
+}"""
+
+
+def wait_stream(what, page, check, timeout=30):
+    """Wait until `check` holds for a page's stream report."""
+    deadline = time.monotonic() + timeout
+    while True:
+        report = page.evaluate(STREAM_JS)
+        if check(report):
+            return report
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"timed out waiting for {what}: {report}")
+        time.sleep(0.25)
+
+
+GAP_JS = """() => {
+    window.frameGap = 0;
+    if (window.watchingGaps) return;
+    window.watchingGaps = true;
+    let last = performance.now();
+    const presented = now => {
+        window.frameGap = Math.max(window.frameGap, now - last);
+        last = now;
+        video.requestVideoFrameCallback(presented);
+    };
+    video.requestVideoFrameCallback(presented);
+}"""
+
+
+def changed(api, pages, what, change, ready):
+    """Make `change`, wait for `ready`, and report the longest any display in
+    `pages` went without presenting a frame, then that they play on."""
+    for page in pages.values():
+        page.evaluate(GAP_JS)
+    change()
+    ready()
+    # Let a stream that just started or changed size settle before counting.
+    time.sleep(2)
+    api.call("POST", "/api/measure", {"on": True})
+    time.sleep(4)
+    displays = api.call("GET", "/api/measure")["summary"]["displays"]
+    gaps = {display: page.evaluate("window.frameGap") for display, page in pages.items()}
+    for display in displays:
+        if display["frames"] < 30:
+            raise RuntimeError(f"{display['id']} stopped presenting after {what}: {display}")
+    print(f"{what} while playing:", ", ".join(f"{d['id']} {d['frames']} frames" for d in displays),
+          "; longest gap", ", ".join(f"{display} {gap:.0f} ms" for display, gap in gaps.items()), file=sys.stderr)
+    return gaps
+
+
+def live_changes(api, pages):
+    """Change a stream's size and take a display out and back while playing:
+    the other display, and the resized one, keep their WebRTC connections."""
+    original = api.call("GET", "/api/calibration")
+    before = generations_of(api.call("GET", "/api/state"))
+
+    def apply(calibration, **options):
+        api.call("PUT", "/api/calibration", calibration)
+        api.call("POST", "/api/layout", {"mode": "viewpoint", "canvas": {"longest": 1280}, **options})
+
+    def edited(*changes):
+        calibration = json.loads(json.dumps(original))
+        for screen in calibration["screens"]:
+            for change in changes:
+                change(screen)
+        return calibration
+
+    def shrink_left(screen):
+        if screen["id"] == "left":
+            screen["output"] = {"width": 480, "height": 270}
+
+    def drop_right(screen):
+        if screen["id"] == "right":
+            screen["corners"] = None
+            screen["status"] = "missing"
+
+    left, right = pages["left"], pages["right"]
+    for page in pages.values():
+        page.evaluate("window.firstPeer = undefined")
+        page.evaluate(STREAM_JS)
+    changed(api, pages, "resizing a stream",
+            lambda: apply(edited(shrink_left)),
+            lambda: wait_stream("the smaller stream", left, lambda report: report["size"] == [480, 270]))
+    changed(api, {"left": left}, "a display leaving",
+            lambda: apply(edited(shrink_left, drop_right), allow_incomplete=True),
+            lambda: wait_stream("the display to leave", right, lambda report: report["mode"] == "idle"))
+    if len(api.call("GET", "/api/state")["player"]["routes"]) != 1:
+        raise RuntimeError("the display that left still has a route")
+    changed(api, {"left": left}, "a display joining",
+            lambda: apply(edited(shrink_left)),
+            lambda: wait_stream("the display to return", right, lambda report:
+                                report["mode"] == "play" and report["size"] == list(DISPLAYS["right"])))
+    changed(api, pages, "a stream growing",
+            lambda: apply(original),
+            lambda: wait_stream("the larger stream", left, lambda report: report["size"] == list(DISPLAYS["left"])))
+    report = left.evaluate(STREAM_JS)
+    if not report["same_peer"]:
+        raise RuntimeError(f"the left display reconnected: {report}")
+    if generations_of(api.call("GET", "/api/state")) != before:
+        raise RuntimeError("changing the displays restarted the pipeline")
+
+
 def run(args, directory):
     port = free_port()
     signalling = free_port(len(DISPLAYS))
@@ -313,6 +431,8 @@ def run(args, directory):
                 raise RuntimeError("a new layout for the same displays restarted the pipeline")
             print("new layout while playing:", ", ".join(f"{d['id']} {d['frames']} frames" for d in relaid),
                   file=sys.stderr)
+
+            live_changes(api, pages)
 
             # Recovery: a display reloads its page, then playing again restarts
             # the pipeline under every display; both must present frames again.

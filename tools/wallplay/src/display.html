@@ -164,8 +164,8 @@ function apply(next) {
   current = text;
   command = next;
   const sameStream = previous?.mode === "play" && next.mode === "play"
-    && JSON.stringify([previous.endpoint, previous.generation, previous.output])
-      === JSON.stringify([next.endpoint, next.generation, next.output]);
+    && JSON.stringify([previous.endpoint, previous.generation])
+      === JSON.stringify([next.endpoint, next.generation]);
   if (!sameStream) {
     stream?.close();
     stream = null;
