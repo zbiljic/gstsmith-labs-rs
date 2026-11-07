@@ -3,7 +3,7 @@
 //! `videoconvertscale` uses. `ODMtd` boxes are rescaled; `x-*` documents are
 //! copied unchanged, which is why they hold only normalized coordinates.
 
-use analytics_meta::{json, schema};
+use analytics_meta::{json, record, schema};
 use anyhow::{Context, Result, ensure};
 use gst::glib;
 use gst_analytics::prelude::*;
@@ -144,5 +144,32 @@ fn format_conversion_keeps_documents() -> Result<()> {
         frame()?,
     )?;
     ensure!(check(&output)? == (8, 8, 16, 24));
+    Ok(())
+}
+
+#[test]
+fn record_names_documents_after_a_transform() -> Result<()> {
+    let output = run(
+        r#"videoconvertscale ! capsfilter caps="video/x-raw,width=32,height=24""#,
+        frame()?,
+    )?;
+    let meta = output.meta::<AnalyticsRelationMeta>().context("meta")?;
+    let record = record::relation_meta(&meta);
+    let schemas: Vec<_> = record["mtds"]
+        .as_array()
+        .context("mtds")?
+        .iter()
+        .filter_map(|mtd| mtd["schema"].as_str())
+        .collect();
+    ensure!(
+        schemas
+            == [
+                "x-polygon",
+                "x-relation",
+                "x-caption",
+                "example/detector/record"
+            ],
+        "{schemas:?}"
+    );
     Ok(())
 }

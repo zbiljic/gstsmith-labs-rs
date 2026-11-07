@@ -4,11 +4,13 @@
 //!   plugin in the process.
 //! - [`schema`]: generic `x-*` documents (polygons, relation predicates,
 //!   captions, text, provenance) and their relation conventions.
+//! - [`record`]: a JSON record of a whole relation meta.
 //! - [`segmentation`]: binary GRAY8 segmentation masks.
 
 use std::sync::LazyLock;
 
 pub mod json;
+pub mod record;
 pub mod schema;
 pub mod segmentation;
 

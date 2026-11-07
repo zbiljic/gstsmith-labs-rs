@@ -57,6 +57,14 @@ a buffer is copied, usually by an in-place element making a shared buffer
 writable (fixed in 1.28.3); documents survive, but the documents under a
 dropped box lose their link to it.
 
+## Recording
+
+`record::relation_meta` turns a relation meta into JSON: every Mtd with its
+upstream type name and type-specific fields, its outgoing relations and, for
+`JsonMtd`, its schema and parsed JSON (keys sorted, numbers normalized, no
+value lost; `f32` fields at `f32` precision). Unknown Mtd types are recorded
+by name only.
+
 ## Segmentation
 
 `segmentation::add` attaches a full-frame binary GRAY8 mask as a

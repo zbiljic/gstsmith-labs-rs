@@ -70,6 +70,32 @@ pub fn add(
     Ok(unsafe { result.assume_init() }.id)
 }
 
+/// Marker type for upstream segmentation Mtds, usable with the
+/// `gstreamer-analytics` iteration API.
+#[derive(Debug)]
+pub enum SegmentationMtd {}
+
+// SAFETY: the type comes from upstream's own segmentation Mtd registration.
+unsafe impl gst_analytics::AnalyticsMtd for SegmentationMtd {
+    fn mtd_type() -> ffi::GstAnalyticsMtdType {
+        // SAFETY: a plain getter of a static upstream impl address.
+        unsafe { ffi::gst_analytics_segmentation_mtd_get_mtd_type() }
+    }
+}
+
+/// Where a segmentation mask applies and which region ids it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentationInfo {
+    /// Masked area in frame pixels.
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    /// Mask buffer size, from its `VideoMeta`, if it has one.
+    pub mask_size: Option<(u32, u32)>,
+    pub region_ids: Vec<u32>,
+}
+
 fn handle(
     meta: &gst::MetaRef<'_, AnalyticsRelationMeta>,
     id: u32,
@@ -106,6 +132,46 @@ pub fn mask(meta: &gst::MetaRef<'_, AnalyticsRelationMeta>, id: u32) -> Option<g
     unsafe { from_glib_full(buffer) }
 }
 
+/// Reads a segmentation Mtd's location, mask size and region ids.
+#[must_use]
+pub fn info(meta: &gst::MetaRef<'_, AnalyticsRelationMeta>, id: u32) -> Option<SegmentationInfo> {
+    let handle = handle(meta, id)?;
+    let (mut x, mut y, mut width, mut height) = (0, 0, 0, 0);
+    // SAFETY: the handle is valid for the borrowed meta and every out-pointer
+    // is a live local; the returned buffer owns a reference.
+    let buffer = unsafe {
+        ffi::gst_analytics_segmentation_mtd_get_mask(
+            &raw const handle,
+            &raw mut x,
+            &raw mut y,
+            &raw mut width,
+            &raw mut height,
+        )
+    };
+    // SAFETY: get_mask transfers a full reference (or null), adopted exactly once.
+    let buffer: Option<gst::Buffer> = unsafe { from_glib_full(buffer) };
+    let mask_size = buffer
+        .as_ref()
+        .and_then(|buffer| buffer.meta::<gst_video::VideoMeta>())
+        .map(|video| (video.width(), video.height()));
+    // SAFETY: as above.
+    let count = unsafe { ffi::gst_analytics_segmentation_mtd_get_region_count(&raw const handle) };
+    let region_ids = (0..count)
+        // SAFETY: as above; every index is below the region count.
+        .map(|index| unsafe {
+            ffi::gst_analytics_segmentation_mtd_get_region_id(&raw const handle, index)
+        })
+        .collect();
+    Some(SegmentationInfo {
+        x,
+        y,
+        width,
+        height,
+        mask_size,
+        region_ids,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +189,18 @@ mod tests {
         drop(original);
         let meta = copied.meta::<AnalyticsRelationMeta>().expect("meta");
         assert!(mask(&meta, id + 100).is_none());
+        assert_eq!(
+            info(&meta, id),
+            Some(SegmentationInfo {
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 2,
+                mask_size: Some((3, 2)),
+                region_ids: vec![0, 1],
+            })
+        );
+        assert_eq!(info(&meta, id + 100), None);
         let mask = mask(&meta, id).expect("mask");
         assert_eq!(
             mask.map_readable().expect("readable").as_slice(),
