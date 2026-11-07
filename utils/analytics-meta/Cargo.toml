@@ -18,3 +18,7 @@ serde_json = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+anyhow = { workspace = true }
+gst-check = { workspace = true }

@@ -59,8 +59,10 @@ dependencies = [
 name = "analytics-meta"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gstreamer",
  "gstreamer-analytics",
+ "gstreamer-check",
  "gstreamer-video",
  "serde",
  "serde_json",

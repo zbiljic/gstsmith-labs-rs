@@ -28,6 +28,35 @@ A schema-tagged JSON document stored as an Mtd in
   layout or adding a callback renames the impl to `x-json-2` and the slot key
   to `.v2`, together.
 
+## Generic `x-*` documents
+
+`schema` writes and reads model-agnostic documents for what GStreamer 1.28
+has no Mtd type for. A consumer that reads only these and the standard Mtds
+works with any producer that writes them.
+
+| Schema | Attached to | Content |
+| --- | --- | --- |
+| `x-polygon` | an `ODMtd`, `CONTAIN` and `IS_PART_OF` | `{"rings": [[x, y, ...], ...]}`, normalized 0..1 |
+| `x-relation` | its own node: subject `RELATE_TO` node `RELATE_TO` object | `{"predicate": "holding"}`; the direct subject `RELATE_TO` object edge is kept too |
+| `x-caption` | the frame | `{"text": "..."}` |
+| `x-text` | an `ODMtd` labelled `text-line`, `CONTAIN` and `IS_PART_OF` | `{"string": "...", "score": 0.7}` |
+| `x-provenance` | the frame | `{"pts": ..., "running-time": ..., "producer": "..."}` |
+
+No document stores Mtd ids: upstream's transforms renumber ids but copy
+relation edges, so predicates live in their own nodes. Upstream's
+`set_relation` assigns a cell, so the writers OR their relation into what is
+already there. Per-object documents normally hang under an `ODMtd`, but any
+Mtd may contain them; polygon coordinates up to 0.001 outside 0..1 are
+clamped, anything further is rejected. Documents are copied
+unchanged while `ODMtd` boxes are rescaled, which is why polygons use
+normalized coordinates. Frame documents are found by schema. Writers check
+ids first, so a failed call leaves no orphan document. Tests run real
+`videoconvertscale` and `videoconvert` transforms and writable copies.
+GStreamer 1.28.0 to 1.28.2 drop every `ODMtd`, and with it its edges, when
+a buffer is copied, usually by an in-place element making a shared buffer
+writable (fixed in 1.28.3); documents survive, but the documents under a
+dropped box lose their link to it.
+
 ## Segmentation
 
 `segmentation::add` attaches a full-frame binary GRAY8 mask as a
