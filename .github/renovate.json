@@ -30,6 +30,18 @@
     {
       "matchManagers": ["cargo"],
       "rangeStrategy": "bump"
+    },
+    {
+      "description": ["Wait for CI before creating usls PRs"],
+      "matchManagers": ["cargo"],
+      "matchDepNames": ["usls"],
+      "prCreation": "status-success"
+    },
+    {
+      "description": ["Update ort only with usls"],
+      "matchManagers": ["cargo"],
+      "matchDepNames": ["ort"],
+      "enabled": false
     }
   ]
 }
