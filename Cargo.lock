@@ -513,7 +513,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -686,7 +686,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1206,7 +1206,7 @@ version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "147daed7579da33611245e7e3bfbc71e13098f8ab63b6b12d2c243c065775aee"
 dependencies = [
- "kornia-image",
+ "kornia-image 0.1.14",
  "kornia-imgproc",
  "thiserror",
 ]
@@ -1217,7 +1217,19 @@ version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be96e08b0a366771510e8e3c113dd432491ca30b6a94f8cb9e804de4bb33cfec"
 dependencies = [
- "kornia-tensor",
+ "kornia-tensor 0.1.14",
+ "num-traits",
+ "rayon",
+ "thiserror",
+]
+
+[[package]]
+name = "kornia-image"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7baeb89055e61de6ca0580e9dd04893052ff4da619836f993dd7ec998b4a128b"
+dependencies = [
+ "kornia-tensor 0.2.0",
  "num-traits",
  "rayon",
  "thiserror",
@@ -1230,8 +1242,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a23243158114ac4e1416050c372d6cee59e75c3d528c9bf6a4a477a9775bd67"
 dependencies = [
  "kornia-algebra",
- "kornia-image",
- "kornia-tensor",
+ "kornia-image 0.1.14",
+ "kornia-tensor 0.1.14",
  "num-traits",
  "rayon",
  "thiserror",
@@ -1243,6 +1255,17 @@ name = "kornia-tensor"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6c8de4d7b5972bf6c2756f663d483a588a4c2ba5f74f6fe87ec93bfc694f81b"
+dependencies = [
+ "num-traits",
+ "rayon",
+ "thiserror",
+]
+
+[[package]]
+name = "kornia-tensor"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e7dc445092435019b0fe1599c95ab4c23aa17f1a8a092403c08765cf059d06a"
 dependencies = [
  "num-traits",
  "rayon",
@@ -2014,7 +2037,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2261,7 +2284,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2514,7 +2537,7 @@ dependencies = [
  "anyhow",
  "image",
  "kornia-apriltag",
- "kornia-image",
+ "kornia-image 0.2.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -2659,7 +2682,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
