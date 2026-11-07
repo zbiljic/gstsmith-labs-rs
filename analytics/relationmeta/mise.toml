@@ -1,0 +1,23 @@
+[tasks.build]
+description = "Build the relationmeta plugin"
+depends = []
+dir = "{{config_root}}/../.."
+run = "cargo build --locked -p gst-plugin-relationmeta"
+
+[tasks.inspect]
+description = "Build and inspect both relationmeta elements"
+depends = ["build"]
+dir = "{{config_root}}/../.."
+run = '''
+export GST_PLUGIN_PATH="$PWD/target/debug${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+gst-inspect-1.0 relationmetaevents
+gst-inspect-1.0 relationmetaoverlay
+'''
+
+[tasks.demo]
+description = "Render a demo-style overlay frame to RELATIONMETA_DEMO_PNG"
+dir = "{{config_root}}/../.."
+run = '''
+: "${RELATIONMETA_DEMO_PNG:?RELATIONMETA_DEMO_PNG must name the PNG to write}"
+cargo test --locked -p gst-plugin-relationmeta --test relationmetaoverlay demo -- --ignored
+'''
