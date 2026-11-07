@@ -1638,7 +1638,7 @@ dependencies = [
  "faer",
  "kiddo",
  "kornia-algebra",
- "kornia-image 0.2.0",
+ "kornia-image",
  "kornia-imgproc",
  "log",
  "nalgebra",
@@ -1668,22 +1668,10 @@ checksum = "2d5d97c995fbb5e732aa1bf2ab00008f0dacbb7e6a1964ddcffc7d74be8629f5"
 dependencies = [
  "kornia-3d",
  "kornia-algebra",
- "kornia-image 0.2.0",
+ "kornia-image",
  "kornia-imgproc",
  "rayon",
  "rustc-hash",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "kornia-image"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be96e08b0a366771510e8e3c113dd432491ca30b6a94f8cb9e804de4bb33cfec"
-dependencies = [
- "kornia-tensor 0.1.14",
- "num-traits",
- "rayon",
  "thiserror 2.0.21",
 ]
 
@@ -1693,7 +1681,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7baeb89055e61de6ca0580e9dd04893052ff4da619836f993dd7ec998b4a128b"
 dependencies = [
- "kornia-tensor 0.2.0",
+ "kornia-tensor",
  "num-traits",
  "rayon",
  "thiserror 2.0.21",
@@ -1706,23 +1694,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eeca083d17c225e16b40dde8153d00e846a655c9d250e8690ce6a9ee22070cb"
 dependencies = [
  "kornia-algebra",
- "kornia-image 0.2.0",
- "kornia-tensor 0.2.0",
+ "kornia-image",
+ "kornia-tensor",
  "num-traits",
  "rayon",
  "thiserror 2.0.21",
  "wide",
-]
-
-[[package]]
-name = "kornia-tensor"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6c8de4d7b5972bf6c2756f663d483a588a4c2ba5f74f6fe87ec93bfc694f81b"
-dependencies = [
- "num-traits",
- "rayon",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3455,7 +3432,7 @@ dependencies = [
  "anyhow",
  "image",
  "kornia-apriltag",
- "kornia-image 0.1.14",
+ "kornia-image",
  "serde",
  "serde_json",
  "tempfile",

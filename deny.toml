@@ -33,3 +33,8 @@ allow = ["BSD-2-Clause"]
 [[licenses.exceptions]]
 name = "v_frame"
 allow = ["BSD-2-Clause"]
+
+# Verified BSD 2-Clause notice in the Kornia AprilTag transitive dependency.
+[[licenses.exceptions]]
+name = "atomic-wait"
+allow = ["BSD-2-Clause"]

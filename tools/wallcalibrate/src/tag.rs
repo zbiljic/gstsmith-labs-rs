@@ -26,7 +26,9 @@ pub const TAG_COUNT: usize = CODE_DATA.len();
 /// A rendered tag, row-major, `true` for white.
 pub type Cells = [[bool; TAG_CELLS]; TAG_CELLS];
 
-static FAMILY_TABLES: LazyLock<TagFamily> = LazyLock::new(TagFamily::tag36_h11);
+#[expect(clippy::expect_used, reason = "built-in tag36h11 tables are valid")]
+static FAMILY_TABLES: LazyLock<TagFamily> =
+    LazyLock::new(|| TagFamily::tag36_h11().expect("built-in tag36h11 tables are valid"));
 
 /// The cells of `tag`, or `None` beyond [`TAG_COUNT`].
 ///
