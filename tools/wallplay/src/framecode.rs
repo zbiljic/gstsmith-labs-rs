@@ -7,7 +7,8 @@
 //! opposite, so a reader compares the two blocks instead of guessing a
 //! threshold, and rejects a column whose blocks are too alike, as in a frame
 //! blurred by compression. Browsers read the code in `display.html`; [`read`]
-//! does the same for tests.
+//! does the same for tests. Codes go into RGBA frames, or into the luma of
+//! I420 frames over neutral chroma.
 
 use serde::Serialize;
 
@@ -56,20 +57,47 @@ impl CodeGeometry {
     }
 }
 
-/// Draw `frame` modulo [`MODULUS`] into packed RGBA pixels with rows `stride`
-/// bytes apart.
-pub fn stamp(pixels: &mut [u8], stride: usize, geometry: &CodeGeometry, frame: u64) {
-    let block = geometry.block as usize;
+/// How the pixels a code is drawn into are laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Packing {
+    /// Four bytes per pixel: red, green, blue and alpha.
+    Rgba,
+    /// One byte of luma per pixel, as in the Y plane of I420.
+    Luma,
+}
+
+impl Packing {
+    const fn bytes(self) -> usize {
+        match self {
+            Self::Rgba => 4,
+            Self::Luma => 1,
+        }
+    }
+}
+
+/// Draw `frame` modulo [`MODULUS`] into pixels packed as `packing`, with
+/// rows `stride` bytes apart.
+pub fn stamp(
+    pixels: &mut [u8],
+    stride: usize,
+    packing: Packing,
+    geometry: &CodeGeometry,
+    frame: u64,
+) {
+    let (block, bytes) = (geometry.block as usize, packing.bytes());
     for bit in 0..geometry.bits {
         let one = (frame >> (geometry.bits - 1 - bit)) & 1 == 1;
         for bottom in [false, true] {
             let value = if one == bottom { 0 } else { 255 };
             let (x, y) = geometry.block_origin(bit, bottom);
             for row in y..y + block {
-                let start = row * stride + x * 4;
-                if let Some(span) = pixels.get_mut(start..start + block * 4) {
-                    for pixel in span.as_chunks_mut::<4>().0 {
-                        *pixel = [value, value, value, 255];
+                let start = row * stride + x * bytes;
+                if let Some(span) = pixels.get_mut(start..start + block * bytes) {
+                    match packing {
+                        Packing::Rgba => {
+                            span.as_chunks_mut::<4>().0.fill([value, value, value, 255]);
+                        }
+                        Packing::Luma => span.fill(value),
                     }
                 }
             }
@@ -77,30 +105,73 @@ pub fn stamp(pixels: &mut [u8], stride: usize, geometry: &CodeGeometry, frame: u
     }
 }
 
+/// Make the chroma under the code neutral, in a plane subsampled by two
+/// both ways as I420's U and V planes are, so its blocks stay black and
+/// white.
+pub fn clear_chroma(chroma: &mut [u8], stride: usize, geometry: &CodeGeometry) {
+    let (left, top) = (geometry.left as usize / 2, geometry.top as usize / 2);
+    let right = (geometry.left + geometry.bits * geometry.block).div_ceil(2) as usize;
+    let bottom = (geometry.top + 2 * geometry.block).div_ceil(2) as usize;
+    for row in top..bottom {
+        if let Some(span) = chroma.get_mut(row * stride + left..row * stride + right) {
+            span.fill(128);
+        }
+    }
+}
+
 /// Mean luma of the middle half of one block, or `None` outside the image.
-fn block_luma(pixels: &[u8], stride: usize, (x, y): (usize, usize), block: usize) -> Option<u32> {
+fn block_luma(
+    pixels: &[u8],
+    stride: usize,
+    packing: Packing,
+    (x, y): (usize, usize),
+    block: usize,
+) -> Option<u32> {
     let (start, end) = (block / 4, block - block / 4);
+    let bytes = packing.bytes();
     let (mut sum, mut count) = (0_u32, 0_u32);
     for row in y + start..y + end {
-        let offset = row * stride + (x + start) * 4;
-        let span = pixels.get(offset..offset + (end - start) * 4)?;
-        for [r, g, b, _] in span.as_chunks::<4>().0 {
-            sum += (u32::from(*r) + u32::from(*g) + u32::from(*b)) / 3;
-            count += 1;
+        let offset = row * stride + (x + start) * bytes;
+        let span = pixels.get(offset..offset + (end - start) * bytes)?;
+        match packing {
+            Packing::Rgba => {
+                for [r, g, b, _] in span.as_chunks::<4>().0 {
+                    sum += (u32::from(*r) + u32::from(*g) + u32::from(*b)) / 3;
+                }
+            }
+            Packing::Luma => sum += span.iter().map(|value| u32::from(*value)).sum::<u32>(),
         }
+        count += u32::try_from(end - start).ok()?;
     }
     sum.checked_div(count)
 }
 
-/// Read a code back from packed RGBA pixels, or `None` if any column is
-/// unreadable.
+/// Read a code back from pixels packed as `packing`, or `None` if any
+/// column is unreadable.
 #[must_use]
-pub fn read(pixels: &[u8], stride: usize, geometry: &CodeGeometry) -> Option<u64> {
+pub fn read(
+    pixels: &[u8],
+    stride: usize,
+    packing: Packing,
+    geometry: &CodeGeometry,
+) -> Option<u64> {
     let block = geometry.block as usize;
     let mut value = 0;
     for bit in 0..geometry.bits {
-        let top = block_luma(pixels, stride, geometry.block_origin(bit, false), block)?;
-        let bottom = block_luma(pixels, stride, geometry.block_origin(bit, true), block)?;
+        let top = block_luma(
+            pixels,
+            stride,
+            packing,
+            geometry.block_origin(bit, false),
+            block,
+        )?;
+        let bottom = block_luma(
+            pixels,
+            stride,
+            packing,
+            geometry.block_origin(bit, true),
+            block,
+        )?;
         if top.abs_diff(bottom) < MIN_CONTRAST {
             return None;
         }
@@ -148,13 +219,16 @@ mod tests {
         let geometry = CodeGeometry::for_output(width, height).expect("fits");
         for fill in [0, 128, 255] {
             for frame in [0, 1, 0x0a5c, MODULUS - 1, MODULUS + 7] {
-                let mut pixels = image(width, height, fill);
-                stamp(&mut pixels, width as usize * 4, &geometry, frame);
-                assert_eq!(
-                    read(&pixels, width as usize * 4, &geometry),
-                    Some(frame % MODULUS),
-                    "frame {frame} over {fill}"
-                );
+                for (packing, bytes) in [(Packing::Rgba, 4), (Packing::Luma, 1)] {
+                    let stride = width as usize * bytes;
+                    let mut pixels = vec![fill; stride * height as usize];
+                    stamp(&mut pixels, stride, packing, &geometry, frame);
+                    assert_eq!(
+                        read(&pixels, stride, packing, &geometry),
+                        Some(frame % MODULUS),
+                        "{packing:?} frame {frame} over {fill}"
+                    );
+                }
             }
         }
     }
@@ -165,7 +239,7 @@ mod tests {
         let stride = width as usize * 4 + 64;
         let geometry = CodeGeometry::for_output(width, height).expect("fits");
         let mut pixels = vec![90; stride * height as usize];
-        stamp(&mut pixels, stride, &geometry, 1234);
+        stamp(&mut pixels, stride, Packing::Rgba, &geometry, 1234);
         // Smear every block's edge pixels, as compression would.
         let block = geometry.block as usize;
         for row in geometry.top as usize..height as usize {
@@ -176,7 +250,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(read(&pixels, stride, &geometry), Some(1234));
+        assert_eq!(read(&pixels, stride, Packing::Rgba, &geometry), Some(1234));
     }
 
     #[test]
@@ -184,8 +258,33 @@ mod tests {
         let (width, height) = (640, 360);
         let geometry = CodeGeometry::for_output(width, height).expect("fits");
         let pixels = image(width, height, 128);
-        assert_eq!(read(&pixels, width as usize * 4, &geometry), None);
-        assert_eq!(read(&pixels[..1000], width as usize * 4, &geometry), None);
+        let stride = width as usize * 4;
+        assert_eq!(read(&pixels, stride, Packing::Rgba, &geometry), None);
+        assert_eq!(
+            read(&pixels[..1000], stride, Packing::Rgba, &geometry),
+            None
+        );
+    }
+
+    #[test]
+    fn chroma_under_codes_turns_neutral() {
+        // An odd-sized block still clears every chroma sample it touches.
+        let geometry = CodeGeometry {
+            bits: 2,
+            block: 3,
+            left: 1,
+            top: 5,
+        };
+        let stride = 8;
+        let mut chroma = vec![7; stride * 8];
+        clear_chroma(&mut chroma, stride, &geometry);
+        for (row, values) in chroma.chunks(stride).enumerate() {
+            for (column, value) in values.iter().enumerate() {
+                // Luma columns 1..7 and rows 5..11 halve to 0..4 and 2..6.
+                let under = (0..4).contains(&column) && (2..6).contains(&row);
+                assert_eq!(*value, if under { 128 } else { 7 }, "({column}, {row})");
+            }
+        }
     }
 
     #[test]

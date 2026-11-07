@@ -21,7 +21,8 @@ pub mod player;
 pub mod source;
 pub mod sync;
 
-/// Register the `wallwarp` element with this process's `GStreamer`.
+/// Register the `wallwarp` and `glwallwarp` elements with this process's
+/// `GStreamer`.
 pub fn register_wallwarp() -> Result<(), gst::glib::BoolError> {
     gstwallwarp::plugin_register_static()
 }

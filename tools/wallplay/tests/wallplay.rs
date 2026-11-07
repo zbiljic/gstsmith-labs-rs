@@ -20,7 +20,7 @@ use wallcalibrate::manifest::Manifest;
 use wallcalibrate::synth::{self, SynthOptions};
 use wallplay::app::{App, Config};
 use wallplay::framecode::{self, CodeGeometry};
-use wallplay::player::{self, Clock, Fill, Player, PlayerOptions, Sink, frame_number};
+use wallplay::player::{self, Clock, Fill, Player, PlayerOptions, Sink, Warp, frame_number};
 use wallplay::source::{DEFAULT_SOURCE, DEFAULT_STANDBY, Prepared, Resolver, Source};
 
 fn init() {
@@ -41,7 +41,23 @@ fn options() -> PlayerOptions {
         fill: Fill::default(),
         resolver: Resolver::default(),
         audio: false,
+        warp: Warp::Cpu,
     }
+}
+
+fn options_with(warp: Warp) -> PlayerOptions {
+    PlayerOptions { warp, ..options() }
+}
+
+/// Whether warping on the GPU works here, saying so when it does not.
+fn gpu() -> bool {
+    static WORKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    init();
+    *WORKS.get_or_init(|| {
+        player::check_gpu_warp()
+            .inspect_err(|reason| eprintln!("skipping: warping on the GPU does not work: {reason}"))
+            .is_ok()
+    })
 }
 
 /// Start a server on a free local port.
@@ -139,7 +155,16 @@ fn pull(sink: &gst::Element) -> (gst::ClockTime, Option<u64>, Size) {
         .first()
         .and_then(|stride| usize::try_from(*stride).ok())
         .expect("stride");
-    let code = framecode::read(frame.plane_data(0).expect("plane"), stride, &geometry);
+    let packing = match info.format() {
+        gst_video::VideoFormat::I420 => framecode::Packing::Luma,
+        _ => framecode::Packing::Rgba,
+    };
+    let code = framecode::read(
+        frame.plane_data(0).expect("plane"),
+        stride,
+        packing,
+        &geometry,
+    );
     let size = Size {
         width: info.width(),
         height: info.height(),
@@ -248,6 +273,17 @@ fn moved(sink: &gst::Element) -> i128 {
 
 #[test]
 fn sound_follows_what_shows() {
+    sound_follows_what_shows_with(Warp::Cpu);
+}
+
+#[test]
+fn sound_follows_what_shows_on_the_gpu() {
+    if gpu() {
+        sound_follows_what_shows_with(Warp::Gpu);
+    }
+}
+
+fn sound_follows_what_shows_with(warp: Warp) {
     init();
     let layout = two_displays();
     let measurement = std::sync::Arc::default();
@@ -265,7 +301,7 @@ fn sound_follows_what_shows() {
             audio: true,
             // Cropping needs gst-plugins-good, which CI does not install.
             fill: Fill::Contain,
-            ..options()
+            ..options_with(warp)
         },
         &measurement,
         Clock::new(),
@@ -368,11 +404,28 @@ fn eventually(seconds: u64, mut done: impl FnMut() -> bool) -> bool {
 
 #[test]
 fn every_output_carries_the_same_frame_codes_while_measuring() {
+    every_output_carries_the_same_frame_codes_while_measuring_with(Warp::Cpu);
+}
+
+#[test]
+fn every_output_carries_the_same_frame_codes_while_measuring_on_the_gpu() {
+    if gpu() {
+        every_output_carries_the_same_frame_codes_while_measuring_with(Warp::Gpu);
+    }
+}
+
+fn every_output_carries_the_same_frame_codes_while_measuring_with(warp: Warp) {
     init();
     let layout = two_displays();
     let measurement = std::sync::Arc::default();
-    let player =
-        Player::start(&layout, &options(), &measurement, Clock::new(), |_| {}).expect("player");
+    let player = Player::start(
+        &layout,
+        &options_with(warp),
+        &measurement,
+        Clock::new(),
+        |_| {},
+    )
+    .expect("player");
     assert_eq!(player.routes().len(), 2);
     assert_eq!(
         player.route("right").expect("route").endpoint,
@@ -523,6 +576,17 @@ fn codes(app: &App, id: &str) -> usize {
 
 #[test]
 fn sources_end_fail_and_change_while_playing() {
+    sources_end_fail_and_change_while_playing_with(Warp::Cpu);
+}
+
+#[test]
+fn sources_end_fail_and_change_while_playing_on_the_gpu() {
+    if gpu() {
+        sources_end_fail_and_change_while_playing_with(Warp::Gpu);
+    }
+}
+
+fn sources_end_fail_and_change_while_playing_with(warp: Warp) {
     init();
     let layout = two_displays();
     let measurement = std::sync::Arc::default();
@@ -540,7 +604,7 @@ fn sources_end_fail_and_change_while_playing() {
             restart: false,
             // Cropping needs gst-plugins-good, which CI does not install.
             fill: Fill::Contain,
-            ..options()
+            ..options_with(warp)
         },
         &measurement,
         Clock::new(),
@@ -621,16 +685,38 @@ fn sources_end_fail_and_change_while_playing() {
 
 #[test]
 fn layouts_change_while_playing() {
+    layouts_change_while_playing_with(Warp::Cpu);
+}
+
+#[test]
+fn layouts_change_while_playing_on_the_gpu() {
+    if gpu() {
+        layouts_change_while_playing_with(Warp::Gpu);
+    }
+}
+
+fn layouts_change_while_playing_with(warp: Warp) {
     init();
-    playing_on_a_new_layout(Fill::Contain);
+    playing_on_a_new_layout(Fill::Contain, warp);
     // Cropping needs gst-plugins-good, which CI does not install.
     if gst::ElementFactory::find("videocrop").is_some() {
-        playing_on_a_new_layout(Fill::Cover);
+        playing_on_a_new_layout(Fill::Cover, warp);
     }
 }
 
 #[test]
 fn covering_crops_follow_the_canvas() {
+    covering_crops_follow_the_canvas_with(Warp::Cpu);
+}
+
+#[test]
+fn covering_crops_follow_the_canvas_on_the_gpu() {
+    if gpu() {
+        covering_crops_follow_the_canvas_with(Warp::Gpu);
+    }
+}
+
+fn covering_crops_follow_the_canvas_with(warp: Warp) {
     init();
     if gst::ElementFactory::find("videocrop").is_none() {
         return;
@@ -650,7 +736,7 @@ fn covering_crops_follow_the_canvas() {
         &PlayerOptions {
             source: clip,
             fill: Fill::Cover,
-            ..options()
+            ..options_with(warp)
         },
         &measurement,
         Clock::new(),
@@ -668,14 +754,16 @@ fn covering_crops_follow_the_canvas() {
     assert!(eventually(10, || rows(&crop) == (60, 60, 0, 0)));
     let mut narrower: serde_json::Value =
         serde_json::from_str(&two_displays().to_json().expect("json")).expect("json");
-    narrower["canvas"]["height"] = json!(300);
+    *narrower
+        .pointer_mut("/canvas/height")
+        .expect("canvas height") = json!(300);
     let narrower = Layout::from_json(&narrower.to_string()).expect("layout");
     assert!(player.update_layout(&narrower, Fill::Cover));
     // And 300 of a 640x300 one.
     assert!(eventually(10, || rows(&crop) == (90, 90, 0, 0)));
 }
 
-fn playing_on_a_new_layout(fill: Fill) {
+fn playing_on_a_new_layout(fill: Fill, warp: Warp) {
     let layout = two_displays();
     let measurement = std::sync::Arc::default();
     // A source that is not live keeps playing through a new canvas size.
@@ -689,7 +777,7 @@ fn playing_on_a_new_layout(fill: Fill) {
         &PlayerOptions {
             source: clip,
             fill,
-            ..options()
+            ..options_with(warp)
         },
         &measurement,
         Clock::new(),
@@ -763,11 +851,22 @@ fn preview_size(player: &Player, id: &str) -> Option<(u32, u32)> {
 
 #[test]
 fn stream_sizes_change_while_playing() {
+    stream_sizes_change_while_playing_with(Warp::Cpu);
+}
+
+#[test]
+fn stream_sizes_change_while_playing_on_the_gpu() {
+    if gpu() {
+        stream_sizes_change_while_playing_with(Warp::Gpu);
+    }
+}
+
+fn stream_sizes_change_while_playing_with(warp: Warp) {
     init();
     let measurement = std::sync::Arc::default();
     let mut player = Player::start(
         &two_displays(),
-        &options(),
+        &options_with(warp),
         &measurement,
         Clock::new(),
         |_| {},
@@ -775,6 +874,17 @@ fn stream_sizes_change_while_playing() {
     .expect("player");
     let pipeline = player.pipeline().clone();
     let left = pipeline.by_name("warp-left").expect("warp");
+    let (factory, format) = match warp {
+        Warp::Cpu => ("wallwarp", gst_video::VideoFormat::Rgba),
+        Warp::Gpu => ("glwallwarp", gst_video::VideoFormat::I420),
+    };
+    assert_eq!(left.factory().expect("factory").name(), factory);
+    let stream = pipeline.by_name("sink-left").expect("sink");
+    let sample = stream
+        .emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&gst::ClockTime::from_seconds(5)])
+        .expect("sample");
+    let info = gst_video::VideoInfo::from_caps(sample.caps().expect("caps")).expect("info");
+    assert_eq!(info.format(), format);
     let new_size = Size {
         width: 240,
         height: 136,
@@ -818,13 +928,24 @@ fn stream_sizes_change_while_playing() {
 
 #[test]
 fn stream_sizes_change_under_running_frames() {
+    stream_sizes_change_under_running_frames_with(Warp::Cpu);
+}
+
+#[test]
+fn stream_sizes_change_under_running_frames_on_the_gpu() {
+    if gpu() {
+        stream_sizes_change_under_running_frames_with(Warp::Gpu);
+    }
+}
+
+fn stream_sizes_change_under_running_frames_with(warp: Warp) {
     init();
     let measurement = std::sync::Arc::default();
     let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let reported = std::sync::Arc::clone(&failures);
     let mut player = Player::start(
         &two_displays(),
-        &options(),
+        &options_with(warp),
         &measurement,
         Clock::new(),
         move |event| {
@@ -874,12 +995,26 @@ fn without_right() -> Layout {
 
 #[test]
 fn displays_come_and_go_while_playing() {
+    displays_come_and_go_while_playing_with(Warp::Cpu);
+}
+
+#[test]
+fn displays_come_and_go_while_playing_on_the_gpu() {
+    if gpu() {
+        displays_come_and_go_while_playing_with(Warp::Gpu);
+    }
+}
+
+fn displays_come_and_go_while_playing_with(warp: Warp) {
     init();
     for audio in [false, true] {
         let measurement = std::sync::Arc::default();
         let mut player = Player::start(
             &two_displays(),
-            &PlayerOptions { audio, ..options() },
+            &PlayerOptions {
+                audio,
+                ..options_with(warp)
+            },
             &measurement,
             Clock::new(),
             |_| {},

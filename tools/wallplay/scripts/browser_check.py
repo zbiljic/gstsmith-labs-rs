@@ -321,7 +321,9 @@ def live_changes(api, pages):
 def run(args, directory):
     port = free_port()
     signalling = free_port(len(DISPLAYS))
-    command = [args.wallplay, "--listen", f"127.0.0.1:{port}", "--state", directory / "state"]
+    command = [
+        args.wallplay, "--listen", f"127.0.0.1:{port}", "--state", directory / "state", "--warp", args.warp,
+    ]
     external = None
     if args.signalling_server:
         external = subprocess.Popen(
@@ -351,6 +353,9 @@ def run(args, directory):
                 break
             except (OSError, RuntimeError):
                 time.sleep(0.1)
+        for line in log.read_text().splitlines():
+            if line.startswith("Warping:"):
+                print(" ".join(line.split()))
         with sync_playwright() as playwright:
             pages = {}
             for display, (width, height) in DISPLAYS.items():
@@ -537,6 +542,7 @@ def main():
     parser.add_argument("--buffer", type=int, help="browser jitter buffer target in milliseconds")
     parser.add_argument("--output", type=Path, help="keep screenshots and files here")
     parser.add_argument("--verbose", action="store_true", help="print wallplay's output")
+    parser.add_argument("--warp", choices=["auto", "cpu", "gpu"], default="auto", help="where wallplay warps")
     args = parser.parse_args()
     args.wallplay = args.wallplay.resolve()
     args.wallcalibrate = args.wallcalibrate.resolve()

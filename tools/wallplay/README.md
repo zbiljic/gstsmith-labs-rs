@@ -5,8 +5,9 @@ is a web browser that opens one URL with its own ID. A control page shows the
 calibration patterns, takes a photo of the wall, makes a layout, and plays one
 video across all displays: a test pattern, a file, a live stream or network
 camera, or a web page such as YouTube, with its sound on one display. Each
-display's part comes from its own [`wallwarp`](../../video/wallwarp/) branch
-and reaches its browser through `webrtcsink`. A measurement mode reports how
+display's part comes from its own [`wallwarp`](../../video/wallwarp/) branch,
+on the GPU through `glwallwarp` where OpenGL works, and reaches its browser
+through `webrtcsink`. A measurement mode reports how
 far apart the browsers present the same frame, and can align them.
 
 It is a test application, not a video wall manager: the server, the pages,
@@ -27,6 +28,8 @@ browser.
   `--yt-dlp`. For WHEP endpoints, `whepclientsrc`, also from `rswebrtc`.
 - For sound, GStreamer's Opus encoder, `opusenc`, and `audiobuffersplit`
   from gst-plugins-bad.
+- Optionally, OpenGL and GStreamer's OpenGL plugin, to warp on the GPU; see
+  [Warping on the GPU](#warping-on-the-gpu).
 - Browsers with WebRTC VP8 and `requestVideoFrameCallback`: current Chrome,
   Edge, Safari, and Firefox. The displays and the server must reach each
   other on the local network; no STUN or TURN server is used.
@@ -78,6 +81,7 @@ It prints the control page's address, for example `http://192.168.1.20:8000/`.
 --max-output PIXELS      longest side of each display's stream [default: 1920]
 --signalling-port PORT   first port of the per-display signalling servers [default: 8443]
 --signalling-uri URI     one external signalling server for every display
+--warp auto|cpu|gpu      where displays' frames are warped [default: auto]
 ```
 
 `--source` takes a test pattern's ID, a URL (see [Sources](#sources)), or a
@@ -94,6 +98,27 @@ restarted server plays the last layout, and the files work with the
 Each display's stream has its viewport's aspect ratio, at most
 `--max-output` pixels on the longer side and in CSS pixels, so a high-DPI
 display at 2x scaling gets a stream at half its device resolution.
+
+### Warping on the GPU
+
+With `--warp gpu`, every canvas frame is uploaded to the GPU once, each
+display's part is warped there by `glwallwarp`, and converted there to the
+I420 its encoder takes, so the CPU is left mostly with encoding. `--warp
+cpu` warps with `wallwarp`, one thread per display, and `webrtcsink`
+converts. `auto`, the default, tries one frame through `glwallwarp` at
+startup and uses the GPU if it comes out, the CPU otherwise; the server
+prints which, and why OpenGL failed. `--warp gpu` refuses to start without
+working OpenGL. Both paths warp the same frames; their conversions to I420
+average colors slightly differently. Frame codes and previews work with
+either.
+
+For three 1920x1080 displays of a 1920x1080 source, encoded to VP8, the
+GPU path took about a third of the CPU time per frame on a machine with an
+integrated GPU; see
+[the plugin's measurements](../../video/wallwarp/README.md#performance).
+Latency did not change: in the browser check on that machine, the median
+from frame to screen was 83 ms on the GPU path and 80 to 94 ms on the CPU
+path.
 
 ## Sources
 
@@ -227,7 +252,7 @@ raised that latency by its 21.3 ms buffer, the video's too.
 
 A new layout applies while playing, and playback does not restart:
 
-- Each display's `wallwarp` takes its new corners with the first frame of the
+- Each display's warp takes its new corners with the first frame of the
   new canvas size, and the source is converted to that size in place, so a
   clip does not start over. Test patterns restart at the new size, and so does
   a source whose **Video** fill changed.
@@ -436,7 +461,8 @@ cargo test -p wallplay
 cargo clippy -p wallplay --all-targets -- -D warnings
 ```
 
-The tests check the frame code, RTP timestamps, drift statistics, the
+The tests check the frame code in RGBA and I420, RTP timestamps, drift
+statistics, the
 aligner, HTTP parsing, and how URLs open, and run the whole workflow over
 HTTP against a real pipeline with `appsink`s in place of `webrtcsink`. That
 covers registration, patterns, a synthetic photo, corrections, layout,
@@ -444,7 +470,9 @@ playback, frame codes matching running times, measurement and aligning from
 simulated browser reports, a new layout while playing, a source that ends,
 restarts, fails, and is replaced while playing, sound that follows the source
 with its picture's offset and turns to silence on standby, and sound moving
-between displays.
+between displays. Layout changes, stream sizes, displays coming and going,
+sources ending, failing and changing, sound, cropping, and frame codes are
+checked on the GPU path too, where OpenGL works.
 
 With `webrtcsink`, libnice, `uv`, and Playwright's Chromium installed, a full
 check runs the real pages in headless Chromium:
@@ -464,8 +492,8 @@ plays a clip with a tone and its sound on one display, checks that both
 displays receive the tone and only that one plays it, moves the sound to the
 other display, and turns it off. Finally it makes one display 100 ms late and
 checks that aligning brings both together. `--signalling-server` repeats it
-with an external `gst-webrtc-signalling-server`, and `--output DIR` keeps
-screenshots.
+with an external `gst-webrtc-signalling-server`, `--warp cpu` or `--warp
+gpu` picks the warp, and `--output DIR` keeps screenshots.
 
 ## Limitations
 

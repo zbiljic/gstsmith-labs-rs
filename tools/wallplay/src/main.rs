@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use wallplay::app::{App, Config};
-use wallplay::player::{Fill, PlayerOptions, Signalling, Sink};
+use wallplay::player::{Fill, PlayerOptions, Signalling, Sink, Warp};
 use wallplay::source::{DEFAULT_SOURCE, DEFAULT_STANDBY, Prepared, Resolver, Source};
 
 const USAGE: &str = "\
@@ -39,6 +39,9 @@ Options:
   --yt-dlp PROGRAM           Finds the video of web pages [default: yt-dlp]
   --fps N                    Canvas frame rate [default: 30]
   --max-output PIXELS        Longest side of each display's stream [default: 1920]
+  --warp auto|cpu|gpu        Where displays' frames are warped: gpu uses
+                             OpenGL and leaves the CPU little but encoding;
+                             auto picks gpu when OpenGL works [default: auto]
   --signalling-port PORT     First port of the per-display signalling servers;
                              displays take the first free ports from here
                              [default: 8443]
@@ -52,6 +55,8 @@ Open the control page, then open http://HOST:PORT/display/ID on every display.";
 struct Options {
     listen: SocketAddr,
     config: Config,
+    /// `None` to pick the GPU when OpenGL works.
+    warp: Option<Warp>,
 }
 
 fn value<T: std::str::FromStr>(name: &str, value: Option<String>) -> Result<T> {
@@ -73,6 +78,7 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
     let mut max_output = 1920;
     let mut first_port = 8443;
     let mut external = None;
+    let mut warp = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => listen = value(&arg, args.next())?,
@@ -86,6 +92,14 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
             "--max-output" => max_output = value(&arg, args.next())?,
             "--signalling-port" => first_port = value(&arg, args.next())?,
             "--signalling-uri" => external = Some(value::<String>(&arg, args.next())?),
+            "--warp" => {
+                warp = match value::<String>(&arg, args.next())?.as_str() {
+                    "auto" => None,
+                    "cpu" => Some(Warp::Cpu),
+                    "gpu" => Some(Warp::Gpu),
+                    other => bail!("--warp {other:?} is not auto, cpu or gpu"),
+                }
+            }
             "-h" | "--help" => return Ok(None),
             _ => bail!("unknown argument {arg}"),
         }
@@ -123,11 +137,14 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
                 resolver,
                 // Set from the sound display whenever a player starts.
                 audio: false,
+                // Set once GStreamer can tell whether OpenGL works.
+                warp: Warp::Cpu,
             },
             poll_timeout: Duration::from_secs(25),
             max_output,
             sound,
         },
+        warp,
     }))
 }
 
@@ -139,9 +156,25 @@ fn lan_address() -> Option<std::net::IpAddr> {
     Some(socket.local_addr().ok()?.ip())
 }
 
-fn run(options: Options) -> Result<()> {
+fn run(mut options: Options) -> Result<()> {
     gst::init()?;
     wallplay::register_wallwarp()?;
+    if options.warp != Some(Warp::Cpu) {
+        println!("Checking whether OpenGL can warp...");
+    }
+    let (warp, fallback) = match options.warp {
+        Some(Warp::Cpu) => (Warp::Cpu, None),
+        Some(Warp::Gpu) => {
+            wallplay::player::check_gpu_warp()
+                .map_err(|reason| anyhow::anyhow!("--warp gpu: {reason}"))?;
+            (Warp::Gpu, None)
+        }
+        None => match wallplay::player::check_gpu_warp() {
+            Ok(()) => (Warp::Gpu, None),
+            Err(reason) => (Warp::Cpu, Some(reason)),
+        },
+    };
+    options.config.player.warp = warp;
     let listener = TcpListener::bind(options.listen)
         .with_context(|| format!("listening on {}", options.listen))?;
     let address = listener.local_addr()?;
@@ -158,6 +191,13 @@ fn run(options: Options) -> Result<()> {
         address.port()
     );
     println!("State:         {state_dir}");
+    match (warp, fallback) {
+        (Warp::Gpu, _) => println!("Warping:       on the GPU, through OpenGL"),
+        (Warp::Cpu, None) => println!("Warping:       on the CPU"),
+        (Warp::Cpu, Some(reason)) => {
+            println!("Warping:       on the CPU; OpenGL did not warp: {reason}");
+        }
+    }
     wallplay::http::serve(&listener, &app.handler())
 }
 

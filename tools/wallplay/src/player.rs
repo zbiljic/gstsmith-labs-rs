@@ -1,15 +1,15 @@
 //! The playback pipeline: a source and a standby pattern, one shown at a
-//! time, and one `wallwarp` branch per display.
+//! time, and one warp branch per display, on the CPU or the GPU.
 //!
 //! ```text
 //! source  ! identity ! videoconvert [! videocrop] ! videoscale [! videorate] ! RGBA canvas [! clocksync] ! selector.
 //! source  ! identity ! audioconvert ! audioresample ! S16 48 kHz stereo ! audiobuffersplit ! clocksync ! sound.   (with audio)
 //! standby ! identity ! videoconvert ! videoscale ! RGBA canvas ! selector.
 //! audiotestsrc wave=silence ! clocksync ! sound.   (with audio)
-//! input-selector name=selector ! tee
-//!   tee. ! queue ! wallwarp ! capsfilter ! tee   (per display)
+//! input-selector name=selector [! glupload] ! tee
+//!   tee. ! queue ! wallwarp|glwallwarp ! capsfilter ! tee   (per display)
 //!     tee. ! queue ! webrtcsink meta="meta,display=<id>"
-//!     tee. ! queue ! videorate ! videoscale ! capsfilter ! fakesink   (preview)
+//!     tee. ! queue ! videorate ! videoscale ! videoconvert ! capsfilter ! fakesink   (preview)
 //! input-selector name=sound ! tee
 //!   tee. ! queue ! webrtcsink's audio input   (per display, with audio)
 //! ```
@@ -22,10 +22,15 @@
 //! streams reconnect. Built-in patterns skip `videorate` and `clocksync`,
 //! which only files and other sources need, and which add latency.
 //!
+//! On the CPU, `wallwarp` gives each display RGBA, which `webrtcsink`
+//! converts for its encoder. On the GPU, every canvas frame is uploaded once
+//! for all displays, and `glwallwarp` gives each display I420, converted on
+//! the GPU too, so the CPU only encodes.
+//!
 //! Displays come and go with the layout: each has a branch of its own, added
 //! to and removed from the running pipeline, so the others keep their
 //! streams. A display's stream size is the caps of the `capsfilter` after its
-//! `wallwarp`, which changes width and height as one step; `webrtcsink`
+//! warp, which changes width and height as one step; `webrtcsink`
 //! accepts that without a new WebRTC negotiation, its encoders start again
 //! at the new size, and browsers follow.
 //!
@@ -97,6 +102,7 @@ pub struct PlayerOptions {
     /// Send the sound to every display. Browsers then hold each display's
     /// video back to keep it in sync with the sound, muted or not.
     pub audio: bool,
+    pub warp: Warp,
 }
 
 /// How a source whose aspect ratio differs from the canvas fills it.
@@ -109,6 +115,85 @@ pub enum Fill {
     Cover,
     /// Show the whole source, with black bars on two sides.
     Contain,
+}
+
+/// Where displays' frames are warped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Warp {
+    /// `wallwarp`, one thread per display.
+    #[default]
+    Cpu,
+    /// `glwallwarp` in OpenGL, which also converts each display's stream to
+    /// the I420 its encoder takes.
+    Gpu,
+}
+
+impl Warp {
+    const fn element(self) -> &'static str {
+        match self {
+            Self::Cpu => "wallwarp",
+            Self::Gpu => "glwallwarp",
+        }
+    }
+
+    const fn format(self) -> gst_video::VideoFormat {
+        match self {
+            Self::Cpu => gst_video::VideoFormat::Rgba,
+            Self::Gpu => gst_video::VideoFormat::I420,
+        }
+    }
+}
+
+/// How long [`check_gpu_warp`] waits for its frame.
+const GPU_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether warping on the GPU works here: a frame makes it through
+/// `glwallwarp` within [`GPU_CHECK_TIMEOUT`]. Otherwise says why. A GL setup
+/// that hangs, as with an unreachable display server, is left behind on its
+/// own thread rather than holding the caller.
+///
+/// # Errors
+///
+/// Returns why no frame came through.
+pub fn check_gpu_warp() -> Result<(), String> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("wallplay-gl-check".to_owned())
+        .spawn(move || {
+            let _ignored = sender.send(try_gpu_warp());
+        })
+        .map_err(|err| err.to_string())?;
+    receiver
+        .recv_timeout(GPU_CHECK_TIMEOUT + Duration::from_secs(5))
+        .unwrap_or_else(|_err| Err("OpenGL did not answer".to_owned()))
+}
+
+fn try_gpu_warp() -> Result<(), String> {
+    let pipeline = gst::parse::launch(
+        "videotestsrc num-buffers=1 ! video/x-raw,format=RGBA,width=64,height=48 \
+         ! glupload ! glwallwarp output-width=32 output-height=24 \
+         ! video/x-raw,format=I420 ! fakesink",
+    )
+    .map_err(|err| err.to_string())?;
+    let bus = pipeline.bus().ok_or("the check has no bus")?;
+    let result = match pipeline.set_state(gst::State::Playing) {
+        Err(_err) => Err("the check did not start".to_owned()),
+        Ok(_) => match bus
+            .timed_pop_filtered(
+                gst::ClockTime::try_from(GPU_CHECK_TIMEOUT).ok(),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .as_deref()
+            .map(gst::MessageRef::view)
+        {
+            Some(gst::MessageView::Eos(_)) => Ok(()),
+            Some(gst::MessageView::Error(error)) => Err(error.error().to_string()),
+            _ => Err("no frame came through".to_owned()),
+        },
+    };
+    let _ignored = pipeline.set_state(gst::State::Null);
+    result
 }
 
 /// Longest side of a display's preview, in pixels.
@@ -244,6 +329,13 @@ fn check_elements(options: &PlayerOptions) -> Result<()> {
     if options.audio && gst::ElementFactory::find("audiobuffersplit").is_none() {
         bail!("sound needs audiobuffersplit, from gst-plugins-bad, which is not available");
     }
+    if options.warp == Warp::Gpu {
+        for element in ["glupload", "glwallwarp"] {
+            if gst::ElementFactory::find(element).is_none() {
+                bail!("warping on the GPU needs {element}, which is not available");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -280,6 +372,7 @@ pub struct Player {
     generation: u32,
     fps: u32,
     sink: Sink,
+    warp: Warp,
     measuring: Arc<AtomicBool>,
     drawing: Arc<AtomicBool>,
     measurement: Arc<Mutex<Measurement>>,
@@ -316,7 +409,7 @@ fn follow_canvas(warp: &gst::Element) -> Result<PendingQuad> {
     let waiting = Arc::clone(&pending);
     let element = warp.downgrade();
     warp.static_pad("sink")
-        .context("wallwarp has no sink pad")?
+        .context("the warp has no sink pad")?
         .add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
             if let Some(gst::PadProbeData::Event(event)) = &info.data
                 && let gst::EventView::Caps(caps) = event.view()
@@ -372,10 +465,11 @@ fn size_filter(caps: gst::Caps) -> Result<gst::Element> {
         .build()?)
 }
 
-/// Caps giving a warp's output the size `output`.
-fn output_caps(output: Size) -> Result<gst::Caps> {
+/// Caps giving a warp's output the size `output`, in the format `warp` gives
+/// streams.
+fn output_caps(output: Size, warp: Warp) -> Result<gst::Caps> {
     Ok(gst_video::VideoCapsBuilder::new()
-        .format(gst_video::VideoFormat::Rgba)
+        .format(warp.format())
         .width(i32::try_from(output.width)?)
         .height(i32::try_from(output.height)?)
         .build())
@@ -1853,7 +1947,7 @@ impl Stamper {
         };
         let pad = warp
             .static_pad("src")
-            .context("wallwarp has no source pad")?;
+            .context("the warp has no source pad")?;
         pad.add_probe(
             gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
             move |pad, info| {
@@ -1906,21 +2000,40 @@ impl Stamper {
             Some(Duration::from(late).as_secs_f64() * 1000.0)
         });
         if self.drawing.load(Ordering::Relaxed) {
-            let Ok(mut video) =
-                gst_video::VideoFrameRef::from_buffer_ref_writable(buffer.make_mut(), info)
-            else {
-                return;
-            };
-            let stride = video
-                .plane_stride()
-                .first()
-                .and_then(|stride| usize::try_from(*stride).ok());
-            let (Some(stride), Ok(pixels)) = (stride, video.plane_data_mut(0)) else {
-                return;
-            };
-            framecode::stamp(pixels, stride, code, frame);
+            draw(buffer, info, code, frame);
         }
         lock(&self.measurement).stamped(&self.display, frame, self.clock.now_ms(), delay);
+    }
+}
+
+/// Draw `frame`'s code into an RGBA or I420 frame of layout `info`.
+fn draw(buffer: &mut gst::Buffer, info: &gst_video::VideoInfo, code: &CodeGeometry, frame: u64) {
+    let Ok(mut video) = gst_video::VideoFrameRef::from_buffer_ref_writable(buffer.make_mut(), info)
+    else {
+        return;
+    };
+    let packing = match info.format() {
+        gst_video::VideoFormat::Rgba => framecode::Packing::Rgba,
+        gst_video::VideoFormat::I420 => framecode::Packing::Luma,
+        _ => return,
+    };
+    let Some(strides) = video
+        .plane_stride()
+        .iter()
+        .map(|stride| usize::try_from(*stride).ok())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    for (plane, stride) in (0_u32..).zip(strides) {
+        let Ok(pixels) = video.plane_data_mut(plane) else {
+            return;
+        };
+        if plane == 0 {
+            framecode::stamp(pixels, stride, packing, code, frame);
+        } else {
+            framecode::clear_chroma(pixels, stride, code);
+        }
     }
 }
 
@@ -1951,7 +2064,15 @@ impl Player {
             .property("allow-not-linked", true)
             .build()?;
         pipeline.add_many([&selector, &tee])?;
-        selector.link(&tee)?;
+        match options.warp {
+            Warp::Cpu => selector.link(&tee)?,
+            // One upload for every display.
+            Warp::Gpu => {
+                let upload = make("glupload")?;
+                pipeline.add(&upload)?;
+                gst::Element::link_many([&selector, &upload, &tee])?;
+            }
+        }
         let sound = options.audio.then(|| Self::sound(&pipeline)).transpose()?;
         let (sound_selector, sound_tee) = match sound {
             Some((selector, pad, tee)) => (Some((selector, pad)), Some(tee)),
@@ -1980,6 +2101,7 @@ impl Player {
             generation,
             fps: options.fps,
             sink: options.sink.clone(),
+            warp: options.warp,
             measuring,
             drawing,
             measurement: Arc::clone(measurement),
@@ -2012,12 +2134,13 @@ impl Player {
             .property("max-size-time", 0_u64)
             .property_from_str("leaky", "downstream")
             .build()?;
-        let warp = gst::ElementFactory::make("wallwarp")
+        let factory = self.warp.element();
+        let warp = gst::ElementFactory::make(factory)
             .name(format!("warp-{id}"))
             .property("quad", layout.source_quad(screen).to_string())
             .build()
-            .context("creating wallwarp")?;
-        let output = size_filter(output_caps(screen.output)?)?;
+            .with_context(|| format!("creating {factory}"))?;
+        let output = size_filter(output_caps(screen.output, self.warp)?)?;
         let (sink, endpoint) = self.display_sink(id)?;
         // The warped output goes to the display and, a few times a second
         // and scaled down, to a preview for the control page.
@@ -2211,6 +2334,8 @@ impl Player {
                 .property("max-rate", PREVIEW_RATE)
                 .build()?,
             make("videoscale")?,
+            // From the I420 of the GPU's streams.
+            make("videoconvert")?,
             filter.clone(),
             gst::ElementFactory::make("fakesink")
                 .name(format!("preview-{id}"))
@@ -2426,7 +2551,7 @@ impl Player {
                     .set_property("caps", preview_caps(screen.output));
                 branch
                     .output
-                    .set_property("caps", output_caps(screen.output)?);
+                    .set_property("caps", output_caps(screen.output, self.warp)?);
                 route.output = screen.output;
                 route.code = CodeGeometry::for_output(screen.output.width, screen.output.height);
             }
