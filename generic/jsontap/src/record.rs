@@ -147,6 +147,25 @@ pub(crate) fn eos() -> Value {
     json!({ "kind": "eos" })
 }
 
+/// A custom event with its structure, or `None` for other events.
+pub(crate) fn custom_event(event: &gst::EventRef) -> Option<Value> {
+    let kind = match event.type_() {
+        gst::EventType::CustomDownstream => "custom-downstream",
+        gst::EventType::CustomDownstreamOob => "custom-downstream-oob",
+        gst::EventType::CustomBoth => "custom-both",
+        gst::EventType::CustomBothOob => "custom-both-oob",
+        _ => return None,
+    };
+    let fields = event.structure();
+    Some(json!({
+        "kind": "event",
+        "type": kind,
+        "running-time-offset": event.running_time_offset(),
+        "name": fields.map(|s| s.name().as_str()),
+        "fields": fields.map_or(Value::Null, structure),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use gst::meta::CustomMeta;

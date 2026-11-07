@@ -181,3 +181,42 @@ fn fails_to_start_without_a_location() {
         .expect_err("start requires a location");
     tap.set_state(gst::State::Null).expect("tap stops");
 }
+
+#[test]
+fn records_custom_downstream_events_between_buffers() {
+    init();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("events.jsonl");
+    let mut h = gst_check::Harness::new_parse(&format!("jsontap location={}", path.display()));
+    h.set_src_caps_str("application/x-test");
+    h.push(gst::Buffer::new()).expect("buffer pushes");
+    h.pull().expect("buffer passes through");
+    let event = gst::event::CustomDownstream::new(
+        gst::Structure::builder("example-event")
+            .field("type", "present")
+            .field("label", "man")
+            .field("count", 2u32)
+            .build(),
+    );
+    assert!(h.push_event(event));
+    h.push(gst::Buffer::new()).expect("buffer pushes");
+    h.pull().expect("buffer passes through");
+    assert!(h.push_event(gst::event::Eos::new()));
+
+    let records = records(&path);
+    let kinds = records
+        .iter()
+        .map(|r| r["kind"].as_str().expect("kind").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["caps", "buffer", "event", "buffer", "eos"]);
+    assert_eq!(
+        records[2],
+        serde_json::json!({
+            "kind": "event",
+            "type": "custom-downstream",
+            "running-time-offset": 0,
+            "name": "example-event",
+            "fields": {"type": "present", "label": "man", "count": 2},
+        })
+    );
+}

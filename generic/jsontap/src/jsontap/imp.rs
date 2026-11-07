@@ -181,9 +181,14 @@ impl BaseTransformImpl for JsonTap {
     }
 
     fn sink_event(&self, event: gst::Event) -> bool {
-        if let gst::EventView::Eos(_) = event.view()
-            && let Err(err) = self.write(&record::eos()).and_then(|()| self.flush())
-        {
+        let result = if let gst::EventView::Eos(_) = event.view() {
+            self.write(&record::eos()).and_then(|()| self.flush())
+        } else if let Some(custom) = record::custom_event(&event) {
+            self.write(&custom)
+        } else {
+            Ok(())
+        };
+        if let Err(err) = result {
             self.post_error_message(err);
         }
         self.parent_sink_event(event)

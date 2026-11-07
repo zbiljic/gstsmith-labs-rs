@@ -20,6 +20,12 @@ EOS or when the element stops.
   start), `pts`, `dts`, and `duration` in nanoseconds or `null`, `offset` and
   `offset_end` or `null`, `flags` (for example `delta-unit`, `discont`),
   `size` in bytes, and `metas`.
+- `{"kind":"event",...}`: each custom event travelling downstream, in
+  stream order between buffers, with `type` (`custom-downstream`,
+  `custom-downstream-oob`, `custom-both` or `custom-both-oob`),
+  `running-time-offset`, the structure `name`, and its `fields` converted as
+  for custom metas below. Sticky custom events are not recorded, because
+  they are replayed on relinking.
 - `{"kind":"eos"}`: end of stream; the file is flushed.
 
 Each entry of `metas` names the meta API. Custom metas (`GstCustomMeta`)
