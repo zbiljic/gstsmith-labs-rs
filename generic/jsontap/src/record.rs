@@ -54,7 +54,12 @@ fn value(value: &glib::SendValue) -> Value {
     } else if let Ok(v) = value.get::<u64>() {
         json!(v)
     } else if let Ok(v) = value.get::<f32>() {
-        json!(v)
+        // Shortest decimal form, so 0.7f32 is not recorded as 0.699999988.
+        v.to_string()
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map_or(Value::Null, Value::Number)
     } else if let Ok(v) = value.get::<f64>() {
         json!(v)
     } else if let Ok(v) = value.get::<&str>() {
@@ -173,6 +178,7 @@ mod tests {
             fields.set("long", i64::MIN);
             fields.set("ulong", u64::MAX);
             fields.set("small_float", 1.25f32);
+            fields.set("inexact_float", 0.7f32);
             fields.set("float", 1.25f64);
             fields.set("non_finite", f64::NAN);
             fields.set("empty", gst::Array::new(std::iter::empty::<u64>()));
@@ -195,6 +201,7 @@ mod tests {
                 "long": i64::MIN,
                 "ulong": u64::MAX,
                 "small_float": 1.25,
+                "inexact_float": 0.7,
                 "float": 1.25,
                 "non_finite": null,
                 "empty": [],

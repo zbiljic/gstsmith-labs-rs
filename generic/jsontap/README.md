@@ -24,7 +24,8 @@ EOS or when the element stops.
 
 Each entry of `metas` names the meta API. Custom metas (`GstCustomMeta`)
 are named by their registered name and include their structure `fields`:
-numbers, booleans, and strings as JSON values, arrays and lists as JSON
+numbers, booleans, and strings as JSON values (`f32` values at `f32`
+precision, so `0.7` stays `0.7`), arrays and lists as JSON
 arrays, nested structures as objects, anything else in its `GStreamer`
 serialized form.
 
