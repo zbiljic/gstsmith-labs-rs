@@ -122,16 +122,16 @@ fn pipeline(
     for screen in &layout.screens {
         steps.push(Step::Branch("wall".to_owned()));
         steps.push(element(true, "queue", &[]));
-        steps.push(element(
-            true,
-            "wallwarp",
-            &[
-                format!("name={}", screen.id),
-                format!("quad=\"{}\"", layout.source_quad(screen)),
-                format!("output-width={}", screen.output.width),
-                format!("output-height={}", screen.output.height),
-            ],
-        ));
+        let mut properties = vec![
+            format!("name={}", screen.id),
+            format!("quad=\"{}\"", layout.source_quad(screen)),
+            format!("output-width={}", screen.output.width),
+            format!("output-height={}", screen.output.height),
+        ];
+        if !screen.mask.is_empty() {
+            properties.push(format!("mask=\"{}\"", screen.mask));
+        }
+        steps.push(element(true, "wallwarp", &properties));
         steps.extend(sink(&screen.id));
     }
     steps

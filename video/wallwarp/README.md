@@ -37,8 +37,30 @@ quads in the same notation:
 | `1,0,0,0,0,1,1,1` | Mirrored horizontally |
 | `0.25,0,0.75,0,1,1,0,1` | A trapezoid, sampled with perspective |
 
-The default identity quad, with equal input and output video info, runs in
-passthrough mode without copying.
+The default identity quad, with equal input and output video info and no
+mask, runs in passthrough mode without copying.
+
+### Masks
+
+`mask` limits the picture to part of the output, for displays that are not
+rectangular or are partly covered: outside it, pixels show `background`. It
+lists polygons separated by `;`, each as normalized `x,y` output points,
+`0,0` the output's top-left and `1,1` its bottom-right. A pixel shows the
+picture when its center is inside an odd number of polygons, so a polygon
+inside another cuts a hole in it:
+
+| `mask` | Output |
+|---|---|
+| empty | The whole output (default) |
+| `0.5,0 1,0.5 0.5,1 0,0.5` | A diamond touching the edges' midpoints |
+| `0,0 1,0 1,1 0,1; 0.4,0.4 0.6,0.4 0.6,0.6 0.4,0.6` | All but a square in the middle |
+
+Points may lie outside the output, so a triangle reaching past an edge cuts
+off a corner; coordinates stay within ±1000000. Edges are hard, without
+antialiasing, and a pixel center exactly on an edge counts as right of and
+below it. A mask has at most 256 points. Masks belong to the display, not the
+source, so they keep their place when `quad` changes. Layouts carry them as each screen's optional `mask`, the
+same polygons as `[[[x, y], ...], ...]`.
 
 ### Caps
 
@@ -66,7 +88,9 @@ are dropped.
 ## Properties
 
 Every property can change while streaming, and the next frame after a change
-uses it. An invalid `quad` is ignored with a warning, keeping the current one.
+uses it. While streaming, an invalid `quad` or `mask` is ignored with a
+warning, keeping the current one, and setting the current one again changes
+nothing.
 
 | Property | Default | Meaning |
 |---|---|---|
@@ -75,12 +99,13 @@ uses it. An invalid `quad` is ignored with a warning, keeping the current one.
 | `output-height` | `0` | Output height in pixels; `0` negotiates it, preferring the input height |
 | `interpolation` | `bilinear` | `nearest` copies the closest source pixel; `bilinear` blends the four closest |
 | `background` | `0xff000000` | Color of output pixels sampling outside the input, as big-endian ARGB (`0xAARRGGBB`) |
+| `mask` | empty | Polygons of normalized output points, separated by `;`, where the output shows the picture; see [Masks](#masks) |
 | `n-threads` | `1` | Maximum number of threads warping each frame; `0` uses one per CPU core |
 
 An invalid `quad`, with the wrong number of values, non-finite values, or
 repeated, collinear, concave, or self-intersecting corners, is logged when it
-is set. The element then refuses to leave READY and posts a
-`GST_LIBRARY_ERROR_SETTINGS` error naming the problem.
+is set, and so is an invalid `mask`. The element then refuses to leave READY
+and posts a `GST_LIBRARY_ERROR_SETTINGS` error naming the problem.
 
 ## Examples
 
@@ -200,7 +225,8 @@ GST_PLUGIN_PATH="$PWD/target/debug" gst-launch-1.0 \
 It samples by the same rules. Nearest sampling picks the same source pixels
 as `wallwarp`; a sample within a tiny fraction of a pixel short of a pixel
 boundary may take the next one, and so may more of them on a GLES 2 device
-without high-precision fragment shaders. Bilinear blends differ by at most
+without high-precision fragment shaders, where mask edges can also move by
+up to about a thousandth of the output. Bilinear blends differ by at most
 one level per channel on the GPUs tested; the GPU weighs them at its own
 precision, which OpenGL leaves to the hardware. Output pixels are square
 unless downstream requires otherwise. Two differences remain: an output
@@ -209,8 +235,10 @@ display aspect ratio rather than the input dimension, and the identity quad
 still draws every frame.
 
 The homography, background, and sampling are shader uniforms, so changing
-them costs nothing; a new output size renegotiates the element's output on
-the next frame, without asking anything upstream of it to renegotiate.
+them costs nothing. The mask is compiled into the shader, one test per edge,
+so a new mask rebuilds the shader before the next frame. A new output size
+renegotiates the element's output on the next frame, without asking anything
+upstream of it to renegotiate.
 Without the OpenGL plugin the element fails to reach READY, naming the
 missing element; without a usable GL display or context, OpenGL's own
 elements report the error.
@@ -233,9 +261,10 @@ elements report the error.
   clamps to the edge inside the source; samples outside it use the
   background. A unit test compares every pixel with a direct per-pixel
   transcription of these rules.
-- A new `quad` or frame size locates every output pixel's sample once, in
-  `f64`, and keeps it as a 16-bit column and row plus, for bilinear, two 8-bit
-  weights: 4 or 6 bytes per output pixel, about 12 MB for a bilinear
+- A new `quad`, `mask`, or frame size locates every output pixel's sample
+  once, in `f64`, and keeps it as a 16-bit column and row plus, for bilinear,
+  two 8-bit weights; pixels the mask hides are marked like samples outside
+  the source: 4 or 6 bytes per output pixel, about 12 MB for a bilinear
   1920x1080 output. Bilinear clamps through its weights: past the last pixel
   center, all the weight goes to the last pixel. Each frame then only reads
   the source pixels around 64 samples at a time and blends them, without

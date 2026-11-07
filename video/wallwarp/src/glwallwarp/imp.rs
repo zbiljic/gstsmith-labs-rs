@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::str::FromStr as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -5,9 +6,9 @@ use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
-use wall_geometry::{Homography, Quad};
+use wall_geometry::{Homography, Mask, Quad};
 
-use crate::wallwarp::{Interpolation, parse_quad, rgba};
+use crate::wallwarp::{Interpolation, MASK_BLURB, parse_mask, parse_quad, rgba};
 
 const DEFAULT_QUAD: &str = "0,0,1,0,1,1,0,1";
 const DEFAULT_OUTPUT_SIZE: u32 = 0;
@@ -30,6 +31,9 @@ const MAX_OUTPUT_SIZE: u32 = i32::MAX.unsigned_abs();
 /// GLES 2 devices without high precision in fragment shaders get medium
 /// precision, too coarse for the nudge: boundary samples may take a
 /// neighbour there.
+///
+/// `shows` holds where the mask shows the picture; [`shader_source`]
+/// writes it.
 const SHADER: &str = "#version 100
 #ifdef GL_ES
 #ifdef GL_FRAGMENT_PRECISION_HIGH
@@ -43,13 +47,14 @@ uniform sampler2D tex;
 uniform float h0, h1, h2, h3, h4, h5, h6, h7, h8;
 uniform float source_width, source_height, nearest;
 uniform float background_red, background_green, background_blue, background_alpha;
+bool shows (vec2 o);
 void main () {
   vec2 o = v_texcoord;
   float w = h6 * o.x + h7 * o.y + h8;
   vec2 s = vec2(h0 * o.x + h1 * o.y + h2, h3 * o.x + h4 * o.y + h5) / w;
   vec2 size = vec2(source_width, source_height);
   vec2 p = s * size + size / 524288.0;
-  if (w <= 0.0 || p.x < 0.0 || p.y < 0.0 || p.x >= size.x || p.y >= size.y) {
+  if (w <= 0.0 || p.x < 0.0 || p.y < 0.0 || p.x >= size.x || p.y >= size.y || !shows(o)) {
     gl_FragColor = vec4(background_red, background_green, background_blue, background_alpha);
   } else if (nearest > 0.5) {
     gl_FragColor = texture2D(tex, (floor(p) + 0.5) / size);
@@ -58,6 +63,40 @@ void main () {
   }
 }
 ";
+
+/// [`SHADER`] with `shows` for `mask`: the even-odd test of
+/// [`Mask::shows`], one line per edge. Horizontal edges never cross a ray
+/// and are left out; their points are compared as the strings the shader
+/// reads.
+fn shader_source(mask: &Mask) -> String {
+    // A pixel center on an edge lies to its right and below it, as on the
+    // CPU, which decides exactly; `o` is nudged by 2⁻¹⁹ of the output, as
+    // samples are, so that interpolation and single precision do too.
+    let mut source = format!(
+        "{SHADER}bool shows (vec2 center) {{\n  vec2 o = center + 1.0 / 524288.0;\n  bool inside = {};\n",
+        mask.is_empty()
+    );
+    // Debug formatting keeps a decimal point or an exponent, as GLSL floats
+    // need.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the shader computes in single precision"
+    )]
+    let float = |value: f64| format!("{:?}", value as f32);
+    for (from, to) in mask.edges() {
+        let (ax, ay, bx, by) = (float(from.x), float(from.y), float(to.x), float(to.y));
+        if ay == by {
+            continue;
+        }
+        // Writing to a String cannot fail.
+        let _ignored = writeln!(
+            source,
+            "  if (({ay} > o.y) != ({by} > o.y) && o.x < ({bx} - {ax}) * (o.y - {ay}) / ({by} - {ay}) + {ax}) inside = !inside;"
+        );
+    }
+    source.push_str("  return inside;\n}\n");
+    source
+}
 
 static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     gst::DebugCategory::new(
@@ -75,6 +114,11 @@ struct Settings {
     output_height: u32,
     interpolation: Interpolation,
     background: u32,
+    mask_text: String,
+    /// The last valid mask.
+    mask: Mask,
+    /// Why `mask_text` is unusable, if it is.
+    mask_error: Option<String>,
 }
 
 impl Default for Settings {
@@ -86,6 +130,9 @@ impl Default for Settings {
             output_height: DEFAULT_OUTPUT_SIZE,
             interpolation: Interpolation::default(),
             background: DEFAULT_BACKGROUND,
+            mask_text: String::new(),
+            mask: Mask::default(),
+            mask_error: None,
         }
     }
 }
@@ -207,7 +254,7 @@ impl GlWallWarp {
         // The shader samples an RGBA 2D texture.
         let texture = capsfilter("video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D")?;
         let shader = make("glshader")?;
-        shader.set_property("fragment", SHADER);
+        self.rebuild_shader_on_request(&shader)?;
         let size = capsfilter("video/x-raw(memory:GLMemory)")?;
         let finish = make("glcolorconvert")?;
         let download = make("gldownload")?;
@@ -258,6 +305,67 @@ impl GlWallWarp {
             },
         );
         Ok(Children { shader, size })
+    }
+
+    /// Have `shader` compile the source for the current mask whenever it asks
+    /// for a shader: at its first frame, and after `update-shader` is set.
+    /// glshader asks on its GL thread, between frames, and compiles its
+    /// `fragment` itself when given no shader and no current one, so the
+    /// handler clears the current shader and sets the new source there.
+    fn rebuild_shader_on_request(&self, shader: &gst::Element) -> Result<(), String> {
+        let shader_type = shader
+            .find_property("shader")
+            .ok_or("glshader has no shader property")?
+            .value_type();
+        let weak = self.obj().downgrade();
+        shader.connect("create-shader", false, move |args| {
+            let none = glib::Value::from_type(shader_type);
+            if let (Some(obj), Some(Ok(shader))) = (
+                weak.upgrade(),
+                args.first().map(glib::Value::get::<gst::Element>),
+            ) {
+                let source = shader_source(&lock(&obj.imp().settings).mask);
+                shader.set_property_from_value("shader", &none);
+                shader.set_property("fragment", source);
+            }
+            Some(none)
+        });
+        Ok(())
+    }
+
+    /// Take a new mask, like a new quad: while streaming, an invalid one is
+    /// ignored. The shader is rebuilt for a changed one before the next
+    /// frame.
+    fn set_mask(&self, text: String) {
+        let mask = parse_mask(&text);
+        let streaming = self.streaming.load(Ordering::SeqCst);
+        if let Err(err) = &mask {
+            let action = if streaming {
+                "; keeping the current one"
+            } else {
+                ""
+            };
+            gst::warning!(CAT, imp = self, "invalid mask {text:?}: {err}{action}");
+            if streaming {
+                return;
+            }
+        }
+        let mut settings = lock(&self.settings);
+        settings.mask_text = text;
+        match mask {
+            Err(err) => settings.mask_error = Some(err),
+            Ok(mask) => {
+                settings.mask_error = None;
+                if settings.mask == mask {
+                    return;
+                }
+                settings.mask = mask;
+                drop(settings);
+                if let Ok(children) = self.children() {
+                    children.shader.set_property("update-shader", true);
+                }
+            }
+        }
     }
 
     /// Apply `change` and hand the shader the current settings, which it
@@ -369,6 +477,12 @@ impl ObjectImpl for GlWallWarp {
                     .default_value(DEFAULT_BACKGROUND)
                     .mutable_playing()
                     .build(),
+                glib::ParamSpecString::builder("mask")
+                    .nick("Mask")
+                    .blurb(MASK_BLURB)
+                    .default_value(Some(""))
+                    .mutable_playing()
+                    .build(),
             ]
             });
         PROPERTIES.as_ref()
@@ -400,6 +514,14 @@ impl ObjectImpl for GlWallWarp {
                 lock(&self.settings).background = value.get().unwrap_or(DEFAULT_BACKGROUND);
                 self.push_uniforms(|_drawing| ());
             }
+            "mask" => {
+                let text = value
+                    .get::<Option<String>>()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                self.set_mask(text);
+            }
             other => gst::error!(CAT, imp = self, "unknown property {other}"),
         }
     }
@@ -412,6 +534,7 @@ impl ObjectImpl for GlWallWarp {
             "output-height" => settings.output_height.to_value(),
             "interpolation" => settings.interpolation.to_value(),
             "background" => settings.background.to_value(),
+            "mask" => settings.mask_text.to_value(),
             other => {
                 gst::error!(CAT, imp = self, "unknown property {other}");
                 glib::Value::from_type(pspec.value_type())
@@ -499,6 +622,14 @@ impl ElementImpl for GlWallWarp {
                             self,
                             gst::LibraryError::Settings,
                             ("invalid quad {:?}: {err}", settings.quad_text)
+                        );
+                        return Err(gst::StateChangeError);
+                    }
+                    if let Some(err) = &settings.mask_error {
+                        gst::element_imp_error!(
+                            self,
+                            gst::LibraryError::Settings,
+                            ("invalid mask {:?}: {err}", settings.mask_text)
                         );
                         return Err(gst::StateChangeError);
                     }

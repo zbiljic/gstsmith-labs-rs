@@ -157,6 +157,7 @@ fn registers_with_documented_defaults() {
     assert_eq!(element.property::<u32>("output-height"), 0);
     assert_eq!(element.property::<u32>("background"), 0xff00_0000);
     assert_eq!(element.property::<u32>("n-threads"), 1);
+    assert_eq!(element.property::<String>("mask"), "");
     let interpolation = element.property_value("interpolation");
     let (_, value) = glib::EnumValue::from_value(&interpolation).expect("enum");
     assert_eq!(value.nick(), "bilinear");
@@ -488,6 +489,80 @@ fn quads_change_while_streaming() {
         assert_samples(&warp(&mut h, grid(8, 8, 0, 0)), |x, y| {
             Some((2 * x + 1, 2 * y + 1))
         });
+    }
+}
+
+#[test]
+fn masks_change_while_streaming() {
+    let mut h = harness("background=0", (8, 6));
+    let element = element(&h);
+    let passthrough = || {
+        element
+            .clone()
+            .downcast::<gst_base::BaseTransform>()
+            .expect("base transform")
+            .is_passthrough()
+    };
+    assert_samples(&warp(&mut h, grid(8, 6, 0, 0)), |x, y| Some((x, y)));
+    assert!(passthrough());
+    // The left half, then a hole in the middle: the identity copies no more.
+    element.set_property("mask", "0,0 0.5,0 0.5,1 0,1");
+    assert_eq!(element.property::<String>("mask"), "0,0 0.5,0 0.5,1 0,1");
+    assert_samples(&warp(&mut h, grid(8, 6, 0, 0)), |x, y| {
+        (x < 4).then_some((x, y))
+    });
+    assert!(!passthrough());
+    element.set_property("mask", "0,0 1,0 1,1 0,1; 0.3,0.3 0.7,0.3 0.7,0.7 0.3,0.7");
+    let hole = |x: u32, y: u32| (2..6).contains(&x) && (2..4).contains(&y);
+    assert_samples(&warp(&mut h, grid(8, 6, 0, 0)), |x, y| {
+        (!hole(x, y)).then_some((x, y))
+    });
+    // An invalid mask leaves the current one in place.
+    element.set_property("mask", "0,0 1,0");
+    assert_samples(&warp(&mut h, grid(8, 6, 0, 0)), |x, y| {
+        (!hole(x, y)).then_some((x, y))
+    });
+    // Without a mask, frames pass through again.
+    element.set_property("mask", "");
+    assert_samples(&warp(&mut h, grid(8, 6, 0, 0)), |x, y| Some((x, y)));
+    assert!(passthrough());
+}
+
+#[test]
+fn invalid_masks_fail_at_startup() {
+    init();
+    for mask in ["0,0 1,0", "0,0 1,0 1,one", "0,0 1,0 1e9,1"] {
+        let pipeline = gst::Pipeline::new();
+        let element = gst::ElementFactory::make("wallwarp")
+            .property("mask", mask)
+            .build()
+            .expect("wallwarp");
+        pipeline.add(&element).expect("adding wallwarp");
+        assert_eq!(element.property::<String>("mask"), mask);
+        let _failure = element
+            .set_state(gst::State::Paused)
+            .expect_err("an invalid mask refuses to start");
+        let message = pipeline
+            .bus()
+            .expect("bus")
+            .timed_pop_filtered(gst::ClockTime::from_seconds(1), &[gst::MessageType::Error])
+            .expect("error message");
+        let gst::MessageView::Error(error) = message.view() else {
+            panic!("expected an error message");
+        };
+        assert!(
+            error.error().matches(gst::LibraryError::Settings)
+                && error.error().message().contains("invalid mask"),
+            "{mask:?}: {error:?}"
+        );
+        // A valid mask set afterwards starts.
+        element.set_property("mask", "0,0 1,0 1,1");
+        element
+            .set_state(gst::State::Paused)
+            .expect("a valid mask starts");
+        pipeline
+            .set_state(gst::State::Null)
+            .expect("stopping the pipeline");
     }
 }
 

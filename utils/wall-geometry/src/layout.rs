@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{GeometryError, Homography, LayoutError, Orientation, Point, Quad};
+use crate::{GeometryError, Homography, LayoutError, Mask, Orientation, Point, Quad};
 
 /// The layout schema version this crate reads and writes.
 pub const LAYOUT_VERSION: u32 = 1;
@@ -39,6 +39,9 @@ pub struct Screen {
     pub output: Size,
     /// The display's corners on the canvas, in its own orientation.
     pub corners: Quad,
+    /// The part of the display that shows the picture; all of it when empty.
+    #[serde(default, skip_serializing_if = "Mask::is_empty")]
+    pub mask: Mask,
 }
 
 impl Screen {
@@ -249,6 +252,26 @@ mod tests {
         let layout = example();
         let json = layout.to_json().expect("serialize");
         assert_eq!(Layout::from_json(&json).expect("reparse"), layout);
+    }
+
+    #[test]
+    fn masks_are_optional_and_checked() {
+        let layout = example();
+        assert!(layout.screens.iter().all(|screen| screen.mask.is_empty()));
+        assert!(!layout.to_json().expect("serialize").contains("mask"));
+        let json = edit(|value| {
+            value["screens"][0]["mask"] = serde_json::json!([[[0.5, 0], [1, 1], [0, 1]]]);
+        });
+        let masked = Layout::from_json(&json).expect("masked layout");
+        let mask = &masked.screen("display-a").expect("display-a").mask;
+        assert!(mask.shows(0.5, 0.9));
+        assert!(!mask.shows(0.1, 0.1));
+        let json = masked.to_json().expect("serialize");
+        assert_eq!(Layout::from_json(&json).expect("reparse"), masked);
+        let json = edit(|value| {
+            value["screens"][0]["mask"] = serde_json::json!([[[0.5, 0], [1, 1]]]);
+        });
+        assert!(matches!(rejects(&json), LayoutError::Json(_)));
     }
 
     #[test]

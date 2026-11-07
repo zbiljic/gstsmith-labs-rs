@@ -21,6 +21,7 @@
 mod error;
 mod homography;
 mod layout;
+mod mask;
 mod quad;
 
 pub use error::{GeometryError, LayoutError};
@@ -28,4 +29,5 @@ pub use homography::Homography;
 pub use layout::{
     LAYOUT_VERSION, Layout, MAX_DIMENSION, MAX_ID_LENGTH, Screen, Size, is_valid_screen_id,
 };
+pub use mask::{MAX_MASK_COORDINATE, MAX_MASK_POINTS, Mask};
 pub use quad::{Orientation, Point, Quad};

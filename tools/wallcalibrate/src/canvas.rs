@@ -25,7 +25,7 @@ use std::f64::consts::FRAC_PI_2;
 
 use anyhow::{Context, Result, bail, ensure};
 use wall_geometry::{
-    Homography, LAYOUT_VERSION, Layout, MAX_DIMENSION, Orientation, Point, Quad, Screen, Size,
+    Homography, LAYOUT_VERSION, Layout, MAX_DIMENSION, Mask, Orientation, Point, Quad, Screen, Size,
 };
 
 use crate::calibration::{Calibration, ScreenCalibration};
@@ -308,6 +308,7 @@ pub fn layout(calibration: &Calibration, options: &LayoutOptions) -> Result<Gene
                 id: screen.id.clone(),
                 output: screen.output,
                 corners: quad.map(|p| Point::new(p.x * scale + offset.x, p.y * scale + offset.y)),
+                mask: Mask::default(),
             })
             .collect(),
     };

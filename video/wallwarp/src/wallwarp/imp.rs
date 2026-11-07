@@ -7,10 +7,10 @@ use gst_base::prelude::*;
 use gst_base::subclass::prelude::*;
 use gst_video::prelude::*;
 use gst_video::subclass::prelude::*;
-use wall_geometry::{Homography, Quad};
+use wall_geometry::{Homography, Mask, Quad};
 
 use super::warp::{Plane, PlaneMut, Warp};
-use super::{Interpolation, parse_quad, rgba};
+use super::{Interpolation, MASK_BLURB, parse_mask, parse_quad, rgba};
 
 const DEFAULT_QUAD: &str = "0,0,1,0,1,1,0,1";
 const DEFAULT_OUTPUT_SIZE: u32 = 0;
@@ -35,6 +35,11 @@ struct Settings {
     interpolation: Interpolation,
     background: u32,
     threads: u32,
+    mask_text: String,
+    /// The last valid mask.
+    mask: Mask,
+    /// Why `mask_text` is unusable, if it is.
+    mask_error: Option<String>,
 }
 
 impl Default for Settings {
@@ -47,12 +52,15 @@ impl Default for Settings {
             interpolation: Interpolation::default(),
             background: DEFAULT_BACKGROUND,
             threads: DEFAULT_THREADS,
+            mask_text: String::new(),
+            mask: Mask::default(),
+            mask_error: None,
         }
     }
 }
 
 /// The settings in use while streaming.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Config {
     quad: Quad,
     local_to_source: Homography,
@@ -60,6 +68,15 @@ struct Config {
     background: [u8; 4],
     /// Most threads warping one frame.
     threads: usize,
+    mask: Mask,
+}
+
+impl Config {
+    /// Whether every output pixel is its input pixel when the input and
+    /// output video info are equal.
+    fn is_identity(&self) -> bool {
+        self.quad == Quad::UNIT && self.mask.is_empty()
+    }
 }
 
 /// What caps negotiation settled.
@@ -150,6 +167,38 @@ impl WallWarp {
         });
     }
 
+    /// Take a new mask, like a new quad: while streaming, an invalid one is
+    /// ignored, and an unchanged one changes nothing.
+    fn set_mask(&self, text: String) {
+        let mask = parse_mask(&text);
+        let streaming = lock(&self.state).config.is_some();
+        if let Err(err) = &mask {
+            let action = if streaming {
+                "; keeping the current one"
+            } else {
+                ""
+            };
+            gst::warning!(CAT, imp = self, "invalid mask {text:?}: {err}{action}");
+            if streaming {
+                return;
+            }
+        }
+        let mut settings = lock(&self.settings);
+        settings.mask_text = text;
+        match mask {
+            Err(err) => settings.mask_error = Some(err),
+            Ok(mask) => {
+                settings.mask_error = None;
+                if settings.mask == mask {
+                    return;
+                }
+                settings.mask = mask.clone();
+                drop(settings);
+                self.reconfigure(|config| config.mask = mask);
+            }
+        }
+    }
+
     /// Change the settings in use, if streaming; new coefficients replace the
     /// old ones between frames.
     fn reconfigure(&self, change: impl FnOnce(&mut Config)) {
@@ -159,7 +208,7 @@ impl WallWarp {
                 return;
             };
             change(config);
-            let config = *config;
+            let config = config.clone();
             state.revision += 1;
             (config, state.negotiated, state.revision)
         };
@@ -177,7 +226,9 @@ impl WallWarp {
             output,
             config.interpolation,
             config.background,
-        ) {
+        )
+        .map(|warp| warp.masked(&config.mask))
+        {
             Ok(warp) => {
                 let mut state = lock(&self.state);
                 // A renegotiation or another change meanwhile located its own
@@ -189,7 +240,7 @@ impl WallWarp {
                 drop(state);
                 if current {
                     self.obj()
-                        .set_passthrough(config.quad == Quad::UNIT && same_info);
+                        .set_passthrough(config.is_identity() && same_info);
                 }
             }
             Err(err) => {
@@ -258,6 +309,12 @@ impl ObjectImpl for WallWarp {
                     .default_value(DEFAULT_BACKGROUND)
                     .mutable_playing()
                     .build(),
+                glib::ParamSpecString::builder("mask")
+                    .nick("Mask")
+                    .blurb(MASK_BLURB)
+                    .default_value(Some(""))
+                    .mutable_playing()
+                    .build(),
                 glib::ParamSpecUInt::builder("n-threads")
                     .nick("Threads")
                     .blurb("Maximum number of threads warping each frame; 0 uses one per CPU core")
@@ -298,6 +355,14 @@ impl ObjectImpl for WallWarp {
                 lock(&self.settings).background = background;
                 self.reconfigure(|config| config.background = rgba(background));
             }
+            "mask" => {
+                let text = value
+                    .get::<Option<String>>()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                self.set_mask(text);
+            }
             "n-threads" => {
                 let threads = value.get().unwrap_or(DEFAULT_THREADS);
                 lock(&self.settings).threads = threads;
@@ -315,6 +380,7 @@ impl ObjectImpl for WallWarp {
             "output-height" => settings.output_height.to_value(),
             "interpolation" => settings.interpolation.to_value(),
             "background" => settings.background.to_value(),
+            "mask" => settings.mask_text.to_value(),
             "n-threads" => settings.threads.to_value(),
             other => {
                 gst::error!(CAT, imp = self, "unknown property {other}");
@@ -376,6 +442,12 @@ impl BaseTransformImpl for WallWarp {
                 )
             };
             let quad = settings.quad.as_ref().map_err(|err| invalid(err))?;
+            if let Some(err) = &settings.mask_error {
+                return Err(gst::error_msg!(
+                    gst::LibraryError::Settings,
+                    ("invalid mask {:?}: {err}", settings.mask_text)
+                ));
+            }
             let local_to_source =
                 Homography::unit_square_to_quad(quad).map_err(|err| invalid(&err))?;
             Config {
@@ -384,6 +456,7 @@ impl BaseTransformImpl for WallWarp {
                 interpolation: settings.interpolation,
                 background: rgba(settings.background),
                 threads: thread_count(settings.threads),
+                mask: settings.mask.clone(),
             }
         };
         *lock(&self.state) = State {
@@ -493,9 +566,10 @@ impl VideoFilterImpl for WallWarp {
             config.interpolation,
             config.background,
         )
+        .map(|warp| warp.masked(&config.mask))
         .map_err(|err| gst::loggable_error!(CAT, "cannot warp {source:?} to {output:?}: {err}"))?;
         // The identity warp copies every pixel exactly, so skip the copy.
-        let passthrough = config.quad == Quad::UNIT && in_info == out_info;
+        let passthrough = config.is_identity() && in_info == out_info;
         state.negotiated = Some(Negotiated {
             source,
             output,

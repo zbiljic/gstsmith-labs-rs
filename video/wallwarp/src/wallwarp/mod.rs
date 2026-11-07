@@ -1,6 +1,6 @@
 use gst::glib;
 use gst::prelude::*;
-use wall_geometry::{Homography, Quad};
+use wall_geometry::{Homography, Mask, Quad};
 
 mod imp;
 mod warp;
@@ -28,6 +28,17 @@ pub(crate) fn parse_quad(text: &str) -> Result<Quad, String> {
     let quad = text.parse::<Quad>().map_err(|err| err.to_string())?;
     Homography::unit_square_to_quad(&quad).map_err(|err| err.to_string())?;
     Ok(quad)
+}
+
+/// The `mask` property's description.
+pub(crate) const MASK_BLURB: &str = "Where the output shows the picture, other pixels showing the \
+    background: polygons separated by ';', each as normalized x,y output points (0,0 is the \
+    output top-left, 1,1 its bottom-right); a pixel inside an odd number of polygons shows the \
+    picture. Empty shows it everywhere";
+
+/// A mask from its property text, or why it is unusable.
+pub(crate) fn parse_mask(text: &str) -> Result<Mask, String> {
+    text.parse::<Mask>().map_err(|err| err.to_string())
 }
 
 /// Big-endian ARGB to RGBA bytes.

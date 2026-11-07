@@ -62,6 +62,23 @@ whose width and height each differ from that ratio by less than one pixel.
 Screen order carries no meaning: IDs identify screens. Screens may overlap,
 leave gaps, or extend past the canvas.
 
+A screen may have a `mask`, the part of the display that shows the picture,
+for displays that are not rectangular or are partly covered:
+
+```json
+"mask": [[[0.5, 0], [1, 0.5], [0.5, 1], [0, 0.5]]]
+```
+
+It lists polygons of display-local points, which may lie outside `[0, 1]²`
+to cut off a corner, within ±1000000. A pixel shows the picture when its
+center is inside an odd number of them, so a polygon inside another cuts a
+hole; without a mask, the whole display shows it. A polygon needs at least
+three points, and a mask has at most 256 in all.
+
+Optional fields such as `mask` are added within version 1 and left out of
+files that do not use them, so such files read anywhere; a reader older than
+the field refuses a file that has it.
+
 ## API
 
 - `Layout::from_json`, `Layout::to_json`, and `Layout::validate`.
@@ -76,6 +93,10 @@ leave gaps, or extend past the canvas.
   bounds `|det H| / ‖H‖_F³`, which does not depend on the projective scale.
 - `Quad::orientation` validates a quadrilateral and reports whether it is
   mirrored; `Quad` parses from and formats to eight comma-separated numbers.
+- `Mask::shows(u, v)` tells whether a display-local point shows the picture,
+  and `Mask::crossings(v)` where the polygons' edges cross a row. `Mask`
+  parses from and formats to the `mask` property of `wallwarp`: polygons
+  separated by `;`, each as `x,y` pairs.
 
 ## Development
 

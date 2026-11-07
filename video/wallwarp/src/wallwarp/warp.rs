@@ -3,7 +3,7 @@
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
 
-use wall_geometry::Homography;
+use wall_geometry::{Homography, Mask};
 
 use super::Interpolation;
 
@@ -251,6 +251,37 @@ impl Warp {
             Interpolation::Bilinear => warp.locate::<true>()?,
         };
         Ok(warp)
+    }
+
+    /// Show the background wherever `mask` hides the picture: at pixels
+    /// whose center is outside it.
+    pub(super) fn masked(mut self, mask: &Mask) -> Self {
+        if mask.is_empty() {
+            return self;
+        }
+        let (width, height) = (f64::from(self.output.0), f64::from(self.output.1));
+        let row = usize::try_from(self.output.0).unwrap_or(usize::MAX);
+        for (y, columns) in (0..self.output.1).zip(self.samples.columns.chunks_mut(row)) {
+            let v = (f64::from(y) + 0.5) / height;
+            let mut crossings: Vec<f64> = mask.crossings(v).collect();
+            crossings.sort_by(f64::total_cmp);
+            // A pixel shows the picture when an odd number of crossings lie
+            // to its right.
+            let mut left = 0;
+            for (column, x) in columns.iter_mut().zip(0..) {
+                let u = (f64::from(x) + 0.5) / width;
+                left += crossings
+                    .get(left..)
+                    .unwrap_or_default()
+                    .iter()
+                    .take_while(|crossing| **crossing <= u)
+                    .count();
+                if (crossings.len() - left).is_multiple_of(2) {
+                    *column = OUTSIDE;
+                }
+            }
+        }
+        self
     }
 
     /// Locate every output pixel's sample. Branch-free and in floating
@@ -768,6 +799,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn masks_show_the_background_where_they_hide_the_picture() {
+        // A diamond with a hole, odd sizes so that rows and columns differ.
+        let mask: Mask = "0.5,0 1,0.5 0.5,1 0,0.5; 0.4,0.4 0.6,0.4 0.6,0.6 0.4,0.6"
+            .parse()
+            .expect("mask");
+        let (width, height) = (37, 23);
+        for interpolation in [Interpolation::Nearest, Interpolation::Bilinear] {
+            let warp =
+                warp(Quad::UNIT, (width, height), (width, height), interpolation).masked(&mask);
+            let (output, stride) = run(&warp, (width, height), (width, height), 4);
+            let (input, input_stride) = grid(width, height, 0);
+            let mut hidden = 0;
+            for y in 0..height as usize {
+                for x in 0..width as usize {
+                    let (u, v) = (
+                        (f64::from(u32::try_from(x).expect("x")) + 0.5) / f64::from(width),
+                        (f64::from(u32::try_from(y).expect("y")) + 0.5) / f64::from(height),
+                    );
+                    let expected = if mask.shows(u, v) {
+                        pixel(&input, input_stride, x, y)
+                    } else {
+                        hidden += 1;
+                        BACKGROUND
+                    };
+                    assert_eq!(pixel(&output, stride, x, y), expected, "({x}, {y})");
+                }
+            }
+            // The diamond hides half the output, and its hole 4% more.
+            let share = f64::from(hidden) / f64::from(width * height);
+            assert!((0.5..0.6).contains(&share), "{share}");
+        }
+        // The empty mask changes nothing.
+        let plain = warp(Quad::UNIT, (5, 5), (5, 5), Interpolation::Nearest);
+        let samples = plain.samples.columns.clone();
+        assert_eq!(plain.masked(&Mask::default()).samples.columns, samples);
     }
 
     #[test]

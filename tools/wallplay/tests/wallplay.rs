@@ -807,6 +807,33 @@ fn fills_bar_or_stretch_a_source_of_another_shape() {
     }
 }
 
+#[test]
+fn layout_masks_reach_the_warps() {
+    init();
+    let mut masked: Value = serde_json::from_str(&two_displays_json()).expect("json");
+    masked
+        .pointer_mut("/screens/0")
+        .and_then(Value::as_object_mut)
+        .expect("left screen")
+        .insert("mask".to_owned(), json!([[[0.5, 0], [1, 1], [0, 1]]]));
+    let masked = Layout::from_json(&masked.to_string()).expect("layout");
+    let measurement = std::sync::Arc::default();
+    let mut player =
+        Player::start(&masked, &options(), &measurement, Clock::new(), |_| {}).expect("player");
+    let mask = |player: &Player, id: &str| {
+        player
+            .pipeline()
+            .by_name(&format!("warp-{id}"))
+            .expect("warp")
+            .property::<String>("mask")
+    };
+    assert_eq!(mask(&player, "left"), "0.5,0 1,1 0,1");
+    assert_eq!(mask(&player, "right"), "");
+    // A mask belongs to the display: it changes with the layout at once.
+    assert!(player.update_layout(&two_displays(), Fill::default()));
+    assert_eq!(mask(&player, "left"), "");
+}
+
 /// The pixel at the middle of the left edge of the next canvas frame from
 /// the input bin `bin`, if it is playing.
 fn canvas_edge(player: &Player, bin: &str) -> Option<[u8; 4]> {
@@ -1358,6 +1385,43 @@ fn layouts_fill_the_canvas_level_and_straighten() {
     );
     assert_eq!(status, 400, "{error}");
     layout(json!({"mode": "planar", "anchor": "left", "canvas": {"longest": 1000}}));
+}
+
+#[test]
+fn new_layouts_keep_the_displays_masks() {
+    let state = tempfile::tempdir().expect("state directory");
+    let viewpoint = json!({"mode": "viewpoint", "canvas": {"longest": 1000}});
+    {
+        let (_app, address) = serve(state.path());
+        calibrate(address);
+        ok(address, "POST", "/api/layout", &viewpoint);
+    }
+    // A mask written into the stored layout by hand...
+    let path = state.path().join("layout.json");
+    let mut stored: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("layout")).expect("JSON");
+    let screens = stored
+        .get_mut("screens")
+        .and_then(Value::as_array_mut)
+        .expect("screens");
+    for screen in screens.iter_mut() {
+        if screen.get("id") == Some(&json!("left"))
+            && let Some(screen) = screen.as_object_mut()
+        {
+            screen.insert("mask".to_owned(), json!([[[0.5, 0], [1, 1], [0, 1]]]));
+        }
+    }
+    std::fs::write(&path, stored.to_string()).expect("writing the layout");
+    // ...is played by a restarted server and kept by its next layout.
+    let (_app, address) = serve(state.path());
+    ok(address, "POST", "/api/layout", &viewpoint);
+    let layout = Layout::from_json(
+        &String::from_utf8(request(address, "GET", "/api/layout", b"").1).expect("UTF-8"),
+    )
+    .expect("layout");
+    let mask = |id: &str| layout.screen(id).expect("screen").mask.to_string();
+    assert_eq!(mask("left"), "0.5,0 1,1 0,1");
+    assert_eq!(mask("right"), "");
 }
 
 #[test]

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use image::DynamicImage;
-use wall_geometry::{Layout, Point, Quad, Screen, Size};
+use wall_geometry::{Layout, Mask, Point, Quad, Screen, Size};
 use wallcalibrate::calibration::{self, Calibration, SolveOptions, Status};
 use wallcalibrate::canvas::{self, CanvasSize, LayoutOptions, Mode};
 use wallcalibrate::detect::{self, DETECTIONS_VERSION, Detections, Photo};
@@ -334,6 +334,7 @@ fn coplanar_wall() -> Layout {
         id: id.to_owned(),
         output: Size { width, height },
         corners: quad(corners),
+        mask: Mask::default(),
     };
     Layout {
         version: 1,

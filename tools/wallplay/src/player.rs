@@ -2143,6 +2143,7 @@ impl Player {
         let warp = gst::ElementFactory::make(factory)
             .name(format!("warp-{id}"))
             .property("quad", layout.source_quad(screen).to_string())
+            .property("mask", screen.mask.to_string())
             .build()
             .with_context(|| format!("creating {factory}"))?;
         let output = size_filter(output_caps(screen.output, self.warp)?)?;
@@ -2534,6 +2535,8 @@ impl Player {
                 self.add_display(layout, screen)?;
                 continue;
             };
+            // A mask belongs to the display, whatever the canvas.
+            branch.warp.set_property("mask", screen.mask.to_string());
             let quad = layout.source_quad(screen).to_string();
             {
                 let mut pending = lock(&branch.pending);

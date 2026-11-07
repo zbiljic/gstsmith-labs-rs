@@ -95,6 +95,12 @@ The state directory keeps `manifest.json`, the photo, `detections.json`,
 restarted server plays the last layout, and the files work with the
 `wallcalibrate` command line.
 
+A display that is not rectangular or is partly covered can be given a
+`mask` in `layout.json` while the server is stopped: the part of the display
+that shows the picture, as described under
+[Masks](../../video/wallwarp/README.md#masks). The rest of it stays black.
+New layouts keep each display's mask.
+
 Each display's stream has its viewport's aspect ratio, at most
 `--max-output` pixels on the longer side and in CSS pixels, so a high-DPI
 display at 2x scaling gets a stream at half its device resolution.

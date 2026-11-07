@@ -283,6 +283,102 @@ fn frames_match_wallwarp() {
     }
 }
 
+/// A diamond with a hole in it. Uneven coordinates keep its edges off pixel
+/// centers, where single and double precision could decide differently.
+const MASK: &str = "0.503,0.013 0.987,0.497 0.511,0.991 0.017,0.483; \
+                    0.391,0.403 0.613,0.389 0.597,0.607 0.409,0.593";
+
+#[test]
+fn masks_match_wallwarp() {
+    if !gl() {
+        return;
+    }
+    for (interpolation, expected) in [("nearest", Match::Nearest), ("bilinear", Match::Bilinear)] {
+        for quad in [QUADS[0], QUADS[1], QUADS[3]] {
+            // The same size and the identity quad would otherwise pass
+            // frames through.
+            for (input, output) in [
+                ((64, 48), (40, 30)),
+                ((33, 17), (50, 41)),
+                ((64, 48), (64, 48)),
+            ] {
+                let properties = format!(
+                    "quad={quad} interpolation={interpolation} mask=\"{MASK}\" \
+                     output-width={} output-height={}",
+                    output.0, output.1
+                );
+                let mut cpu = Warp::new("wallwarp", &properties, input, RGBA);
+                let mut gl = Warp::new("glwallwarp", &properties, input, RGBA);
+                assert_eq!(gl.element().property::<String>("mask"), MASK);
+                assert_same(
+                    &mut cpu,
+                    &mut gl,
+                    expected,
+                    &format!("masked {interpolation} {quad} {input:?} to {output:?}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn masks_decide_ties_and_restarts_like_wallwarp() {
+    if !gl() {
+        return;
+    }
+    // Edges through pixel centers: x = 0.5 at an odd width, and 0.25, 0.75
+    // at a width and height of 2 mod 4. A center on an edge is to its right
+    // and below it.
+    for (mask, output) in [
+        ("0,0 0.5,0 0.5,1 0,1", (41, 31)),
+        ("0.25,0.25 0.75,0.25 0.75,0.75 0.25,0.75", (42, 30)),
+    ] {
+        let properties = format!(
+            "interpolation=nearest mask=\"{mask}\" output-width={} output-height={}",
+            output.0, output.1
+        );
+        let mut cpu = Warp::new("wallwarp", &properties, (64, 48), RGBA);
+        let mut gl = Warp::new("glwallwarp", &properties, (64, 48), RGBA);
+        assert_same(&mut cpu, &mut gl, Match::Nearest, &format!("{mask} ties"));
+        // Started again, the shader is rebuilt with the mask.
+        for warp in [&cpu, &gl] {
+            warp.pipeline.set_state(gst::State::Null).expect("stopping");
+            warp.pipeline
+                .set_state(gst::State::Playing)
+                .expect("playing again");
+        }
+        assert_same(
+            &mut cpu,
+            &mut gl,
+            Match::Nearest,
+            &format!("{mask} restarted"),
+        );
+    }
+    // An invalid mask refuses to start, as an invalid quad does.
+    let pipeline = gst::Pipeline::new();
+    let element = gst::ElementFactory::make("glwallwarp")
+        .property("mask", "0,0 1,0")
+        .build()
+        .expect("glwallwarp");
+    pipeline.add(&element).expect("adding");
+    let _failure = element
+        .set_state(gst::State::Paused)
+        .expect_err("an invalid mask refuses to start");
+    let message = pipeline
+        .bus()
+        .expect("bus")
+        .timed_pop_filtered(gst::ClockTime::from_seconds(5), &[gst::MessageType::Error])
+        .expect("an error message");
+    let gst::MessageView::Error(error) = message.view() else {
+        panic!("expected an error message");
+    };
+    assert!(
+        error.error().message().contains("invalid mask"),
+        "{error:?}"
+    );
+    let _ignored = pipeline.set_state(gst::State::Null);
+}
+
 #[test]
 fn large_sources_halved_pick_the_same_pixels() {
     if !gl() {
@@ -313,12 +409,16 @@ fn settings_change_between_frames() {
     let mut cpu = Warp::new("wallwarp", start, (64, 48), RGBA);
     let mut gl = Warp::new("glwallwarp", start, (64, 48), RGBA);
     assert_same(&mut cpu, &mut gl, Match::Nearest, "at the start");
-    let changes: [(&str, glib::Value, Match); 5] = [
+    let changes: [(&str, glib::Value, Match); 8] = [
+        ("mask", MASK.to_value(), Match::Nearest),
+        // An invalid mask is ignored.
+        ("mask", "0,0 1,1".to_value(), Match::Nearest),
         ("quad", QUADS[0].to_value(), Match::Nearest),
         ("background", 0xff40_5060_u32.to_value(), Match::Nearest),
         ("quad", QUADS[3].to_value(), Match::Nearest),
         ("output-width", 24_u32.to_value(), Match::Nearest),
         ("interpolation", "bilinear".to_value(), Match::Bilinear),
+        ("mask", "".to_value(), Match::Bilinear),
     ];
     for (name, value, expected) in changes {
         for warp in [&cpu, &gl] {

@@ -911,6 +911,16 @@ impl App {
                 straighten: request.straighten,
             },
         )?;
+        let mut generated = generated;
+        // Masks are written by hand and belong to the displays: a new
+        // layout keeps them.
+        if let Some(previous) = &state.layout {
+            for screen in &mut generated.layout.screens {
+                if let Some(old) = previous.layout.screen(&screen.id) {
+                    screen.mask.clone_from(&old.mask);
+                }
+            }
+        }
         let json = generated
             .layout
             .to_json()
