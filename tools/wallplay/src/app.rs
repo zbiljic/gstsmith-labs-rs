@@ -27,6 +27,7 @@ use wallcalibrate::detect::{self, Detections, Photo};
 use wallcalibrate::manifest::{Manifest, Placement};
 use wallcalibrate::{pattern, preview, tag};
 
+use crate::capture;
 use crate::drift::{FrameReport, Measurement};
 use crate::framecode::CodeGeometry;
 use crate::http::{Handler, Request, Response};
@@ -597,6 +598,12 @@ impl App {
             ("GET", ["api", "layout"]) => self.file("layout.json"),
             ("GET", ["api", "layout.svg"]) => self.layout_svg(),
             ("POST", ["api", "play"]) => self.play(),
+            // Each connection has its own thread, so finding the devices,
+            // which takes a moment, holds up nothing else.
+            ("GET", ["api", "devices"]) => Ok(Response::json(&json!({
+                "devices": capture::devices(),
+                "screen_capture": capture::SCREEN_CAPTURE,
+            }))),
             ("POST", ["api", "source"]) => request
                 .json()
                 .map_err(|error| Failure::new(400, format!("{error:#}")))

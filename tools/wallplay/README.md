@@ -72,7 +72,7 @@ It prints the control page's address, for example `http://192.168.1.20:8000/`.
 ```text
 --listen ADDRESS:PORT    control and display pages [default: 0.0.0.0:8000]
 --state DIRECTORY        calibration files [default: wallplay-state]
---source PATTERN|URL|PIPELINE  what to play first [default: bars]
+--source PATTERN|URL|camera:ID|screen:N|PIPELINE  what to play first [default: bars]
 --standby PATTERN        shown whenever the source is not [default: slate]
 --play-once              leave the standby showing when the source ends
 --sound DISPLAY          play the sound on this display; without it, no sound
@@ -82,10 +82,13 @@ It prints the control page's address, for example `http://192.168.1.20:8000/`.
 --signalling-port PORT   first port of the per-display signalling servers [default: 8443]
 --signalling-uri URI     one external signalling server for every display
 --warp auto|cpu|gpu      where displays' frames are warped [default: auto]
+--list-devices           list this machine's cameras and screens, and exit
 ```
 
-`--source` takes a test pattern's ID, a URL (see [Sources](#sources)), or a
-`gst-launch-1.0` description with one video output and at most one audio
+`--source` takes a test pattern's ID, a URL (see [Sources](#sources)), a
+camera or screen of this machine as `--list-devices` names it (see
+[Cameras and screens](#cameras-and-screens)), or a `gst-launch-1.0`
+description with one video output and at most one audio
 output, such as `"videotestsrc is-live=true pattern=snow"`. The control page
 can switch between patterns and URLs, but not set a pipeline description:
 over an unauthenticated page, a pipeline could write files.
@@ -137,6 +140,14 @@ A URL under **Source** opens by what it looks like, or as **Open as** says:
 | HTTP(S) ending in `/whep` | `whepclientsrc` (WebRTC-HTTP egress) | `http://mediamtx:8889/cam/whep` |
 | Any other HTTP(S) page | yt-dlp, then `uridecodebin` | YouTube videos and live streams, Vimeo, and [many more](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md) |
 
+Cameras and screens of the machine running `wallplay` are chosen from a list
+instead; see [Cameras and screens](#cameras-and-screens):
+
+| Source | Opens with | Examples |
+|---|---|---|
+| A camera | the element its device provider makes | `camera:USB Camera` |
+| A screen, on macOS | `avfvideosrc` | `screen:1` |
+
 Their sound plays when it is turned on, except WHEP's; see [Sound](#sound).
 
 - **Web pages** take a few seconds to look up. yt-dlp picks video up to 1080
@@ -173,6 +184,31 @@ patterns, pass without waiting for their latency a second time.
 
 Tested against MediaMTX 1.21 (RTSP, HLS, SRT, and WHEP with H.264
 and VP8), local files, a YouTube video, and a live channel on another site.
+
+### Cameras and screens
+
+**A camera or screen of this computer…** under **Source** lists the cameras
+of the machine running `wallplay`, as GStreamer's device monitor finds
+them, and on macOS its screens, captured by `avfvideosrc` with the cursor.
+`--list-devices` prints the same list as `--source` values, such as
+`camera:USB Camera` or `screen:1`; a second camera of the same name is
+`camera:USB Camera (2)`, numbered in the order the device monitor lists
+them, which can change when cameras are plugged in again. A camera is
+looked for again before each retry, so one plugged back in plays. They play
+like any live source: switched to while playing, with the standby and
+retries. Cameras play their raw video modes; larger modes some cameras
+offer only as JPEG are not used.
+
+A program without permission to record the screen gets no frames rather
+than an error: the standby shows "no video within 30 s" and asks about the
+permission. Give the program running `wallplay` that permission and restart
+it; cameras need their own. Screen capture on other systems, such as Linux's
+PipeWire portal or `ximagesrc`, is not supported yet; a `gst-launch-1.0`
+description with `--source` can stand in.
+
+Measured with the browser check (`--source screen:1`) on one machine, a
+screen played at 29 frames a second and reached the browsers about 50 ms
+after capture, 30 ms of it in `wallplay`'s pipeline.
 
 ### Test patterns
 
@@ -448,7 +484,8 @@ Tested with GStreamer 1.28.8 and `rswebrtc` 0.15.4:
 | `GET /api/photo.jpg`, `GET /api/displays/ID/preview.jpg` | The photo, reduced, and a display's latest output, for the simulation; the preview is `204 No Content` before a display's first frame |
 | `GET /api/layout`, `/api/layout.svg`, `/api/manifest` | Files and preview |
 | `POST /api/play`, `POST /api/idle` | Start or stop playback |
-| `POST /api/source` | `{"pattern": ID}`, or a URL as `{"uri": URL}` to open it by its look, `{"media": URL}`, `{"page": URL}` or `{"whep": URL}`; switches while playing |
+| `POST /api/source` | `{"pattern": ID}`, a URL as `{"uri": URL}` to open it by its look, `{"media": URL}`, `{"page": URL}` or `{"whep": URL}`, or `{"camera": ID}` or `{"screen": N}`; switches while playing |
+| `GET /api/devices` | The cameras and screens a source can name, and whether screens can be captured here |
 | `POST /api/playback` | `{"restart": bool, "standby": ID}`, either one; applies while playing |
 | `POST /api/buffer` | `{"ms": N}` or `{"ms": null}`: the browsers' jitter buffer target |
 | `POST /api/sound` | `{"display": ID}` or `{"display": null}`: the display that plays the sound; turning it on or off restarts playback |
@@ -500,15 +537,15 @@ displays receive the tone and only that one plays it, moves the sound to the
 other display, and turns it off. Finally it makes one display 100 ms late and
 checks that aligning brings both together. `--signalling-server` repeats it
 with an external `gst-webrtc-signalling-server`, `--warp cpu` or `--warp
-gpu` picks the warp, and `--output DIR` keeps screenshots.
+gpu` picks the warp, `--source` what plays while measuring, as `wallplay`'s
+`--source` takes it, and `--output DIR` keeps screenshots.
 
 ## Limitations
 
 - One source and one layout at a time.
 - Sound plays on one display, and every display's video waits for it; WHEP
   sources play without it.
-- No local cameras or screen capture; a camera on the network plays over
-  RTSP, SRT, or WHEP.
+- Screens can be captured on macOS only.
 - Patterns come from `videotestsrc`; there is no pattern drawn per display,
   such as a timecode on every screen.
 - The simulation shows the photographed position only; it cannot show how the

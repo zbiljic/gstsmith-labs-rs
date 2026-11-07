@@ -21,15 +21,16 @@ Options:
                              [default: 0.0.0.0:8000]
   --state DIRECTORY          Keep the manifest, photo, calibration and layout
                              here [default: wallplay-state]
-  --source PATTERN|URL|PIPELINE
+  --source PATTERN|URL|camera:ID|screen:N|PIPELINE
                              What to play first: a test pattern (bars, sweep,
                              ball, spokes, checkerboard, timecode, slate,
                              black); a URL such as file:///path/video.mp4,
                              rtsp://camera/stream, an HLS playlist, a WHEP
                              endpoint ending in /whep, or a web page such as
-                             YouTube; or a gst-launch-1.0 description with one
-                             video output and at most one audio output
-                             [default: bars]
+                             YouTube; a camera or screen of this machine, as
+                             --list-devices shows them; or a gst-launch-1.0
+                             description with one video output and at most
+                             one audio output [default: bars]
   --standby PATTERN          Shown while the source connects, after it ends
                              and when it fails [default: slate]
   --play-once                Leave the standby showing when the source ends,
@@ -48,6 +49,7 @@ Options:
   --signalling-uri URI       Use one external signalling server instead, such
                              as ws://HOST:8443 from gst-webrtc-signalling-server;
                              browsers connect to the same URI
+  --list-devices             List this machine's cameras and screens, and exit
   -h, --help                 Show this help
 
 Open the control page, then open http://HOST:PORT/display/ID on every display.";
@@ -66,7 +68,14 @@ fn value<T: std::str::FromStr>(name: &str, value: Option<String>) -> Result<T> {
         .map_err(|_err| anyhow::anyhow!("{name} {value:?} is not valid"))
 }
 
-fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
+/// What the command line asks for.
+enum Command {
+    Help,
+    ListDevices,
+    Run(Box<Options>),
+}
+
+fn options(mut args: impl Iterator<Item = String>) -> Result<Command> {
     let mut listen: SocketAddr = "0.0.0.0:8000".parse()?;
     let mut state_dir = "wallplay-state".into();
     let mut source = DEFAULT_SOURCE.to_owned();
@@ -100,7 +109,8 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
                     other => bail!("--warp {other:?} is not auto, cpu or gpu"),
                 }
             }
-            "-h" | "--help" => return Ok(None),
+            "--list-devices" => return Ok(Command::ListDevices),
+            "-h" | "--help" => return Ok(Command::Help),
             _ => bail!("unknown argument {arg}"),
         }
     }
@@ -122,7 +132,7 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
             first_port,
         },
     };
-    Ok(Some(Options {
+    Ok(Command::Run(Box::new(Options {
         listen,
         config: Config {
             state_dir,
@@ -145,7 +155,7 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Option<Options>> {
             sound,
         },
         warp,
-    }))
+    })))
 }
 
 /// This machine's address on the network other devices use, if any; finding
@@ -201,19 +211,45 @@ fn run(mut options: Options) -> Result<()> {
     wallplay::http::serve(&listener, &app.handler())
 }
 
+/// Print the cameras and screens a source can name.
+fn list_devices() -> Result<()> {
+    gst::init()?;
+    let devices = wallplay::capture::devices();
+    if devices.is_empty() {
+        println!("No cameras or screens found.");
+    }
+    for device in devices {
+        let size = device
+            .size
+            .map(|size| format!(" ({size})"))
+            .unwrap_or_default();
+        let source = match device.kind {
+            wallplay::capture::Kind::Camera => format!("camera:{}", device.id),
+            wallplay::capture::Kind::Screen => format!("screen:{}", device.id),
+        };
+        println!("{source}\t{}{size}", device.name);
+    }
+    if !wallplay::capture::SCREEN_CAPTURE {
+        println!("Screens can be captured on macOS only.");
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
+    let done = |result: Result<()>| match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("wallplay: {error:#}");
+            ExitCode::FAILURE
+        }
+    };
     match options(std::env::args().skip(1)) {
-        Ok(None) => {
+        Ok(Command::Help) => {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Ok(Some(options)) => match run(options) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("wallplay: {error:#}");
-                ExitCode::FAILURE
-            }
-        },
+        Ok(Command::ListDevices) => done(list_devices()),
+        Ok(Command::Run(options)) => done(run(*options)),
         Err(error) => {
             eprintln!("wallplay: {error:#}\n\n{USAGE}");
             ExitCode::from(2)

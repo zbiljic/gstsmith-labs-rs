@@ -1199,6 +1199,27 @@ fn sources_and_buffers_are_checked() {
         status("/api/source", json!({"uri": "file:///video.mp4"})),
         200
     );
+    // Cameras and screens must exist; the reason says what is missing.
+    let (code, error) = json_request(
+        address,
+        "POST",
+        "/api/source",
+        &json!({"camera": "No such camera"}),
+    );
+    assert_eq!(code, 422, "{error}");
+    assert!(error.to_string().contains("no camera"), "{error}");
+    let (code, error) = json_request(address, "POST", "/api/source", &json!({"screen": 0}));
+    assert_eq!(code, 422, "{error}");
+    let expected = if wallplay::capture::SCREEN_CAPTURE {
+        "numbered from 1"
+    } else {
+        "macOS only"
+    };
+    assert!(error.to_string().contains(expected), "{error}");
+    assert_eq!(status("/api/source", json!({"camera": ""})), 422);
+    let devices = ok(address, "GET", "/api/devices", &Value::Null);
+    assert!(devices["devices"].is_array(), "{devices}");
+    assert!(devices["screen_capture"].is_boolean(), "{devices}");
     assert_eq!(status("/api/playback", json!({"standby": "plaid"})), 400);
     assert_eq!(
         status(

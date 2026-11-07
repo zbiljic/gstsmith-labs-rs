@@ -324,6 +324,8 @@ def run(args, directory):
     command = [
         args.wallplay, "--listen", f"127.0.0.1:{port}", "--state", directory / "state", "--warp", args.warp,
     ]
+    if args.source:
+        command += ["--source", args.source]
     external = None
     if args.signalling_server:
         external = subprocess.Popen(
@@ -543,6 +545,7 @@ def main():
     parser.add_argument("--output", type=Path, help="keep screenshots and files here")
     parser.add_argument("--verbose", action="store_true", help="print wallplay's output")
     parser.add_argument("--warp", choices=["auto", "cpu", "gpu"], default="auto", help="where wallplay warps")
+    parser.add_argument("--source", help="what wallplay plays first and while measuring, as its --source takes")
     args = parser.parse_args()
     args.wallplay = args.wallplay.resolve()
     args.wallcalibrate = args.wallcalibrate.resolve()

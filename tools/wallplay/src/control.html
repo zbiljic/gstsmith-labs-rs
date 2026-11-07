@@ -134,6 +134,12 @@
     </select></label>
     <button id="use-url">Play this</button>
   </div>
+  <div class="row" id="device-row" hidden>
+    <label>Device <select id="device"></select></label>
+    <button id="refresh-devices">Look again</button>
+    <button id="use-device" disabled>Play this</button>
+  </div>
+  <p class="muted" id="device-help" hidden></p>
   <p class="muted" id="url-help" hidden>Files on this server (file:///…), HTTP(S) videos, HLS and DASH playlists, RTSP, SRT and RTMP cameras and encoders, WHEP endpoints (URLs ending in /whep), and YouTube and other pages yt-dlp knows, which take a few seconds to look up. WHEP endpoints play without sound.</p>
   <div class="row">
     <label><input id="restart" type="checkbox"> Restart when it ends or fails: clips loop, streams reconnect</label>
@@ -305,6 +311,11 @@ function renderLayout() {
 
 /** Set while a URL is being typed, so refreshes keep the URL row open. */
 let choosingUrl = false;
+/** Set while a camera or screen is being chosen, likewise. */
+let choosingDevice = false;
+/** Whether the cameras and screens were listed, or are being looked for. */
+let devicesListed = false;
+let findingDevices = false;
 
 /** The source's kind and value, as in {"pattern": "bars"}. */
 function sourceEntry(source) {
@@ -317,14 +328,26 @@ function renderSource() {
   if (!select.options.length) {
     select.append(...state.patterns.map(pattern => new Option(pattern.name, `pattern:${pattern.id}`)));
     select.append(new Option("URL: a video, stream, camera or web page…", "url"));
+    select.append(new Option("A camera or screen of this computer…", "device"));
     $("#standby").append(...state.patterns.map(pattern => new Option(pattern.name, pattern.id)));
   }
   const launch = [...select.options].find(option => option.value === "launch");
   if (kind === "launch" && !launch) select.append(new Option("Pipeline from the command line", "launch"));
   if (document.activeElement !== select) {
-    const current = kind === "pattern" ? `pattern:${value}` : kind === "launch" ? "launch" : "url";
-    select.value = choosingUrl ? "url" : current;
+    const current = kind === "pattern" ? `pattern:${value}`
+      : kind === "launch" ? "launch"
+      : kind === "camera" || kind === "screen" ? "device"
+      : "url";
+    select.value = choosingUrl ? "url" : choosingDevice ? "device" : current;
     $("#url-row").hidden = $("#url-help").hidden = select.value !== "url";
+    $("#device-row").hidden = $("#device-help").hidden = select.value !== "device";
+    // A page opened while a camera or screen plays lists the devices too,
+    // and shows which one plays.
+    if (select.value === "device" && !devicesListed && !findingDevices) findDevices();
+    if ((kind === "camera" || kind === "screen") && document.activeElement !== $("#device")) {
+      const playing = JSON.stringify({ [kind]: value });
+      if ([...$("#device").options].some(option => option.value === playing)) $("#device").value = playing;
+    }
     if (select.value === "url" && document.activeElement !== $("#url")) {
       $("#url").value = value;
       $("#open-as").value = kind;
@@ -348,7 +371,7 @@ function renderSound() {
   if (document.activeElement !== select) select.value = state.sound ?? "";
 }
 
-const VIA = { pattern: "test pattern", gstreamer: "GStreamer", "yt-dlp": "found by yt-dlp", whep: "WHEP", pipeline: "pipeline" };
+const VIA = { pattern: "test pattern", gstreamer: "GStreamer", "yt-dlp": "found by yt-dlp", whep: "WHEP", pipeline: "pipeline", capture: "captured" };
 
 /** What plays, and while playing what it is doing. */
 function renderSourceStatus() {
@@ -642,8 +665,11 @@ const playing = () => state.show === "play";
 $("#source").addEventListener("change", event => {
   const value = event.target.value;
   choosingUrl = value === "url";
+  choosingDevice = value === "device";
   $("#url-row").hidden = $("#url-help").hidden = !choosingUrl;
+  $("#device-row").hidden = $("#device-help").hidden = !choosingDevice;
   if (choosingUrl) $("#url").focus();
+  if (choosingDevice) findDevices();
   if (value.startsWith("pattern:")) {
     act(event.target, () => api("POST", "/api/source", { pattern: value.slice("pattern:".length) }),
       () => (playing() ? "Switched to the pattern." : "Pattern chosen. Press Play."));
@@ -661,6 +687,44 @@ function useUrl() {
   }, () => (playing() ? "Switching; the current source shows until the new one plays." : "URL chosen. Press Play."));
 }
 $("#use-url").addEventListener("click", useUrl);
+
+/** List the cameras and screens; finding them takes a moment. */
+function findDevices() {
+  const help = $("#device-help");
+  help.textContent = "Looking for cameras and screens…";
+  findingDevices = true;
+  act($("#refresh-devices"), () => api("GET", "/api/devices").finally(() => {
+    findingDevices = false;
+  }).catch(error => {
+    // Listed or not, only "Look again" asks again.
+    devicesListed = true;
+    help.textContent = "The cameras and screens could not be listed.";
+    throw error;
+  }).then(({ devices, screen_capture }) => {
+    devicesListed = true;
+    $("#device").replaceChildren(...devices.map(device => new Option(
+      `${device.name}${device.size ? ` (${device.size})` : ""}`,
+      JSON.stringify(device.kind === "camera" ? { camera: device.id } : { screen: Number(device.id) }),
+    )));
+    $("#use-device").disabled = !devices.length;
+    const notes = [devices.length ? "" : "No cameras or screens found."];
+    if (screen_capture) {
+      notes.push("Capturing a screen needs permission to record the screen for the program running wallplay; without it, no picture arrives.");
+    } else {
+      notes.push("Screens can be captured on macOS only.");
+    }
+    help.textContent = notes.filter(Boolean).join(" ");
+  }));
+}
+$("#refresh-devices").addEventListener("click", findDevices);
+$("#use-device").addEventListener("click", () => {
+  const value = $("#device").value;
+  if (!value) return;
+  act($("#use-device"), () => api("POST", "/api/source", JSON.parse(value)).then(result => {
+    choosingDevice = false;
+    return result;
+  }), () => (playing() ? "Switching; the current source shows until the new one plays." : "Device chosen. Press Play."));
+});
 $("#url").addEventListener("keydown", event => { if (event.key === "Enter") useUrl(); });
 $("#restart").addEventListener("change", event => act(event.target, () => api("POST", "/api/playback", { restart: event.target.checked })));
 $("#standby").addEventListener("change", event => act(event.target, () => api("POST", "/api/playback", { standby: event.target.value })));

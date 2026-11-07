@@ -17,6 +17,8 @@ use gst::prelude::*;
 use serde::{Deserialize, Serialize};
 use wall_geometry::Size;
 
+use crate::capture;
+
 /// What feeds the canvas.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -34,14 +36,26 @@ pub enum Source {
     /// A `gst-launch-1.0` description with one unlinked video source pad,
     /// and at most one unlinked audio source pad.
     Launch(String),
+    /// A camera of this machine, by its ID in [`capture::devices`].
+    Camera(String),
+    /// A screen of this machine, counted from 1.
+    Screen(u32),
 }
 
 impl Source {
-    /// A pattern if `text` names one, a URL if it has a scheme, otherwise a
-    /// pipeline description.
+    /// A pattern if `text` names one, a camera as `camera:ID`, a screen as
+    /// `screen:N`, a URL if it has a scheme, otherwise a pipeline
+    /// description.
     #[must_use]
     pub fn parse(text: &str) -> Self {
-        if pattern(text).is_some() {
+        if let Some(id) = text.strip_prefix("camera:") {
+            Self::Camera(id.to_owned())
+        } else if let Some(number) = text
+            .strip_prefix("screen:")
+            .and_then(|number| number.parse().ok())
+        {
+            Self::Screen(number)
+        } else if pattern(text).is_some() {
             Self::Pattern(text.to_owned())
         } else if text.contains("://") {
             Self::Uri(text.to_owned())
@@ -242,6 +256,7 @@ pub enum Via {
     YtDlp,
     Whep,
     Pipeline,
+    Capture,
 }
 
 /// What a player plugs in for a source.
@@ -256,6 +271,10 @@ pub enum Input {
     },
     Whep(String),
     Launch(String),
+    /// A camera found when the source was prepared, so starting it does not
+    /// look for it again.
+    Camera(gst::Device),
+    Screen(u32),
 }
 
 /// RTSP's jitter buffer, down from `rtspsrc`'s two seconds.
@@ -320,6 +339,15 @@ impl Input {
                 // offer with audio for a stream without it.
                 source.set_property("audio-codecs", gst::Array::new(Vec::<String>::new()));
                 return Ok(vec![source]);
+            }
+            Self::Camera(device) => {
+                let source = device.create_element(None).with_context(|| {
+                    format!("opening camera {:?}", device.display_name().as_str())
+                })?;
+                return Ok(vec![capture::capture_bin(&source)?]);
+            }
+            Self::Screen(number) => {
+                return Ok(vec![capture::capture_bin(&capture::screen(*number)?)?]);
             }
             Self::Pattern(id) => pattern_launch(id, canvas)?,
             Self::Launch(description) => description.clone(),
@@ -429,6 +457,24 @@ impl Prepared {
             }
             Source::Launch(description) => {
                 return Ok(plain(Via::Pipeline, Input::Launch(description.clone())));
+            }
+            Source::Camera(id) => {
+                let device = capture::camera(id)?;
+                return Ok(Self {
+                    title: Some(device.display_name().to_string()),
+                    live: Some(true),
+                    ..plain(Via::Capture, Input::Camera(device))
+                });
+            }
+            // A screen that does not exist fails as it starts, with the
+            // reason; counting them would start every one.
+            Source::Screen(number) => {
+                capture::screen(*number)?;
+                return Ok(Self {
+                    title: Some(format!("Screen {number}")),
+                    live: Some(true),
+                    ..plain(Via::Capture, Input::Screen(*number))
+                });
             }
             Source::Uri(url) | Source::Media(url) | Source::Page(url) | Source::Whep(url) => url,
         };
@@ -755,6 +801,31 @@ mod tests {
         let whep = Prepared::prepare(&Source::Uri("http://h:8889/cam/whep".to_owned()), &missing)
             .expect("whep");
         assert_eq!(whep.input, Input::Whep("http://h:8889/cam/whep".to_owned()));
+    }
+
+    #[test]
+    fn cameras_and_screens_parse() {
+        assert_eq!(
+            Source::parse("camera:Desk (2)"),
+            Source::Camera("Desk (2)".to_owned())
+        );
+        assert_eq!(Source::parse("screen:2"), Source::Screen(2));
+        // Not a number: a pipeline description, refused when it starts.
+        assert_eq!(
+            Source::parse("screen:main"),
+            Source::Launch("screen:main".to_owned())
+        );
+        assert_eq!(Source::parse("screen:0"), Source::Screen(0));
+        assert_eq!(Source::parse("camera:"), Source::Camera(String::new()));
+        assert_eq!(
+            serde_json::to_value(Source::Screen(1)).expect("JSON"),
+            serde_json::json!({"screen": 1})
+        );
+        assert_eq!(
+            serde_json::from_value::<Source>(serde_json::json!({"camera": "Desk (2)"}))
+                .expect("JSON"),
+            Source::Camera("Desk (2)".to_owned())
+        );
     }
 
     #[test]

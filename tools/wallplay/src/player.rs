@@ -536,6 +536,18 @@ const STALL_RESTART: Duration = Duration::from_secs(10);
 /// How long a source may take to show its first frame.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Why a source that sent no frame within [`CONNECT_TIMEOUT`] failed. A
+/// screen capture without permission gets no frames rather than an error.
+#[must_use]
+pub fn no_video(source: &Source) -> String {
+    let hint = if matches!(source, Source::Screen(_)) {
+        "; does this program have permission to record the screen?"
+    } else {
+        ""
+    };
+    format!("no video within {} s{hint}", CONNECT_TIMEOUT.as_secs())
+}
+
 /// Seconds before retrying a source that failed, the last repeating.
 const RETRY_DELAYS: [u64; 4] = [1, 2, 5, 10];
 
@@ -1824,8 +1836,9 @@ impl Inputs {
         }
         if feed.retry_at.is_some_and(|at| at <= Instant::now()) {
             feed.retry_at = None;
-            if feed.source.via == Via::YtDlp {
-                // Streams found from web pages expire; find the stream again.
+            // Streams found from web pages expire, and a camera may have been
+            // plugged in again: find them again, off this thread.
+            if feed.source.via == Via::YtDlp || matches!(feed.source.source, Source::Camera(_)) {
                 let (source, resolver) = (feed.source.source.clone(), self.resolver.clone());
                 match std::thread::Builder::new()
                     .name("wallplay-resolve".to_owned())
@@ -1860,10 +1873,7 @@ impl Inputs {
                 }
             }
             None if attempt.started.elapsed() > CONNECT_TIMEOUT => {
-                self.fail(
-                    feed,
-                    &format!("no video within {} s", CONNECT_TIMEOUT.as_secs()),
-                );
+                self.fail(feed, &no_video(&feed.source.source));
             }
             None => {}
         }
@@ -1879,6 +1889,8 @@ impl Inputs {
                 Source::Uri(url) | Source::Media(url) | Source::Page(url) | Source::Whep(url) => {
                     short_name(url)
                 }
+                Source::Camera(id) => id.clone(),
+                Source::Screen(number) => format!("Screen {number}"),
                 Source::Pattern(_) | Source::Launch(_) => "The source".to_owned(),
             });
         let status = lock(&self.status);
@@ -2700,6 +2712,15 @@ mod tests {
             short_name("srt://10.0.0.5:7001?streamid=read:cam"),
             "10.0.0.5:7001"
         );
+    }
+
+    #[test]
+    fn screens_without_video_hint_at_permission() {
+        assert_eq!(
+            no_video(&Source::Pattern("bars".to_owned())),
+            "no video within 30 s"
+        );
+        assert!(no_video(&Source::Screen(1)).contains("permission to record the screen"));
     }
 
     #[test]

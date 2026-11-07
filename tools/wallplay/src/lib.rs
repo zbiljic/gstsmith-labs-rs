@@ -6,7 +6,8 @@
 //! `wallcalibrate`, and a layout drives one `wallwarp` branch per display
 //! whose output streams to that display's browser through `webrtcsink`
 //! ([`player`]). It plays a test pattern, a video, a live stream or a web
-//! page's video ([`source`]). While measuring, every output carries its frame
+//! page's video, or a camera or screen of the machine ([`source`],
+//! [`capture`]). While measuring, every output carries its frame
 //! number ([`framecode`]) and the browsers report when they present each
 //! frame ([`drift`]); aligning delays the early displays to match ([`sync`]).
 //!
@@ -14,6 +15,7 @@
 //! and the signalling choices are one way to orchestrate it.
 
 pub mod app;
+pub mod capture;
 pub mod drift;
 pub mod framecode;
 pub mod http;
