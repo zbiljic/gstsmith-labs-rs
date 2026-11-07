@@ -698,6 +698,7 @@ fn layouts_change_while_playing_on_the_gpu() {
 fn layouts_change_while_playing_with(warp: Warp) {
     init();
     playing_on_a_new_layout(Fill::Contain, warp);
+    playing_on_a_new_layout(Fill::Stretch, warp);
     // Cropping needs gst-plugins-good, which CI does not install.
     if gst::ElementFactory::find("videocrop").is_some() {
         playing_on_a_new_layout(Fill::Cover, warp);
@@ -763,12 +764,89 @@ fn covering_crops_follow_the_canvas_with(warp: Warp) {
     assert!(eventually(10, || rows(&crop) == (90, 90, 0, 0)));
 }
 
+#[test]
+fn fills_bar_or_stretch_a_source_of_another_shape() {
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+    const WHITE: [u8; 4] = [255; 4];
+    init();
+    // A white 4:3 source on the 16:9 canvas.
+    let clip = Prepared::prepare(
+        &Source::Launch(
+            "videotestsrc pattern=white ! capsfilter caps=video/x-raw,width=640,height=480"
+                .to_owned(),
+        ),
+        &Resolver::default(),
+    )
+    .expect("clip");
+    let measurement = std::sync::Arc::default();
+    let mut player = Player::start(
+        &two_displays(),
+        &PlayerOptions {
+            source: clip,
+            fill: Fill::Contain,
+            ..options()
+        },
+        &measurement,
+        Clock::new(),
+        |_| {},
+    )
+    .expect("player");
+    // Shown whole, it has black bars left and right.
+    assert!(eventually(10, || canvas_edge(&player, "input-source-1") == Some(BLACK)));
+    // Stretched, it covers the canvas without cropping; the source starts
+    // again for it.
+    assert!(player.update_layout(&two_displays(), Fill::Stretch));
+    assert!(eventually(10, || canvas_edge(&player, "input-source-2") == Some(WHITE)));
+    assert!(player.pipeline().by_name("crop").is_none());
+    // Cropping needs gst-plugins-good, which CI does not install.
+    if gst::ElementFactory::find("videocrop").is_some() {
+        // Cropped, it starts again with a crop.
+        assert!(player.update_layout(&two_displays(), Fill::Cover));
+        assert!(eventually(10, || canvas_edge(&player, "input-source-3") == Some(WHITE)));
+        assert!(player.pipeline().by_name("crop").is_some());
+    }
+}
+
+/// The pixel at the middle of the left edge of the next canvas frame from
+/// the input bin `bin`, if it is playing.
+fn canvas_edge(player: &Player, bin: &str) -> Option<[u8; 4]> {
+    let canvas = player
+        .pipeline()
+        .by_name(bin)?
+        .downcast::<gst::Bin>()
+        .ok()?
+        .by_name("canvas")?;
+    let pad = canvas.static_pad("src")?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        let pixel = (|| {
+            let caps = pad.current_caps()?;
+            let info_caps = gst_video::VideoInfo::from_caps(&caps).ok()?;
+            let buffer = info.buffer()?;
+            let frame =
+                gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info_caps).ok()?;
+            let stride = usize::try_from(*frame.plane_stride().first()?).ok()?;
+            let row = usize::try_from(info_caps.height() / 2).ok()?;
+            let data = frame.plane_data(0).ok()?;
+            data.get(row * stride..row * stride + 4)?.try_into().ok()
+        })();
+        // The test stops waiting after a while; then nobody listens.
+        let _ignored = sender.send(pixel);
+        gst::PadProbeReturn::Remove
+    });
+    receiver.recv_timeout(Duration::from_secs(1)).ok().flatten()
+}
+
 fn playing_on_a_new_layout(fill: Fill, warp: Warp) {
     let layout = two_displays();
     let measurement = std::sync::Arc::default();
-    // A source that is not live keeps playing through a new canvas size.
+    // A source that is not live keeps playing through a new canvas size; its
+    // own 4:3 shape is barred, stretched or cropped to each canvas.
     let clip = Prepared::prepare(
-        &Source::Launch("videotestsrc pattern=ball".to_owned()),
+        &Source::Launch(
+            "videotestsrc pattern=ball ! capsfilter caps=video/x-raw,width=640,height=480"
+                .to_owned(),
+        ),
         &Resolver::default(),
     )
     .expect("clip");

@@ -247,8 +247,9 @@ raised that latency by its 21.3 ms buffer, the video's too.
   falls outside every display. *A fixed size* centers the displays in it.
 - **Video**: *fills the displays* (the default) crops a video whose shape
   differs from the canvas, so the displays show no empty bars; *shows whole*
-  scales it in with black bars. Test patterns are drawn at the canvas size and
-  always fill it.
+  scales it in with black bars; *stretched* shows all of it with no bars,
+  stretched to the canvas's shape. Test patterns are drawn at the canvas size
+  and always fill it.
 
 A new layout applies while playing, and playback does not restart:
 
@@ -437,7 +438,7 @@ Tested with GStreamer 1.28.8 and `rswebrtc` 0.15.4:
 | `POST /api/photo` | Upload a photo (body: JPEG or PNG), detect, and solve |
 | `GET`, `PUT /api/calibration` | The calibration; `PUT` replaces it after validation |
 | `GET /calibration` | Corner editor |
-| `POST /api/layout` | `{"mode", "anchor", "reference_size", "straighten", "canvas", "fill", "allow_incomplete"}`; `canvas` is `[width, height]` or `{"longest": pixels}`, `fill` is `cover` or `contain` |
+| `POST /api/layout` | `{"mode", "anchor", "reference_size", "straighten", "canvas", "fill", "allow_incomplete"}`; `canvas` is `[width, height]` or `{"longest": pixels}`, `fill` is `cover`, `contain` or `stretch` |
 | `GET /api/photo.jpg`, `GET /api/displays/ID/preview.jpg` | The photo, reduced, and a display's latest output, for the simulation; the preview is `204 No Content` before a display's first frame |
 | `GET /api/layout`, `/api/layout.svg`, `/api/manifest` | Files and preview |
 | `POST /api/play`, `POST /api/idle` | Start or stop playback |
@@ -507,7 +508,7 @@ gpu` picks the warp, and `--output DIR` keeps screenshots.
 - The simulation shows the photographed position only; it cannot show how the
   wall looks from anywhere else.
 - Filling the displays with a video needs `videocrop` from
-  gst-plugins-good.
+  gst-plugins-good; showing it whole or stretched does not.
 - The measurement covers the browsers, not the panels, and aligning
   corrects only what the browsers report.
 - No authentication or TLS; browsers that require a secure context for the

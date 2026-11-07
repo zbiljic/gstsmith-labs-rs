@@ -115,6 +115,8 @@ pub enum Fill {
     Cover,
     /// Show the whole source, with black bars on two sides.
     Contain,
+    /// Show the whole source over the whole canvas, stretched to its shape.
+    Stretch,
 }
 
 /// Where displays' frames are warped.
@@ -621,8 +623,11 @@ impl Canvas {
     fn chain(&self, input: &Input) -> Result<Vec<gst::Element>> {
         let entry = make("identity")?;
         let convert = make("videoconvert")?;
+        // Bars keep the source's shape; without them the source is stretched.
+        // Fixed when the chain is made: videoscale takes a new add-borders
+        // only with new caps, so a source whose fill changes restarts.
         let scale = gst::ElementFactory::make("videoscale")
-            .property("add-borders", true)
+            .property("add-borders", self.fill != Fill::Stretch)
             .build()?;
         let filter = gst::ElementFactory::make("capsfilter")
             .name(CANVAS_CAPS)
