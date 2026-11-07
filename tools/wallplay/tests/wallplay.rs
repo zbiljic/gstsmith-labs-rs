@@ -1288,7 +1288,8 @@ fn aligning_delays_the_early_display() {
         .expect("frames");
     // Stand in for browsers that tell frames apart by RTP timestamp: the
     // right display presents every frame 50 ms after the left, from after
-    // the aligner's settling time.
+    // the aligner's settling time, and the left keeps a 20 ms jitter buffer
+    // of its own.
     let now = ok(address, "POST", "/api/clock", &Value::Null)["now"]
         .as_f64()
         .expect("now");
@@ -1300,15 +1301,16 @@ fn aligning_delays_the_early_display() {
                 json!([(frame * 3000) % (1 << 32), shown, null])
             })
             .collect();
-        let report = json!({"rtp": frames, "rtp_timestamps": true});
+        let report = json!({"rtp": frames, "rtp_timestamps": true, "jitter_buffer": 20.0});
         let path = format!("/api/displays/{id}/frames");
         assert_eq!(json_request(address, "POST", &path, &report).0, 204);
     }
-    // The left display gets most of the 50 ms in one step.
+    // The left display gets most of the 50 ms in one step, on top of the
+    // buffer it kept.
     assert!(eventually(10, || {
         poll(address, "left", 480, 270)["buffer_ms"]
             .as_u64()
-            .is_some_and(|ms| (30..=40).contains(&ms))
+            .is_some_and(|ms| (50..=60).contains(&ms))
     }));
     assert_eq!(poll(address, "right", 270, 480)["buffer_ms"], Value::Null);
     let measured = ok(address, "GET", "/api/measure", &Value::Null);

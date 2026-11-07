@@ -336,7 +336,7 @@ class Stream {
 /**
  * Ask the browser to keep the commanded amount of video buffered, or its own
  * default. Less buffering means less latency and more stutter on a jittery
- * network. Chrome and Firefox support it; Safari ignores it.
+ * network. Current Chrome, Firefox, and Safari support it.
  */
 let bufferSupported = null;
 function applyBuffer() {

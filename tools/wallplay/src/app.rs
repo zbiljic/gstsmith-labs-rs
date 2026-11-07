@@ -207,23 +207,25 @@ impl State {
         };
     }
 
-    /// Display `id`'s jitter buffer target: the chosen one, plus its delay
-    /// while aligning.
+    /// Display `id`'s jitter buffer target: the chosen one, or while
+    /// aligning, its delay on top of the larger of the chosen one and the
+    /// buffer it kept before the delay.
     fn buffer_ms(&self, id: &str) -> Option<u32> {
-        let delay = self
-            .aligner
-            .as_ref()
-            .map_or(0.0, |aligner| aligner.delay(id));
-        if delay < 0.5 {
+        let Some(aligner) = &self.aligner else {
+            return self.buffer_ms;
+        };
+        let delay = aligner.delay(id);
+        if delay < crate::sync::MIN_DELAY_MS {
             return self.buffer_ms;
         }
+        let base = f64::from(self.buffer_ms.unwrap_or(0)).max(aligner.base(id));
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "the delay is positive and at most MAX_DELAY_MS"
+            reason = "the target is positive, and clamped below"
         )]
-        let delay = delay.round() as u32;
-        Some((self.buffer_ms.unwrap_or(0) + delay).min(MAX_BUFFER_MS))
+        let target = (base + delay).round().min(f64::from(MAX_BUFFER_MS)) as u32;
+        Some(target)
     }
 
     /// The aligner's progress and each display's buffer target, while

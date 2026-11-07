@@ -154,7 +154,7 @@
       <option value="100">100 ms</option>
       <option value="200">200 ms: smoothest</option>
     </select></label>
-    <span class="muted">Applies while playing, without reconnecting; Safari ignores it.</span>
+    <span class="muted">Applies while playing, without reconnecting, in browsers that support it.</span>
   </div>
   <div class="row">
     <label>Sound <select id="sound"><option value="">off</option></select></label>
@@ -168,7 +168,7 @@
 <section>
   <h2>5. Measure and align</h2>
   <p class="muted">Each display reports which frame it presents, from the frame's RTP timestamp in Chrome and Edge or else from a frame number drawn in its bottom-left corner only while such a display needs it, and when its browser expects every frame on screen, on this server's clock. Latency runs from a frame's capture: <b>Pipeline</b> until it is warped and ready to encode, <b>Arrives</b> until its last packet reaches the browser, <b>On screen</b> until it is expected on screen; <b>Jitter buffer</b> is the browser's own buffering, part of the last step. Offsets compare displays for the same frame; the offset change is how far that moved across the window, and one refresh, about 16.7 ms at 60 Hz, means a display slipped a frame. Panel latency is not included.</p>
-  <p class="muted"><b>Align displays</b> measures too, and gives every display that presents frames earlier than the latest one that much more jitter buffer, a step every few seconds, until all agree within a refresh or so; <b>Added delay</b> is each display's share. It needs browsers that honor a jitter buffer target, which Safari does not, and it is only as exact as each display's clock synchronization (<b>Clock ±</b>).</p>
+  <p class="muted"><b>Align displays</b> measures too, and gives every display that presents frames earlier than the latest one that much more jitter buffer, a step every few seconds, until all agree within a refresh or so; <b>Added delay</b> is each display's share. It needs browsers that honor a jitter buffer target, as current Chrome, Edge, Firefox, and Safari do, and it is only as exact as each display's clock synchronization (<b>Clock ±</b>).</p>
   <div class="row"><button id="measure">Start measuring</button><button id="align">Align displays</button><span id="aligning"></span></div>
   <div class="row"><span id="spread"></span></div>
   <table>

@@ -409,7 +409,8 @@ instead. Displays within 10 ms of the latest count as aligned: presentation
 falls on each display's refreshes, so displays whose refreshes are out of
 phase cannot agree closer than half a refresh, and a tighter tolerance would
 hunt between two equally good refreshes. The added delays show as **Added
-delay**, on top of the **Browser buffer** setting.
+delay**, on top of the **Browser buffer** setting or the buffer the display
+already keeps, whichever is larger.
 
 In the browser check, one of two headless Chromium displays is made 100 ms
 late on purpose by raising its own jitter buffer target; aligning delayed the
@@ -417,8 +418,8 @@ other by about 94 ms and brought them from about 100 ms to 0.2 ms apart in
 two or three steps, 15 to 30 seconds.
 
 Aligning needs browsers that honor `RTCRtpReceiver.jitterBufferTarget`:
-Chrome, Edge, and Firefox do; Safari ignores it, so a Safari display can only
-be the late one that others wait for. It cannot make a display earlier than
+Chrome, Edge, Firefox, and Safari 27 do. A browser that ignores it can only
+be the late one others wait for. It cannot make a display earlier than
 its own jitter buffer allows. It is only as exact as each display's clock
 synchronization, **Clock ±**, and panels add their own latency on top. A
 display that stalls or restarts shifts again, and aligning keeps correcting
@@ -429,7 +430,7 @@ while it runs.
 - **Browser buffer** on the control page sets the browsers'
   `jitterBufferTarget`, applied while playing without reconnecting. A lower
   target cuts latency where the network is jittery, at the cost of stutter;
-  Chrome and Firefox support it, Safari ignores it. On one machine the
+  Chrome, Firefox, and Safari 27 support it. On one machine the
   browser's jitter buffer was already 5–9 ms, so it changed nothing there.
 - Put the server on wired Ethernet, so only the displays use Wi-Fi.
 - Built-in patterns skip `videorate`, which holds a frame to match frame
@@ -563,5 +564,5 @@ gpu` picks the warp, `--source` what plays while measuring, as `wallplay`'s
 - No authentication or TLS; browsers that require a secure context for the
   Screen Wake Lock API get none, so turn off the display's own sleep and
   auto-lock, which also drop it out of fullscreen.
-- Drift and aligning are tested with headless Chromium on one machine; on
-  real devices, only latency has been measured, on one laptop.
+- Drift and aligning are tested with headless Chromium on one machine and
+  on two real displays.

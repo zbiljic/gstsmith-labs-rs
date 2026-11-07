@@ -13,6 +13,11 @@
 //! little more than that at 60 Hz, which keeps steps from hunting between two
 //! equally good refreshes. Alignment is only as good as each browser's clock
 //! synchronization.
+//!
+//! A jitter buffer target sets the browser's whole buffer, not an addition
+//! to it, so a delayed display's target is the buffer it kept before its
+//! first delay plus the delay; otherwise a delay smaller than the buffer the
+//! browser already keeps would change nothing.
 
 use std::collections::BTreeMap;
 
@@ -36,11 +41,17 @@ const GAIN: f64 = 0.7;
 /// The most extra delay one display gets.
 pub const MAX_DELAY_MS: f64 = 1000.0;
 
+/// Smaller delays count as none: the display keeps its own target.
+pub const MIN_DELAY_MS: f64 = 0.5;
+
 /// Extra jitter buffer delay per display, and how it was reached.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Aligner {
     /// Extra delay per display, in milliseconds.
     delays: BTreeMap<String, f64>,
+    /// Each delayed display's jitter buffer when its delay began, which
+    /// the delay goes on top of.
+    bases: BTreeMap<String, f64>,
     /// When the delays last changed, on the server clock.
     changed_at: f64,
     /// Corrections made so far.
@@ -76,6 +87,13 @@ impl Aligner {
         &self.delays
     }
 
+    /// The jitter buffer `display` kept before its delay began, in
+    /// milliseconds, or zero when it is not delayed or did not report one.
+    #[must_use]
+    pub fn base(&self, display: &str) -> f64 {
+        self.bases.get(display).copied().unwrap_or(0.0)
+    }
+
     /// Whether the last measurement found every display within the
     /// tolerance.
     #[must_use]
@@ -109,6 +127,7 @@ impl Aligner {
             .map(|(_, offset)| *offset)
             .fold(f64::INFINITY, f64::min);
         self.spread_ms = Some(latest - earliest);
+        let before = self.delays.clone();
         let mut changed = false;
         for (id, offset) in &offsets {
             let lag = latest - offset;
@@ -128,6 +147,17 @@ impl Aligner {
         for (id, _) in &offsets {
             if let Some(delay) = self.delays.get_mut(*id) {
                 *delay = (*delay - floor).clamp(0.0, MAX_DELAY_MS);
+            }
+        }
+        // A display's buffer is its own only until its first delay, so
+        // that is when it counts as the base.
+        for display in &summary.displays {
+            let id = &display.id;
+            if self.delay(id) < MIN_DELAY_MS {
+                self.bases.remove(id);
+            } else if before.get(id).is_none_or(|delay| *delay < MIN_DELAY_MS) {
+                self.bases
+                    .insert(id.clone(), display.jitter_buffer_ms.unwrap_or(0.0).max(0.0));
             }
         }
         self.changed_at = now;
@@ -213,6 +243,33 @@ mod tests {
         aligner.step(&summary(&[("a", 0.0), ("b", -30.0)], 60), 6000.0);
         assert!((aligner.delay("a") - 14.0).abs() < 1e-9, "{aligner:?}");
         assert!(aligner.delay("b").abs() < 1e-9, "{aligner:?}");
+    }
+
+    /// `summary` with each display keeping `buffer` milliseconds of jitter
+    /// buffer.
+    fn buffered(offsets: &[(&str, f64)], buffer: f64) -> Summary {
+        let mut summary = summary(offsets, 60);
+        for display in &mut summary.displays {
+            display.jitter_buffer_ms = Some(buffer);
+        }
+        summary
+    }
+
+    #[test]
+    fn delays_go_on_top_of_the_buffer_kept_before_them() {
+        let mut aligner = Aligner::new(0.0);
+        assert!(aligner.step(&buffered(&[("a", 0.0), ("b", 50.0)], 20.0), 3000.0));
+        assert!((aligner.base("a") - 20.0).abs() < 1e-9, "{aligner:?}");
+        assert!(aligner.base("b").abs() < 1e-9, "not delayed");
+        // The buffer grew with the delay; the base stays what it was.
+        assert!(aligner.step(&buffered(&[("a", 0.0), ("b", 15.0)], 50.0), 6000.0));
+        assert!((aligner.base("a") - 20.0).abs() < 1e-9, "{aligner:?}");
+        // Once `a` is the late one and its delay ends, so does its base, and
+        // `b`'s begins.
+        assert!(aligner.step(&buffered(&[("a", 0.0), ("b", -80.0)], 30.0), 9000.0));
+        assert!(aligner.delay("a").abs() < 1e-9, "{aligner:?}");
+        assert!(aligner.base("a").abs() < 1e-9, "{aligner:?}");
+        assert!((aligner.base("b") - 30.0).abs() < 1e-9, "{aligner:?}");
     }
 
     #[test]
