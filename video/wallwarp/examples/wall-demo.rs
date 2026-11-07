@@ -82,7 +82,8 @@ enum Step {
         factory: String,
         properties: Vec<String>,
     },
-    /// Start a branch from a named element's next request pad.
+    /// Start a branch from a pad: `name.` for a named element's next
+    /// request pad, or `name.pad`.
     Branch(String),
 }
 
@@ -94,11 +95,14 @@ fn element(linked: bool, factory: &str, properties: &[String]) -> Step {
     }
 }
 
-/// The source, a tee, and one warp branch per screen ending in `sink`.
+/// The source into `walltiles`, which reads the layout, and each screen's
+/// pad ending in `sink`. `before` comes between the source and
+/// `walltiles`.
 fn pipeline(
     layout: &Layout,
     source: (u32, u32),
     options: &Options,
+    before: Vec<Step>,
     sink: impl Fn(&str) -> Vec<Step>,
 ) -> Vec<Step> {
     let mut source_properties = vec![format!("pattern={}", options.pattern)];
@@ -117,21 +121,18 @@ fn pipeline(
             ),
             &[],
         ),
-        element(true, "tee", &["name=wall".to_owned()]),
     ];
+    steps.extend(before);
+    steps.push(element(
+        true,
+        "walltiles",
+        &[
+            "name=wall".to_owned(),
+            format!("location=\"{}\"", options.layout.display()),
+        ],
+    ));
     for screen in &layout.screens {
-        steps.push(Step::Branch("wall".to_owned()));
-        steps.push(element(true, "queue", &[]));
-        let mut properties = vec![
-            format!("name={}", screen.id),
-            format!("quad=\"{}\"", layout.source_quad(screen)),
-            format!("output-width={}", screen.output.width),
-            format!("output-height={}", screen.output.height),
-        ];
-        if !screen.mask.is_empty() {
-            properties.push(format!("mask=\"{}\"", screen.mask));
-        }
-        steps.push(element(true, "wallwarp", &properties));
+        steps.push(Step::Branch(format!("wall.src_{}", screen.id)));
         steps.extend(sink(&screen.id));
     }
     steps
@@ -163,7 +164,7 @@ fn launch_command(steps: &[Step]) -> String {
                         .map(|property| format!("      {property}")),
                 );
             }
-            Step::Branch(name) => lines.push(format!("  {name}.")),
+            Step::Branch(pad) => lines.push(format!("  {pad}")),
         }
     }
     lines.join(" \\\n")
@@ -184,7 +185,7 @@ fn launch_description(steps: &[Step]) -> String {
                 parts.push(factory.clone());
                 parts.extend(properties.iter().cloned());
             }
-            Step::Branch(name) => parts.push(format!("{name}.")),
+            Step::Branch(pad) => parts.push(pad.clone()),
         }
     }
     parts.join(" ")
@@ -249,10 +250,15 @@ fn write_viewer_pages(layout: &Layout, directory: &Path) -> Result<(), Box<dyn E
 fn render(layout: &Layout, source: (u32, u32), options: &Options) -> Result<(), Box<dyn Error>> {
     gst::init()?;
     gstwallwarp::plugin_register_static()?;
-    let mut steps = pipeline(layout, source, options, |id| {
+    // The source itself is written too.
+    let split = vec![
+        element(true, "tee", &["name=source".to_owned()]),
+        element(true, "queue", &[]),
+    ];
+    let mut steps = pipeline(layout, source, options, split, |id| {
         png_sink(&format!("file-{id}"))
     });
-    steps.push(Step::Branch("wall".to_owned()));
+    steps.push(Step::Branch("source.".to_owned()));
     steps.push(element(true, "queue", &[]));
     steps.extend(png_sink("source-file"));
 
@@ -329,7 +335,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     layout.check_source_size(source.0, source.1)?;
 
     if options.print_launch {
-        let steps = pipeline(&layout, source, &options, |_id| {
+        let steps = pipeline(&layout, source, &options, Vec::new(), |_id| {
             vec![
                 element(true, "videoconvert", &[]),
                 element(true, "autovideosink", &[]),

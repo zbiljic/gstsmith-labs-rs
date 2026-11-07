@@ -1,14 +1,17 @@
 //! `GStreamer` perspective warps mapping a source quadrilateral onto one video
-//! wall display, on the CPU (`wallwarp`) or in OpenGL (`glwallwarp`).
+//! wall display, on the CPU (`wallwarp`) or in OpenGL (`glwallwarp`), and
+//! `walltiles`, which gives every display of a layout its own source pad.
 
 use gst::glib;
 
 mod glwallwarp;
+mod walltiles;
 mod wallwarp;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     wallwarp::register(plugin)?;
-    glwallwarp::register(plugin)
+    glwallwarp::register(plugin)?;
+    walltiles::register(plugin)
 }
 
 gst::plugin_define!(

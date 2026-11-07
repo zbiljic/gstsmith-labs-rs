@@ -5,11 +5,13 @@ display of an irregular video wall. It maps a quadrilateral region of the
 input frame onto the whole output frame through a perspective transform, so a
 display can be cropped, scaled, rotated, or keystoned onto the shared source.
 Run one instance per display behind a `tee`. [`glwallwarp`](#glwallwarp) does
-the same on the GPU through OpenGL.
+the same on the GPU through OpenGL, and [`walltiles`](#walltiles) builds the
+whole wall from a layout file, with a source pad per display.
 
 The elements are experimental. They require GStreamer 1.24 or newer;
 `wallwarp` needs only the core, base, and video libraries, and `glwallwarp`
-the OpenGL plugin from gst-plugins-base at run time. Layout files and the geometry behind
+the OpenGL plugin from gst-plugins-base at run time; `walltiles` also uses
+`videoconvert` from gst-plugins-base. Layout files and the geometry behind
 them live in [`wall-geometry`](../../utils/wall-geometry/), which does not
 depend on GStreamer.
 
@@ -136,9 +138,9 @@ top-left corner is near the canvas top-right. See `wall-geometry` for the
 layout format, and [`wallcalibrate`](../../tools/wallcalibrate/) to generate a
 layout from a photo of real displays.
 
-The `wall-demo` example reads a layout and builds one
-`tee ! queue ! wallwarp` branch per screen from it, so the geometry exists only
-in the JSON file. By default it renders one frame and writes
+The `wall-demo` example plays a layout through [`walltiles`](#walltiles),
+which builds one `queue ! wallwarp` branch per screen from it, so the
+geometry exists only in the JSON file. By default it renders one frame and writes
 `screen-<id>.png` for each screen, plus `source.png`; `pngenc` comes from
 gst-plugins-good:
 
@@ -170,22 +172,14 @@ GST_PLUGIN_PATH="$PWD/target/release" gst-launch-1.0 \
       pattern=smpte \
       is-live=true \
   ! video/x-raw,format=RGBA,width=1920,height=1080 \
-  ! tee \
+  ! walltiles \
       name=wall \
-  wall. \
-  ! queue \
-  ! wallwarp \
-      name=display-c \
-      quad="0.18229166666666666,0.6481481481481481,0.5,0.6111111111111112,0.5052083333333334,0.9259259259259259,0.1875,0.9537037037037037" \
-      output-width=1024 \
-      output-height=576 \
+      location="video/wallwarp/examples/three-screens.json" \
+  wall.src_display-c \
   ! videoconvert \
   ! autovideosink \
-  wall. \
-  ! queue \
-  ! wallwarp \
-      name=display-a \
-      ...
+  wall.src_display-a \
+  ...
 ```
 
 To show a video file with the canvas aspect ratio instead, replace the
@@ -242,6 +236,58 @@ upstream of it to renegotiate.
 Without the OpenGL plugin the element fails to reach READY, naming the
 missing element; without a usable GL display or context, OpenGL's own
 elements report the error.
+
+## walltiles
+
+`walltiles` takes a whole layout instead of one display's quad. It has one
+sink pad and a request source pad per display, named `src_` followed by the
+display's ID, so a launch line names displays instead of computing quads:
+
+```sh
+GST_PLUGIN_PATH="$PWD/target/debug" gst-launch-1.0 \
+  videotestsrc ! video/x-raw,width=1920,height=1080 \
+  ! walltiles name=wall location=video/wallwarp/examples/three-screens.json \
+  wall.src_display-a ! videoconvert ! autovideosink \
+  wall.src_display-b ! videoconvert ! autovideosink \
+  wall.src_display-c ! videoconvert ! autovideosink
+```
+
+Inside it is `videoconvert ! tee`, then `queue ! wallwarp ! capsfilter` for
+each display, the `capsfilter` giving the display's output size and the
+`queue` holding at most three frames, so a live wall stays current. With `gl=true` it is `glupload ! tee` and
+`glwallwarp`, which uploads each frame once for every display and gives
+each display any format and memory downstream asks for.
+
+| Property | Default | Meaning |
+|---|---|---|
+| `layout` | none | The layout as JSON |
+| `location` | none | A layout file to read instead |
+| `interpolation` | `bilinear` | As in `wallwarp`, for every display |
+| `background` | `0xff000000` | As in `wallwarp`, for every display |
+| `gl` | `false` | Warp with `glwallwarp`; set before the first display pad or the first start |
+
+- Set the layout before requesting pads. A pad for an ID the layout does not
+  have, or one already requested, is refused.
+- Pads can be requested and released while playing. Releasing one takes
+  its branch out before it returns, so the same display can be requested
+  again at once; stop what the pad feeds first, or its last frame may hold
+  the release up.
+- A new layout applies while playing: each display takes its new quad, mask,
+  and size, the size in one step. A display the new layout leaves out keeps
+  its last place until its pad is released. An invalid layout, or a file
+  that cannot be read, is ignored with a warning.
+- The source should have the canvas's aspect ratio. Otherwise the element
+  posts a warning and the source is stretched to the canvas.
+- Each display's elements are named `queue-ID`, `warp-ID`, and `size-ID`,
+  so an application can reach them through the bin, for example to set a
+  warp's `n-threads` or make a queue leaky.
+- A launch line cannot name a pad whose display ID contains `.`, which
+  layouts allow; request such pads from code.
+
+`walltiles` suits launch lines, prototypes and applications that play a
+fixed layout. `wallplay` builds its own branches: it changes each warp's
+quad with the frame of a new canvas size, draws frame codes on the warped
+frames, and fixes each stream's format for its encoder.
 
 ## Design notes
 
@@ -333,7 +379,10 @@ compared with a direct per-pixel sampler, on one thread and on several.
 sizes, and both samplings, a 4K source halved, property changes while
 streaming, and one upload feeding two displays through a `tee`; they also
 check output formats, memory and pixel aspect ratios, and skip where no
-OpenGL context can be made.
+OpenGL context can be made. `walltiles`' tests compare each display's frames
+with `wallwarp`'s through layout changes and displays released and requested
+again while playing, on the CPU and the GPU, and cover pads requested while
+an I420 source plays, layouts read from a file, and refused requests.
 
 Benchmark perspective and rotated outputs from a 1080p source, on one thread
 and on four, plus identity passthrough:

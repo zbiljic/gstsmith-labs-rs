@@ -49,6 +49,9 @@ are being established before promotion to
     - [`glwallwarp`](video/wallwarp/README.md#glwallwarp): The same warp on the
       GPU through OpenGL, taking and giving any raw format in system or GL
       memory.
+    - [`walltiles`](video/wallwarp/README.md#walltiles): Every display of a
+      layout from one bin, with a source pad per display ID, warping on the
+      CPU or the GPU.
 
 ## Tools
 
