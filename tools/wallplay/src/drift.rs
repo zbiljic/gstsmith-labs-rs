@@ -93,6 +93,8 @@ struct DisplayLog {
     /// Codes reported before any frame was stamped, which cannot be placed.
     unplaced: u64,
     rtp_timestamps: Option<bool>,
+    /// When the browser's latest report arrived, on the server's clock.
+    reported: Option<f64>,
 }
 
 /// Stamped and presented frames per display.
@@ -251,6 +253,42 @@ impl Measurement {
         if let Some(newest) = log.shown.values().map(|shown| shown.at).reduce(f64::max) {
             log.shown.retain(|_, shown| shown.at >= newest - WINDOW_MS);
         }
+    }
+
+    /// A report from `display`'s browser arrived at `at`, whatever it held.
+    pub fn reported(&mut self, display: &str, at: f64) {
+        self.displays
+            .entry(display.to_owned())
+            .or_default()
+            .reported = Some(at);
+    }
+
+    /// When `display`'s browser last reported.
+    #[must_use]
+    pub fn last_report(&self, display: &str) -> Option<f64> {
+        self.displays.get(display)?.reported
+    }
+
+    /// When `display` last presented a frame its browser reported.
+    #[must_use]
+    pub fn last_shown(&self, display: &str) -> Option<f64> {
+        self.displays
+            .get(display)?
+            .shown
+            .values()
+            .map(|shown| shown.at)
+            .reduce(f64::max)
+    }
+
+    /// When the pipeline last stamped a frame for `display`.
+    #[must_use]
+    pub fn last_stamped(&self, display: &str) -> Option<f64> {
+        self.displays
+            .get(display)?
+            .stamped
+            .values()
+            .copied()
+            .reduce(f64::max)
     }
 
     /// Whether any of `displays` needs frame codes drawn to tell frames

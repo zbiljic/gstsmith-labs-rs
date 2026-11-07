@@ -112,6 +112,7 @@ function report() {
 addEventListener("resize", report);
 document.addEventListener("fullscreenchange", report);
 document.addEventListener("webkitfullscreenchange", report);
+document.addEventListener("visibilitychange", report);
 
 function setPlayer(state) {
   if (state === playerState) return;
@@ -132,6 +133,7 @@ async function pollLoop() {
     const query = new URLSearchParams({
       since: version, epoch, w: innerWidth, h: innerHeight, scale: devicePixelRatio,
       fullscreen: isFullscreen() ? 1 : 0, player: playerState,
+      hidden: document.visibilityState === "hidden" ? 1 : 0,
     });
     try {
       const response = await fetch(`/api/displays/${id}/poll?${query}`, { cache: "no-store", signal: controller.signal });

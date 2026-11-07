@@ -11,7 +11,7 @@
 //! `measurement` and `player_status`. Players are stopped without holding
 //! `state`, since stopping one can take seconds, or forever.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -46,6 +46,11 @@ const ASPECT_TOLERANCE: f64 = 0.01;
 
 /// How long a stopping pipeline may take before playback moves on without it.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// While recording, a display whose page plays its stream but reports no
+/// frame for this long, in milliseconds, while the pipeline sends it frames,
+/// is warned about: browsers may draw no frames for a covered window.
+const NO_FRAMES_MS: f64 = 5000.0;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -123,6 +128,8 @@ struct Display {
     address: String,
     /// What the page reports about its stream.
     player: String,
+    /// Whether the page reports itself hidden, so its browser draws nothing.
+    hidden: bool,
     polls: usize,
     last_seen: Instant,
 }
@@ -181,12 +188,23 @@ struct State {
     measuring: bool,
     /// Delays aligning the displays, while aligning.
     aligner: Option<Aligner>,
+    /// When recording last started, on the server's clock.
+    recording_since: Option<f64>,
 }
 
 impl State {
     /// Whether the pipeline records frames and the browsers report them.
     fn recording(&self) -> bool {
         self.measuring || self.aligner.is_some()
+    }
+
+    /// Note when recording started, after measuring or aligning changed.
+    fn note_recording(&mut self, now: f64) {
+        self.recording_since = if self.recording() {
+            self.recording_since.or(Some(now))
+        } else {
+            None
+        };
     }
 
     /// Display `id`'s jitter buffer target: the chosen one, plus its delay
@@ -500,6 +518,7 @@ impl App {
                 fill: Fill::default(),
                 measuring: false,
                 aligner: None,
+                recording_since: None,
             }),
             changed: Condvar::new(),
             measurement: Arc::default(),
@@ -659,6 +678,7 @@ impl App {
                 agent: String::new(),
                 address: String::new(),
                 player: String::new(),
+                hidden: false,
                 polls: 0,
                 last_seen: Instant::now(),
             });
@@ -668,6 +688,7 @@ impl App {
         if let Some(player) = request.query("player") {
             display.player = player.chars().take(200).collect();
         }
+        display.hidden = request.query("hidden") == Some("1");
         request
             .header("user-agent")
             .unwrap_or_default()
@@ -712,7 +733,9 @@ impl App {
         let report: FrameReport = request
             .json()
             .map_err(|error| Failure::new(400, format!("{error:#}")))?;
-        lock(&self.measurement).shown(id, &report, self.config.player.fps);
+        let mut measurement = lock(&self.measurement);
+        measurement.reported(id, self.clock.now_ms());
+        measurement.shown(id, &report, self.config.player.fps);
         Ok(Response::no_content())
     }
 
@@ -767,6 +790,7 @@ impl App {
         *lock(&self.player_status) = PlayerStatus::default();
         state.measuring = false;
         state.aligner = None;
+        state.recording_since = None;
         state.show = Show::Patterns;
         self.bump(&mut state);
         drop(state);
@@ -1042,6 +1066,8 @@ impl App {
         // stamps would place its frames.
         lock(&self.measurement).clear();
         player.set_measuring(state.recording());
+        // The new pipeline's displays reconnect before presenting frames.
+        state.recording_since = state.recording().then(|| self.clock.now_ms());
         state.player = Some(player);
         state.show = Show::Play;
         self.bump(state);
@@ -1165,6 +1191,7 @@ impl App {
         let player = state.player.take();
         state.measuring = false;
         state.aligner = None;
+        state.recording_since = None;
         state.show = Show::Idle;
         *lock(&self.player_status) = PlayerStatus::default();
         self.bump(&mut state);
@@ -1185,6 +1212,7 @@ impl App {
         }
         player.set_measuring(on || state.aligner.is_some());
         state.measuring = on;
+        state.note_recording(self.clock.now_ms());
         self.bump(&mut state);
         Ok(self.status_locked(&state))
     }
@@ -1206,6 +1234,7 @@ impl App {
             player.set_measuring(state.measuring);
             state.aligner = None;
         }
+        state.note_recording(self.clock.now_ms());
         self.bump(&mut state);
         Ok(self.status_locked(&state))
     }
@@ -1258,14 +1287,58 @@ impl App {
         self.status_locked(&state)
     }
 
+    /// Warnings for the displays whose pages play their streams, and which
+    /// the pipeline sends frames, but which reported no presented frame for
+    /// [`NO_FRAMES_MS`] while recording, once recording has run that long.
+    fn silent_displays(&self, state: &State) -> HashMap<String, &'static str> {
+        let now = self.clock.now_ms();
+        let (Some(player), Some(since)) = (&state.player, state.recording_since) else {
+            return HashMap::new();
+        };
+        if now - since < NO_FRAMES_MS {
+            return HashMap::new();
+        }
+        let recent = |time: Option<f64>| time.is_some_and(|time| now - time < NO_FRAMES_MS);
+        let measurement = lock(&self.measurement);
+        player
+            .routes()
+            .iter()
+            .filter(|route| {
+                state.displays.get(&route.display).is_some_and(|display| {
+                    display.online() && display.player.starts_with("playing")
+                })
+            })
+            .filter(|route| {
+                recent(measurement.last_stamped(&route.display))
+                    && !recent(measurement.last_shown(&route.display))
+            })
+            .map(|route| {
+                // A browser that sends reports presents frames, but none it
+                // could tell apart; one that sends none draws nothing.
+                let warning = if recent(measurement.last_report(&route.display)) {
+                    "reports frames it cannot identify"
+                } else {
+                    "reported no frames for 5 s: is its window covered?"
+                };
+                (route.display.clone(), warning)
+            })
+            .collect()
+    }
+
     /// Everything the control page shows.
     fn status_locked(&self, state: &State) -> Response {
         let layout = state.layout.as_ref();
+        let silent = self.silent_displays(state);
         let displays: Vec<_> = state
             .displays
             .iter()
             .map(|(id, display)| {
                 let mut warnings = Vec::new();
+                if display.hidden && display.online() {
+                    warnings.push("page hidden: its browser draws no frames".to_owned());
+                } else if let Some(warning) = silent.get(id) {
+                    warnings.push((*warning).to_owned());
+                }
                 if let Some(viewport) = &display.viewport {
                     if !viewport.fullscreen {
                         warnings.push("not fullscreen".to_owned());

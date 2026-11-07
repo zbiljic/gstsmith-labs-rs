@@ -368,6 +368,12 @@ over the last 20 seconds:
 
 `/api/measure` returns the same as JSON.
 
+Browsers may draw no frames for a window that is hidden or covered, so such a
+display has nothing to report. The control page warns about a display whose
+page is hidden and, while measuring or aligning, about one whose page plays
+its stream but reported no frames for five seconds, or only frames it could
+not identify by RTP timestamp or frame code.
+
 These are the browsers' own estimates of when frames reach the display. They
 leave out the panel's latency, which differs between devices, and they are
 only as good as the clock synchronization, about half the best round trip,

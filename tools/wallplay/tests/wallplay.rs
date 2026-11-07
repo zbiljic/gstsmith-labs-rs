@@ -1320,6 +1320,89 @@ fn aligning_delays_the_early_display() {
     assert_eq!(poll(address, "left", 480, 270)["measuring"], false);
 }
 
+/// The warnings the control page shows for display `id`.
+fn warnings(address: SocketAddr, id: &str) -> Vec<String> {
+    let state = ok(address, "GET", "/api/state", &Value::Null);
+    state
+        .get("displays")
+        .and_then(Value::as_array)
+        .expect("displays")
+        .iter()
+        .find(|display| display.get("id") == Some(&json!(id)))
+        .and_then(|display| serde_json::from_value(display.get("warnings")?.clone()).ok())
+        .expect("warnings")
+}
+
+#[test]
+fn displays_that_present_nothing_are_warned_about() {
+    let state = tempfile::tempdir().expect("state directory");
+    let (app, address) = serve(state.path());
+    calibrate(address);
+    ok(
+        address,
+        "POST",
+        "/api/layout",
+        &json!({"mode": "viewpoint", "canvas": [1280, 720]}),
+    );
+    ok(address, "POST", "/api/play", &Value::Null);
+    // Pages that say they play their streams, the left one hidden.
+    let page = |id: &str, size: &str, hidden: bool| {
+        let path = format!(
+            "/api/displays/{id}/poll?since=0&w={}&scale=2&fullscreen=1&player=playing&hidden={}",
+            size.replace('x', "&h="),
+            u8::from(hidden)
+        );
+        ok(address, "GET", &path, &Value::Null);
+    };
+    page("left", "480x270", true);
+    page("right", "270x480", false);
+    // A hidden page says so, measuring or not.
+    let hidden = "page hidden: its browser draws no frames".to_owned();
+    assert!(warnings(address, "left").contains(&hidden));
+    let covered = "reported no frames for 5 s: is its window covered?".to_owned();
+    ok(address, "POST", "/api/measure", &json!({"on": true}));
+    // Displays get a few seconds to start reporting.
+    assert!(!warnings(address, "right").contains(&covered));
+    assert!(eventually(10, || {
+        page("right", "270x480", false);
+        warnings(address, "right").contains(&covered)
+    }));
+    assert_eq!(warnings(address, "left"), std::slice::from_ref(&hidden));
+    // Frames presented now clear the warning.
+    let sink = app
+        .pipeline()
+        .and_then(|pipeline| pipeline.by_name("sink-right"))
+        .expect("sink");
+    let frame = frame_number(pull(&sink).0, 30);
+    let now = ok(address, "POST", "/api/clock", &Value::Null)["now"]
+        .as_f64()
+        .expect("now");
+    let path = "/api/displays/right/frames";
+    let report = json!({"rtp": [[(frame * 3000) % (1 << 32), now, null]], "rtp_timestamps": true});
+    assert_eq!(json_request(address, "POST", path, &report).0, 204);
+    assert_eq!(warnings(address, "right"), Vec::<String>::new());
+    // Reports of frames it cannot tell apart say that instead, once the
+    // frame above is 5 s old.
+    let unidentified = "reports frames it cannot identify".to_owned();
+    assert!(eventually(10, || {
+        page("right", "270x480", false);
+        let report = json!({"unreadable": 30, "rtp_timestamps": false});
+        assert_eq!(json_request(address, "POST", path, &report).0, 204);
+        warnings(address, "right") == [unidentified.clone()]
+    }));
+    // A page that is not playing its stream is not asked about its window.
+    let path =
+        "/api/displays/right/poll?since=0&w=270&h=480&scale=2&fullscreen=1&player=connecting";
+    ok(address, "GET", path, &Value::Null);
+    assert_eq!(warnings(address, "right"), Vec::<String>::new());
+    // Not measuring, nothing is expected.
+    ok(address, "POST", "/api/measure", &json!({"on": false}));
+    page("left", "480x270", false);
+    page("right", "270x480", false);
+    assert_eq!(warnings(address, "left"), Vec::<String>::new());
+    assert_eq!(warnings(address, "right"), Vec::<String>::new());
+}
+
 #[test]
 fn layouts_fill_the_canvas_level_and_straighten() {
     let state = tempfile::tempdir().expect("state directory");
