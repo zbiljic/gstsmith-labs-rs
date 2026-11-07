@@ -51,7 +51,8 @@ impl Default for Settings {
     }
 }
 
-/// Settings taken when streaming starts; only the quad changes afterwards.
+/// The settings in use while streaming.
+#[derive(Clone, Copy)]
 struct Config {
     quad: Quad,
     local_to_source: Homography,
@@ -76,6 +77,9 @@ struct State {
     /// Coefficients for the negotiated frame sizes.
     warp: Option<Warp>,
     negotiated: Option<Negotiated>,
+    /// Counts changes of `config`, so that coefficients located for an older
+    /// one are not installed.
+    revision: u64,
 }
 
 #[derive(Default)]
@@ -116,6 +120,14 @@ fn plane_stride(frame: &impl VideoFrameExt) -> Result<usize, &'static str> {
         .ok_or("negative plane strides are not supported")
 }
 
+/// The threads warping a frame for the `n-threads` value `threads`.
+fn thread_count(threads: u32) -> usize {
+    match threads {
+        0 => std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+        threads => usize::try_from(threads).unwrap_or(usize::MAX),
+    }
+}
+
 impl WallWarp {
     /// Take a new quad. While streaming, an invalid one is ignored, and a
     /// valid one replaces the coefficients between frames.
@@ -144,14 +156,24 @@ impl WallWarp {
         let Ok(local_to_source) = Homography::unit_square_to_quad(&quad) else {
             return;
         };
-        let (interpolation, background, negotiated) = {
+        self.reconfigure(|config| {
+            config.quad = quad;
+            config.local_to_source = local_to_source;
+        });
+    }
+
+    /// Change the settings in use, if streaming; new coefficients replace the
+    /// old ones between frames.
+    fn reconfigure(&self, change: impl FnOnce(&mut Config)) {
+        let (config, negotiated, revision) = {
             let mut state = lock(&self.state);
             let Some(config) = state.config.as_mut() else {
                 return;
             };
-            config.quad = quad;
-            config.local_to_source = local_to_source;
-            (config.interpolation, config.background, state.negotiated)
+            change(config);
+            let config = *config;
+            state.revision += 1;
+            (config, state.negotiated, state.revision)
         };
         let Some(Negotiated {
             source,
@@ -161,22 +183,25 @@ impl WallWarp {
         else {
             return;
         };
-        match Warp::new(&local_to_source, source, output, interpolation, background) {
+        match Warp::new(
+            &config.local_to_source,
+            source,
+            output,
+            config.interpolation,
+            config.background,
+        ) {
             Ok(warp) => {
                 let mut state = lock(&self.state);
-                // A renegotiation or another quad meanwhile located its own
+                // A renegotiation or another change meanwhile located its own
                 // samples.
-                let current = state.negotiated == negotiated
-                    && state
-                        .config
-                        .as_ref()
-                        .is_some_and(|config| config.quad == quad);
+                let current = state.negotiated == negotiated && state.revision == revision;
                 if current {
                     state.warp = Some(warp);
                 }
                 drop(state);
                 if current {
-                    self.obj().set_passthrough(quad == Quad::UNIT && same_info);
+                    self.obj()
+                        .set_passthrough(config.quad == Quad::UNIT && same_info);
                 }
             }
             Err(err) => {
@@ -222,19 +247,19 @@ impl ObjectImpl for WallWarp {
                     .blurb("Output width in pixels; 0 negotiates it, preferring the input width")
                     .maximum(MAX_OUTPUT_SIZE)
                     .default_value(DEFAULT_OUTPUT_SIZE)
-                    .mutable_ready()
+                    .mutable_playing()
                     .build(),
                 glib::ParamSpecUInt::builder("output-height")
                     .nick("Output height")
                     .blurb("Output height in pixels; 0 negotiates it, preferring the input height")
                     .maximum(MAX_OUTPUT_SIZE)
                     .default_value(DEFAULT_OUTPUT_SIZE)
-                    .mutable_ready()
+                    .mutable_playing()
                     .build(),
                 glib::ParamSpecEnum::builder_with_default("interpolation", Interpolation::default())
                     .nick("Interpolation")
                     .blurb("How output pixels sample the source")
-                    .mutable_ready()
+                    .mutable_playing()
                     .build(),
                 glib::ParamSpecUInt::builder("background")
                     .nick("Background")
@@ -243,13 +268,13 @@ impl ObjectImpl for WallWarp {
                          ARGB (0xAARRGGBB)",
                     )
                     .default_value(DEFAULT_BACKGROUND)
-                    .mutable_ready()
+                    .mutable_playing()
                     .build(),
                 glib::ParamSpecUInt::builder("n-threads")
                     .nick("Threads")
                     .blurb("Maximum number of threads warping each frame; 0 uses one per CPU core")
                     .default_value(DEFAULT_THREADS)
-                    .mutable_ready()
+                    .mutable_playing()
                     .build(),
             ]
             });
@@ -257,37 +282,39 @@ impl ObjectImpl for WallWarp {
     }
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
-        let name = pspec.name();
-        if name == "quad" {
-            let text = value
-                .get::<Option<String>>()
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            self.set_quad(text);
-            return;
-        }
-        // Output sizes and sampling are fixed while streaming; renegotiation
-        // is not supported yet.
-        if self.obj().current_state() > gst::State::Ready {
-            gst::warning!(
-                CAT,
-                imp = self,
-                "{name} can only change in the NULL or READY state; ignoring the new value"
-            );
-            return;
-        }
-        let mut settings = lock(&self.settings);
-        match name {
+        match pspec.name() {
+            "quad" => {
+                let text = value
+                    .get::<Option<String>>()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                self.set_quad(text);
+            }
+            // The next frame renegotiates with downstream.
             "output-width" => {
-                settings.output_width = value.get().unwrap_or(DEFAULT_OUTPUT_SIZE);
+                lock(&self.settings).output_width = value.get().unwrap_or(DEFAULT_OUTPUT_SIZE);
+                self.obj().reconfigure_src();
             }
             "output-height" => {
-                settings.output_height = value.get().unwrap_or(DEFAULT_OUTPUT_SIZE);
+                lock(&self.settings).output_height = value.get().unwrap_or(DEFAULT_OUTPUT_SIZE);
+                self.obj().reconfigure_src();
             }
-            "interpolation" => settings.interpolation = value.get().unwrap_or_default(),
-            "background" => settings.background = value.get().unwrap_or(DEFAULT_BACKGROUND),
-            "n-threads" => settings.threads = value.get().unwrap_or(DEFAULT_THREADS),
+            "interpolation" => {
+                let interpolation = value.get().unwrap_or_default();
+                lock(&self.settings).interpolation = interpolation;
+                self.reconfigure(|config| config.interpolation = interpolation);
+            }
+            "background" => {
+                let background = value.get().unwrap_or(DEFAULT_BACKGROUND);
+                lock(&self.settings).background = background;
+                self.reconfigure(|config| config.background = rgba(background));
+            }
+            "n-threads" => {
+                let threads = value.get().unwrap_or(DEFAULT_THREADS);
+                lock(&self.settings).threads = threads;
+                self.reconfigure(|config| config.threads = thread_count(threads));
+            }
             other => gst::error!(CAT, imp = self, "unknown property {other}"),
         }
     }
@@ -368,16 +395,12 @@ impl BaseTransformImpl for WallWarp {
                 local_to_source,
                 interpolation: settings.interpolation,
                 background: rgba(settings.background),
-                threads: match settings.threads {
-                    0 => std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
-                    threads => usize::try_from(threads).unwrap_or(usize::MAX),
-                },
+                threads: thread_count(settings.threads),
             }
         };
         *lock(&self.state) = State {
             config: Some(config),
-            warp: None,
-            negotiated: None,
+            ..State::default()
         };
         Ok(())
     }

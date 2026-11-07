@@ -347,14 +347,115 @@ fn invalid_quads_fail_at_startup() {
 }
 
 #[test]
-fn sizes_and_sampling_are_fixed_while_streaming() {
+fn output_sizes_change_while_streaming() {
     let mut h = harness("output-width=4 output-height=4", (8, 8));
-    let before = warp(&mut h, grid(8, 8, 0, 0));
+    assert_eq!(size(&warp(&mut h, grid(8, 8, 0, 0))), (4, 4));
     let element = element(&h);
     element.set_property("output-width", 2u32);
+    assert_eq!(element.property::<u32>("output-width"), 2);
+    let narrower = warp(&mut h, grid(8, 8, 0, 0));
+    assert_eq!(size(&narrower), (2, 4));
+    assert_samples(&narrower, |x, y| Some((4 * x + 2, 2 * y + 1)));
+    // Nothing changed, so nothing renegotiates.
+    drain_events(&mut h);
+    assert_eq!(size(&warp(&mut h, grid(8, 8, 0, 0))), (2, 4));
+    assert!(
+        !drain_events(&mut h)
+            .iter()
+            .any(|event| { event.type_() == gst::EventType::Caps })
+    );
+    // Zero goes back to negotiating, which prefers the input size.
+    element.set_property("output-width", 0u32);
+    element.set_property("output-height", 0u32);
+    assert_eq!(size(&warp(&mut h, grid(8, 8, 0, 0))), (8, 8));
+}
+
+#[test]
+fn output_sizes_leave_and_enter_passthrough_while_streaming() {
+    let mut h = harness("", (8, 8));
+    let frame = grid(8, 8, 0, 0);
+    h.push(frame.clone()).expect("pushing a frame");
+    assert_eq!(h.pull().expect("output").as_ptr(), frame.as_ptr());
+    let element = element(&h);
+    element.set_property("output-width", 4u32);
+    element.set_property("output-height", 4u32);
+    assert_samples(&warp(&mut h, grid(8, 8, 0, 0)), |x, y| {
+        Some((2 * x + 1, 2 * y + 1))
+    });
+    element.set_property("output-width", 8u32);
+    element.set_property("output-height", 8u32);
+    h.push(frame.clone()).expect("pushing a frame");
+    assert_eq!(h.pull().expect("output").as_ptr(), frame.as_ptr());
+}
+
+#[test]
+fn downstream_changes_both_dimensions_in_one_step() {
+    init();
+    let mut h = gst_check::Harness::new_parse(
+        "wallwarp name=warp ! capsfilter name=size caps=video/x-raw,width=4,height=2",
+    );
+    h.set_src_caps(caps(8, 8));
+    assert_eq!(size(&warp(&mut h, grid(8, 8, 0, 0))), (4, 2));
+    drain_events(&mut h);
+    h.element()
+        .expect("harness element")
+        .downcast::<gst::Bin>()
+        .expect("parsed bin")
+        .by_name("size")
+        .expect("capsfilter")
+        .set_property(
+            "caps",
+            gst_video::VideoCapsBuilder::new()
+                .width(2)
+                .height(6)
+                .build(),
+        );
+    let resized = warp(&mut h, grid(8, 8, 0, 0));
+    assert_eq!(size(&resized), (2, 6));
+    let sizes: Vec<_> = drain_events(&mut h)
+        .iter()
+        .filter_map(|event| match event.view() {
+            gst::EventView::Caps(caps) => {
+                let info = gst_video::VideoInfo::from_caps(caps.caps()).expect("video caps");
+                Some((info.width(), info.height()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sizes, [(2, 6)]);
+}
+
+#[test]
+fn sampling_changes_while_streaming() {
+    let frame = || gst::Buffer::from_mut_slice(vec![0, 0, 0, 0xff, 200, 0, 0, 0xff]);
+    let red = |rows: &Rows| {
+        rows.iter()
+            .flatten()
+            .map(|[red, ..]| *red)
+            .collect::<Vec<_>>()
+    };
+    let mut h = harness(
+        "output-width=4 output-height=1 interpolation=nearest",
+        (2, 1),
+    );
+    assert_eq!(red(&warp(&mut h, frame())), [0, 0, 200, 200]);
+    let element = element(&h);
     element.set_property_from_str("interpolation", "bilinear");
-    assert_eq!(element.property::<u32>("output-width"), 4);
-    assert_eq!(warp(&mut h, grid(8, 8, 0, 0)), before);
+    assert_eq!(red(&warp(&mut h, frame())), [0, 50, 150, 200]);
+    // The whole source, in the right half of the output.
+    element.set_property("quad", "-1,0,1,0,1,1,-1,1");
+    element.set_property("background", 0x8011_2233u32);
+    assert_eq!(
+        warp(&mut h, frame())
+            .first()
+            .and_then(|row| row.first())
+            .copied(),
+        Some([0x11, 0x22, 0x33, 0x80])
+    );
+    let before = warp(&mut h, frame());
+    element.set_property("n-threads", 3u32);
+    assert_eq!(element.property::<u32>("n-threads"), 3);
+    assert_eq!(warp(&mut h, frame()), before);
 }
 
 #[test]

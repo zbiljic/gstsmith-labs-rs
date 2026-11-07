@@ -46,6 +46,15 @@ negotiated with downstream, preferring the input dimension. The frame rate
 passes through, and output pixels are square unless downstream requires
 otherwise; the input pixel aspect ratio does not affect sampling.
 
+The output size can change while streaming. The next frame renegotiates, and
+downstream receives new caps before it; passing through an identity starts or
+stops as the sizes come to match or differ. Setting `output-width` and
+`output-height` one after the other can leave a frame in between with one
+dimension changed. To change both in one step, leave them at `0` and change
+the `caps` of a `capsfilter` after the element, with
+`caps-change-mode=delayed`: by default it refuses a frame of the old size that
+is already on its way, which stops the stream.
+
 Timestamps, durations, offsets, and buffer flags (except `gap`) are copied to
 each output buffer. Segments, flushes, and EOS pass through unchanged. Metas
 without tags, or tagged only `video`, are copied; metas tied to frame size,
@@ -54,10 +63,8 @@ are dropped.
 
 ## Properties
 
-`quad` can change while streaming: the next frame after the change uses it,
-and an invalid one is ignored with a warning, keeping the current quad. The
-other properties are mutable only in the NULL and READY states; changes in
-PAUSED or PLAYING are ignored with a warning.
+Every property can change while streaming, and the next frame after a change
+uses it. An invalid `quad` is ignored with a warning, keeping the current one.
 
 | Property | Default | Meaning |
 |---|---|---|
@@ -212,8 +219,6 @@ sets the `quad` or negotiates the caps.
 - Sources wider than 65534 or taller than 65535 pixels are not supported.
 - Bilinear sampling does not prefilter, so outputs much smaller than their
   source region alias.
-- Only `quad` can change while streaming; the output size, sampling, and
-  threads are fixed for the stream.
 - The element knows nothing about canvases. Layout tooling must give it a
   source with the canvas aspect ratio, as `wall-demo` checks.
 
@@ -227,7 +232,8 @@ cargo clippy -p wall-geometry -p gst-plugin-wallwarp --all-targets -- -D warning
 
 The tests cover the identity, crops, quarter turns, perspective trapezoids,
 background fill, invalid quads, padded and offset input rows, odd sizes, caps
-negotiation, timestamps, flags, flushing, EOS, and the three-screen layout
+negotiation, changes of every property while streaming, timestamps, flags,
+flushing, EOS, and the three-screen layout
 through a `tee` with independent branches. Every pixel of several warps is
 compared with a direct per-pixel sampler, on one thread and on several.
 
