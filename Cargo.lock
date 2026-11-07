@@ -56,6 +56,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "analytics-meta"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "gstreamer-analytics",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "analytics-meta-fixture-a"
+version = "0.1.0"
+dependencies = [
+ "analytics-meta",
+ "analytics-meta-fixture-b",
+ "anyhow",
+ "gstreamer",
+ "gstreamer-analytics",
+ "gstreamer-base",
+ "gstreamer-check",
+]
+
+[[package]]
+name = "analytics-meta-fixture-b"
+version = "0.1.0"
+dependencies = [
+ "analytics-meta",
+ "gstreamer",
+ "gstreamer-analytics",
+ "gstreamer-base",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

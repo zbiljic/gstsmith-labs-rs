@@ -1,0 +1,24 @@
+[package]
+name = "analytics-meta-fixture-b"
+version = { workspace = true }
+description = "Test-only plugin b proving JsonMtd identity across plugin libraries."
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+publish = false
+
+[dependencies]
+analytics-meta = { path = "../.." }
+gst = { workspace = true }
+gst-analytics = { workspace = true }
+gst-base = { workspace = true }
+
+[lib]
+name = "gstjsonmtdfixtureb"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
