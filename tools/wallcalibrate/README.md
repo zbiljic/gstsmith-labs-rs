@@ -178,7 +178,7 @@ confident one. `solve` exits with status `2` when any display is missing.
 ## Detectors
 
 The built-in detector, [kornia-apriltag](https://crates.io/crates/kornia-apriltag)
-0.1.10, is pure Rust. It only finds tags whose cells are a few pixels wide
+0.2.0, is pure Rust. It only finds tags whose cells are a few pixels wide
 after shrinking the photo, so it searches at several shrink factors, each on
 a thread of its own, and keeps each tag from the finest one; that handles
 full-size phone photos and screenshots alike. `scripts/detect_opencv.py`

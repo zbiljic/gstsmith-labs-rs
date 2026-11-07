@@ -9,7 +9,6 @@ use anyhow::{Context, Result, bail, ensure};
 use image::{DynamicImage, ImageDecoder as _, ImageReader};
 use kornia_apriltag::family::TagFamilyKind;
 use kornia_apriltag::{AprilTagDecoder, DecodeTagsConfig};
-use kornia_image::allocator::CpuAllocator;
 use kornia_image::{Image, ImageSize};
 use serde::{Deserialize, Serialize};
 use wall_geometry::{Point, Quad};
@@ -20,7 +19,7 @@ use crate::tag::FAMILY;
 pub const DETECTIONS_VERSION: u32 = 1;
 
 /// Name and version of the built-in detector, recorded in its output.
-pub const BUILTIN_DETECTOR: &str = "kornia-apriltag 0.1.10";
+pub const BUILTIN_DETECTOR: &str = "kornia-apriltag 0.2.0";
 
 /// Markers found in one photo.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -195,7 +194,7 @@ pub fn detect(photo: &DynamicImage) -> Result<Vec<DetectedMarker>> {
         height: usize::try_from(gray.height())?,
     };
     let longest = size.width.max(size.height);
-    let image = Image::<u8, 1, _>::new(size, gray.into_raw(), CpuAllocator)?;
+    let image = Image::<u8, 1>::new(size, gray.into_raw())?;
     let factors = SHRINK_FACTORS
         .into_iter()
         .enumerate()
@@ -233,11 +232,11 @@ pub fn detect(photo: &DynamicImage) -> Result<Vec<DetectedMarker>> {
 
 /// The markers the built-in detector finds in `image` shrunk by `factor`.
 fn detect_shrunk(
-    image: &Image<u8, 1, CpuAllocator>,
+    image: &Image<u8, 1>,
     size: ImageSize,
     factor: usize,
 ) -> Result<Vec<DetectedMarker>> {
-    let mut config = DecodeTagsConfig::new(vec![TagFamilyKind::Tag36H11]);
+    let mut config = DecodeTagsConfig::new(vec![TagFamilyKind::Tag36H11])?;
     config.downscale_factor = factor;
     let mut decoder = AprilTagDecoder::new(config, size)?;
     Ok(decoder
