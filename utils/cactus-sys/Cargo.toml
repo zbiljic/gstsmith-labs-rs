@@ -1,0 +1,26 @@
+[package]
+name = "cactus-sys"
+version = { workspace = true }
+description = "Raw FFI to the statically linked Cactus 4.1.0 engine."
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+readme = "README.md"
+repository = { workspace = true }
+publish = false
+links = "cactus"
+build = "build.rs"
+
+[features]
+default = ["download"]
+# Fetch the pinned per-target libcactus.a and cactus.h at build time unless
+# CACTUS_LIB_DIR names a directory holding them.
+download = ["dep:ureq"]
+
+[lints]
+workspace = true
+
+[build-dependencies]
+sha2 = { workspace = true }
+ureq = { workspace = true, optional = true }

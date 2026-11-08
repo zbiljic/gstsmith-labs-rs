@@ -1,0 +1,3 @@
+[tasks."cactus:deps:check"]
+description = "Check that only the cactus plugin links the Cactus engine"
+run = "ci/check-cactus-links.sh"
