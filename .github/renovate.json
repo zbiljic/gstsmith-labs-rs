@@ -32,6 +32,12 @@
       "rangeStrategy": "bump"
     },
     {
+      "description": ["Update gtk-rs crates together; they must share glib with gstreamer-rs"],
+      "matchManagers": ["cargo"],
+      "matchDepNames": ["cairo-rs", "pango", "pangocairo"],
+      "groupName": "gtk-rs"
+    },
+    {
       "description": ["Wait for CI before creating usls PRs"],
       "matchManagers": ["cargo"],
       "matchDepNames": ["usls"],
