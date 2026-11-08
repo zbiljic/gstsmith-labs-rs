@@ -48,7 +48,7 @@ pangocairo = "0.22.9"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 sha2 = "0.10.9"
-ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 usls = { git = "https://github.com/jamjamjon/usls", rev = "c15ad77c1879dbf1117376d34d3022a325cd9cdc", default-features = false, features = ["vision", "ort-download-binaries", "ort-api-28"] }
 
 [workspace.lints.rust]
