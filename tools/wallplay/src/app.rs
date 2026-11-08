@@ -553,6 +553,13 @@ impl App {
             .map(|player| player.pipeline().clone())
     }
 
+    /// What the pipeline and browsers recorded while measuring, for tests
+    /// and diagnostics.
+    #[must_use]
+    pub fn measurement_log(&self) -> Arc<Mutex<Measurement>> {
+        Arc::clone(&self.measurement)
+    }
+
     /// Answer requests with this app.
     #[must_use]
     pub fn handler(self: &Arc<Self>) -> Handler {

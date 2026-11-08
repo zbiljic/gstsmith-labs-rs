@@ -19,6 +19,7 @@ use wall_geometry::{Layout, Point, Quad, Screen, Size};
 use wallcalibrate::manifest::Manifest;
 use wallcalibrate::synth::{self, SynthOptions};
 use wallplay::app::{App, Config};
+use wallplay::drift::Measurement;
 use wallplay::framecode::{self, CodeGeometry};
 use wallplay::player::{self, Clock, Fill, Player, PlayerOptions, Sink, Warp, frame_number};
 use wallplay::source::{DEFAULT_SOURCE, DEFAULT_STANDBY, Prepared, Resolver, Source};
@@ -179,16 +180,31 @@ fn pull(sink: &gst::Element) -> (gst::ClockTime, Option<u64>, Size) {
 
 /// Pull from every display's sink in turn, so their frames overlap, until
 /// each has `count` frames carrying a code, keyed by running time.
-fn coded_frames(pipeline: &gst::Pipeline, ids: &[&str], count: usize) -> Vec<Codes> {
+///
+/// Only frames the pipeline stamped count: frames still queued from before
+/// measuring started carry no code, but a moving pattern can read as one.
+fn coded_frames(
+    pipeline: &gst::Pipeline,
+    measurement: &std::sync::Mutex<Measurement>,
+    ids: &[&str],
+    count: usize,
+) -> Vec<Codes> {
     let sinks: Vec<_> = ids
         .iter()
         .map(|id| pipeline.by_name(&format!("sink-{id}")).expect("sink"))
         .collect();
     let mut frames = vec![Codes::new(); ids.len()];
+    let stamped = |id: &str, pts| {
+        measurement
+            .lock()
+            .expect("measurement")
+            .was_stamped(id, frame_number(pts, 30))
+    };
     for _ in 0..count * 20 {
-        for (sink, frames) in sinks.iter().zip(&mut frames) {
+        for ((sink, frames), id) in sinks.iter().zip(&mut frames).zip(ids) {
             if frames.len() < count
                 && let (pts, Some(code), size) = pull(sink)
+                && stamped(id, pts)
             {
                 frames.insert(pts, (code, size));
             }
@@ -432,7 +448,7 @@ fn every_output_carries_the_same_frame_codes_while_measuring_with(warp: Warp) {
         player::Endpoint::None
     );
     player.set_measuring(true);
-    let frames = coded_frames(player.pipeline(), &["left", "right"], 10);
+    let frames = coded_frames(player.pipeline(), &measurement, &["left", "right"], 10);
     for (pts, (code, size)) in frames.iter().flatten() {
         assert_eq!(
             *code,
@@ -569,7 +585,7 @@ fn synthetic_photo(address: SocketAddr) -> (Vec<u8>, [(String, Quad); 2]) {
 /// Coded frames pulled from display `id` of the app's running pipeline.
 fn codes(app: &App, id: &str) -> usize {
     let pipeline = app.pipeline().expect("pipeline");
-    coded_frames(&pipeline, &[id], 3)
+    coded_frames(&pipeline, &app.measurement_log(), &[id], 3)
         .first()
         .map_or(0, BTreeMap::len)
 }
@@ -675,7 +691,7 @@ fn sources_end_fail_and_change_while_playing_with(warp: Warp) {
         status.state == "playing" && !status.standby && status.error.is_none()
     }));
     player.set_measuring(true);
-    for (pts, (code, _)) in coded_frames(player.pipeline(), &["left"], 5)
+    for (pts, (code, _)) in coded_frames(player.pipeline(), &measurement, &["left"], 5)
         .iter()
         .flatten()
     {
@@ -928,7 +944,7 @@ fn playing_on_a_new_layout(fill: Fill, warp: Warp) {
     assert!(player.pipeline().by_name("input-source-2").is_none());
     assert_eq!(player.source_status().restarts, 0);
     player.set_measuring(true);
-    for (pts, (code, size)) in coded_frames(player.pipeline(), &["left", "right"], 5)
+    for (pts, (code, size)) in coded_frames(player.pipeline(), &measurement, &["left", "right"], 5)
         .iter()
         .flatten()
     {
@@ -1022,7 +1038,7 @@ fn stream_sizes_change_while_playing_with(warp: Warp) {
     );
     // Frame codes follow the new size.
     player.set_measuring(true);
-    for (pts, (code, size)) in coded_frames(player.pipeline(), &["left", "right"], 5)
+    for (pts, (code, size)) in coded_frames(player.pipeline(), &measurement, &["left", "right"], 5)
         .iter()
         .flatten()
     {
@@ -1168,7 +1184,7 @@ fn displays_come_and_go_while_playing_with(warp: Warp) {
         assert_eq!(pipeline.by_name("sink-left").as_ref(), Some(&left));
         // The new branches report nothing wrong, and frames carry codes.
         player.set_measuring(true);
-        coded_frames(player.pipeline(), &["left", "right"], 3);
+        coded_frames(player.pipeline(), &measurement, &["left", "right"], 3);
 
         // No displays at all needs a new pipeline.
         let mut empty = two_displays();
@@ -1686,8 +1702,13 @@ fn the_whole_workflow_runs_over_http() {
     // present, and report them shown 50 ms after the clock reading, the right
     // display 12 ms later than the left.
     let pipeline = app.pipeline().expect("pipeline");
-    let [left, right] = <[Codes; 2]>::try_from(coded_frames(&pipeline, &["left", "right"], 30))
-        .expect("two displays");
+    let [left, right] = <[Codes; 2]>::try_from(coded_frames(
+        &pipeline,
+        &app.measurement_log(),
+        &["left", "right"],
+        30,
+    ))
+    .expect("two displays");
     for (pts, (code, _)) in left.iter().chain(&right) {
         assert_eq!(
             *code,

@@ -291,6 +291,15 @@ impl Measurement {
             .reduce(f64::max)
     }
 
+    /// Whether the pipeline stamped `frame` for `display` in the last
+    /// [`WINDOW_MS`].
+    #[must_use]
+    pub fn was_stamped(&self, display: &str, frame: u64) -> bool {
+        self.displays
+            .get(display)
+            .is_some_and(|log| log.stamped.contains_key(&frame))
+    }
+
     /// Whether any of `displays` needs frame codes drawn to tell frames
     /// apart: its browser reported that it gives no RTP timestamps, or it has
     /// not reported yet.
