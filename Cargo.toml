@@ -40,7 +40,8 @@ serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 usls = { git = "https://github.com/jamjamjon/usls", rev = "c15ad77c1879dbf1117376d34d3022a325cd9cdc", default-features = false, features = ["vision", "ort-download-binaries", "ort-api-28"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 # Baseline coverage - enable broad lint groups, then carve out local policy below.
@@ -80,7 +81,7 @@ large_futures = "warn"
 # Don't Do Unsafe Things with Memory.
 mem_forget = "deny"
 multiple_unsafe_ops_per_block = "warn"
-undocumented_unsafe_blocks = "warn"
+undocumented_unsafe_blocks = "deny"
 unnecessary_safety_comment = "warn"
 unnecessary_safety_doc = "warn"
 
