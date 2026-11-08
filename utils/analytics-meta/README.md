@@ -65,6 +65,14 @@ upstream type name and type-specific fields, its outgoing relations and, for
 value lost; `f32` fields at `f32` precision). Unknown Mtd types are recorded
 by name only.
 
+## Pooled buffers
+
+Upstream flags a relation meta on a pooled buffer `GST_META_FLAG_POOLED`, so
+the pool keeps it, cleared, when the buffer is recycled: the buffer comes
+back with an empty relation meta, which consumers read as "analyzed, saw
+nothing". `unpool` clears the flag, so the pool frees the meta instead. A
+producer that attaches results to only some frames should call it.
+
 ## Segmentation
 
 `segmentation::add` attaches a full-frame binary GRAY8 mask as a
