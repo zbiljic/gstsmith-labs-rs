@@ -20,6 +20,12 @@ are being established before promotion to
 
 - [`analytics`](analytics/)
 
+  - [`cactus`](analytics/cactus/): Elements running models on the
+    [Cactus](https://cactuscompute.com) engine.
+    - `cactusmirage`: Describe frames with the Mirage vision model: objects
+      with outlines, recognized text, relations, captions and form answers
+      as analytics metadata, plus the engine's full JSON.
+
   - [`nalsense`](analytics/nalsense/): Portable H.264 and H.265 encoded-video
     activity analysis and bounded IDR replay.
     - `nalsenseactivity`: Detect inexpensive compressed-stream activity hints
