@@ -12,10 +12,20 @@ on:
       - "**.md"
   merge_group:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      extended:
+        description: Run the full compatibility checks
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   pull-requests: read
+
+env:
+  # Keep tasks from installing tools omitted by each job's setup.
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
@@ -58,6 +68,10 @@ jobs:
 
       - name: Setup mise
         uses: jdx/mise-action@v5
+        with:
+          install_args: >-
+            rust cargo:cargo-deny cargo:cargo-sort
+            ${{ inputs.extended && 'cargo:cargo-c' || '' }}
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -76,9 +90,6 @@ jobs:
       - name: Run clippy
         run: mise run lint
 
-      - name: Check build
-        run: mise run check
-
       - name: Run tests
         run: mise run test
 
@@ -86,6 +97,7 @@ jobs:
         run: mise run build
 
       - name: Validate cargo-c package
+        if: inputs.extended
         run: mise run package:check
 
       - name: Inspect plugin and elements
@@ -109,19 +121,23 @@ jobs:
           gst-inspect-1.0 wallwarp
 
       - name: Read minimum supported Rust version
+        if: inputs.extended
         run: |
           sed -n 's/^rust-version = "\([^"]*\)"$/MSRV=\1/p' Cargo.toml >> "$GITHUB_ENV"
 
       - name: Cache minimum supported Rust version toolchain
+        if: inputs.extended
         uses: actions/cache@v6
         with:
           path: ~/.rustup/toolchains/${{ env.MSRV }}-*
           key: rust-msrv-${{ runner.os }}-${{ runner.arch }}-${{ env.MSRV }}
 
       - name: Install minimum supported Rust version toolchain
+        if: inputs.extended
         run: mise install "rust@$MSRV"
 
       - name: Test minimum supported Rust version
+        if: inputs.extended
         run: cargo +"$MSRV" test --workspace --all-features --locked
 
   gstreamer-124:
@@ -142,15 +158,17 @@ jobs:
           pkg-config --max-version=1.25.99 gstreamer-1.0
       - name: Setup mise
         uses: jdx/mise-action@v5
+        with:
+          install_args: rust ${{ inputs.extended && 'cargo:cargo-c' || '' }}
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-      - name: Check, test, lint and build NALSense independently
+      - name: Test, lint and build NALSense independently
         run: |
-          cargo check --locked -p gst-plugin-nalsense --all-targets
           cargo test --locked -p gst-plugin-nalsense --all-targets
           cargo clippy --locked -p gst-plugin-nalsense --all-targets -- -D warnings
           cargo build --locked -p gst-plugin-nalsense
       - name: Validate NALSense cargo-c package
+        if: inputs.extended
         run: ci/check-cargo-c-packages.sh gst-plugin-nalsense
       - name: Inspect NALSense
         env:
@@ -177,15 +195,17 @@ jobs:
           pkg-config --max-version=1.25.99 gstreamer-1.0
       - name: Setup mise
         uses: jdx/mise-action@v5
+        with:
+          install_args: rust ${{ inputs.extended && 'cargo:cargo-c' || '' }}
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-      - name: Check, test, lint and build wallwarp independently
+      - name: Test, lint and build wallwarp independently
         run: |
-          cargo check --locked -p wall-geometry -p gst-plugin-wallwarp --all-targets
           cargo test --locked -p wall-geometry -p gst-plugin-wallwarp --all-targets
           cargo clippy --locked -p wall-geometry -p gst-plugin-wallwarp --all-targets -- -D warnings
           cargo build --locked -p gst-plugin-wallwarp
       - name: Validate wallwarp cargo-c package
+        if: inputs.extended
         run: ci/check-cargo-c-packages.sh gst-plugin-wallwarp
       - name: Inspect wallwarp
         env:
@@ -205,6 +225,8 @@ jobs:
           pkg-config --atleast-version=1.28 gstreamer-1.0
       - name: Setup mise
         uses: jdx/mise-action@v5
+        with:
+          install_args: rust
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
       - name: Test and lint optional CoreML
