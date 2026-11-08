@@ -1312,6 +1312,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gst-plugin-cactus"
+version = "0.1.0"
+dependencies = [
+ "analytics-meta",
+ "anyhow",
+ "cactus",
+ "gst-plugin-version-helper",
+ "gstreamer",
+ "gstreamer-analytics",
+ "gstreamer-base",
+ "gstreamer-check",
+ "gstreamer-video",
+ "image",
+ "serde_json",
+]
+
+[[package]]
 name = "gst-plugin-jsontap"
 version = "0.1.0"
 dependencies = [
