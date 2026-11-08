@@ -42,6 +42,19 @@ pub enum Fields {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, glib::Enum)]
 #[repr(u32)]
+#[enum_type(name = "GstCactusMirageMode")]
+pub enum Mode {
+    /// Analyze every frame on the streaming thread, which waits.
+    #[default]
+    #[enum_value(name = "Analyze each frame, blocking the stream", nick = "sync")]
+    Sync,
+    /// Pass frames at full rate and analyze the newest one in a worker.
+    #[enum_value(name = "Analyze the newest frame in a worker", nick = "latest")]
+    Latest,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, glib::Enum)]
+#[repr(u32)]
 #[enum_type(name = "GstCactusMirageMaskFormat")]
 pub enum MaskFormat {
     /// One polygon per part of the mask.
@@ -94,7 +107,10 @@ const OWNED_KEYS: &[&str] = &[
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub model_file: Option<String>,
+    pub mode: Mode,
     pub latency: u64,
+    pub hold_time: u64,
+    pub analysis_interval: u64,
     pub sections: Sections,
     pub fields: Fields,
     pub score_threshold: f32,
@@ -118,7 +134,10 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             model_file: None,
+            mode: Mode::Sync,
             latency: 0,
+            hold_time: 0,
+            analysis_interval: 0,
             sections: Sections::SCENE
                 | Sections::OBJECTS
                 | Sections::TEXT

@@ -50,23 +50,38 @@ bytes. Klass `Filter/Analyzer/Video`, rank none.
   `latency` property, because that time cannot be derived. For live sources
   put `queue leaky=downstream max-size-buffers=1` before it, which analyzes
   the newest frame and keeps metadata on the frame it describes; for files,
-  use `ptssampler`. QoS stays off unless enabled.
+  use `analysis-interval`, or `ptssampler` to drop the frames in between.
+  QoS stays off unless enabled.
 - **`mode=latest`: video at full rate, results at inference rate.** A worker
   thread owns the engine and analyzes the newest frame, from its own packed
   copy; frames pass at once and add no latency. Each result is attached
   once, to the first buffer after it completes, with an `x-provenance`
   naming the analyzed frame's PTS and running time (the frame record's `pts`
-  is the analyzed one too). `hold-time` re-attaches the last result to later
-  frames, for example for `ioutracker`; keeping old results on screen is
-  `relationmetaoverlay`'s job (`expire-overlay`). `hold-time` counts from
-  the frame the result was first attached to and needs timestamped buffers
-  in a time segment. A flush, a new segment, a stream start or a caps change
-  discards the analysis in flight. EOS does not wait for it; stopping does,
-  for up to one inference, because the engine call cannot be cancelled.
-  Buffer pools keep a relation meta, cleared, on recycled buffers
+  is the analyzed one too). A flush, a new segment, a stream start or a caps
+  change discards the analysis in flight. EOS does not wait for it; stopping
+  does, for up to one inference, because the engine call cannot be
+  cancelled. Buffer pools keep a relation meta, cleared, on recycled buffers
   (`GST_META_FLAG_POOLED`), which would make frames passed without a result
   look analyzed; the element therefore unpools the meta it attaches, so the
   pool frees it.
+- **`analysis-interval`: fewer analyses, full video.** A frame is analyzed
+  only when its running time is at least this long after the last analyzed
+  frame's; the others pass without a result. Unlike `ptssampler`, no frame
+  is dropped. Spacing is start to start, so results come at most once per
+  interval. In `mode=sync` the spacing is exact in stream time, and slow
+  inference only slows the pipeline. In `mode=latest`, inference slower than
+  the interval analyzes back to back, as without one; INFO logs when it
+  falls behind and when it catches up. Results then carry `x-provenance` and
+  are unpooled, as in `mode=latest`. A flush, a new segment, a stream start
+  or a caps change restarts it, as does running time going backwards; frames
+  without a timestamp are analyzed whenever possible.
+- **`hold-time`** re-attaches the last result to later frames without one,
+  for example for `ioutracker`. To keep a result on every frame, set it to
+  `analysis-interval` in `mode=sync`, and a little above in `mode=latest`,
+  where results arrive one inference late. Keeping old results on screen is
+  `relationmetaoverlay`'s job (`expire-overlay`). `hold-time` counts from
+  the frame the result was first attached to and needs timestamped buffers
+  in a time segment.
 - **Errors.** A frame that cannot be copied, described or mapped is a fatal
   stream error, as in `uslsobjectdetect`: after the dry run, failures mean
   a broken engine or a buffer that does not match its caps. In
@@ -106,7 +121,8 @@ build): about 1.5 KB with `json-output=none`, 5.3 KB with `frame`, 6 KB with
 | `model-file` | unset (required) | Mirage `.cact` weights |
 | `mode` | `sync` | `sync` or `latest` |
 | `latency` | 0 | ns added to LATENCY queries in `mode=sync` (at most an hour) |
-| `hold-time` | 0 | `mode=latest`: ns to re-attach the last result to later frames |
+| `analysis-interval` | 0 (every frame) | least running time in ns between analyzed frames |
+| `hold-time` | 0 | ns to re-attach the last result to later frames |
 | `sections` | `scene+objects+text+relations+reasoning` | also `regions`, `events` |
 | `fields` | `bbox+score+mask+description` | also `point`, `position`; `bbox` is always requested, because an `ODMtd` needs a box |
 | `score-threshold`, `text-score-threshold` | 0 (engine default) | engine `conf`, `text_conf` |

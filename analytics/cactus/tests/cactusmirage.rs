@@ -25,6 +25,7 @@ fn registers_with_documented_defaults() -> Result<()> {
     ensure!(factory.rank() == gst::Rank::NONE);
     ensure!(element.property::<Option<String>>("model-file").is_none());
     ensure!(element.property::<u64>("latency") == 0);
+    ensure!(element.property::<u64>("analysis-interval") == 0);
     ensure!(element.property::<u32>("max-frame-bytes") == 128 * 1024 * 1024);
     ensure!(element.property::<u32>("threads") == 0);
     ensure!(element.property::<bool>("nms"));
@@ -117,5 +118,52 @@ fn measures_output_size_per_frame() -> Result<()> {
         let (count, bytes) = document_bytes(&buffer)?;
         eprintln!("  {count} documents, {bytes} bytes");
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs the Mirage weights"]
+fn latest_mode_passes_every_frame() -> Result<()> {
+    init()?;
+    let weights = std::env::var("CACTUS_MIRAGE_WEIGHTS").context("CACTUS_MIRAGE_WEIGHTS")?;
+    // A live source on the system clock, so frames arrive at 30 fps while
+    // the worker analyzes the newest one.
+    let pipeline = gst::parse::launch(&format!(
+        "videotestsrc is-live=true num-buffers=45 pattern=ball \
+         ! video/x-raw,format=RGB,width=640,height=360,framerate=30/1,pixel-aspect-ratio=1/1 \
+         ! cactusmirage model-file={weights} mode=latest ! appsink name=sink sync=false"
+    ))?
+    .downcast::<gst::Pipeline>()
+    .map_err(|_err| anyhow::anyhow!("not a pipeline"))?;
+    let sink = pipeline
+        .by_name("sink")
+        .context("appsink")?
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_err| anyhow::anyhow!("not an appsink"))?;
+    pipeline.set_state(gst::State::Playing)?;
+    let started = std::time::Instant::now();
+    let (mut frames, mut results) = (0, 0);
+    while let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_seconds(5)) {
+        frames += 1;
+        if let Some(meta) = sample
+            .buffer()
+            .and_then(gst::BufferRef::meta::<gst_analytics::AnalyticsRelationMeta>)
+        {
+            ensure!(
+                analytics_meta::schema::provenance(&meta).is_some(),
+                "{}",
+                analytics_meta::record::relation_meta(&meta)
+            );
+            results += 1;
+        }
+    }
+    let elapsed = started.elapsed();
+    let stop = std::time::Instant::now();
+    pipeline.set_state(gst::State::Null)?;
+    eprintln!(
+        "latest: {frames} frames in {elapsed:?}, {results} carried a result; stop took {:?}",
+        stop.elapsed()
+    );
+    ensure!(frames == 45 && results > 0 && results < frames);
     Ok(())
 }

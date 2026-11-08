@@ -4,6 +4,7 @@ use gst::prelude::*;
 mod describer;
 mod frame;
 mod imp;
+mod latest;
 mod mapping;
 mod settings;
 

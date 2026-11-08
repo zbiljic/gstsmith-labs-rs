@@ -45,6 +45,7 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 anyhow = { workspace = true }
+gst-app = { workspace = true }
 gst-check = { workspace = true }
 
 [lints]

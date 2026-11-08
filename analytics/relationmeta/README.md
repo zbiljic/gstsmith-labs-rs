@@ -32,13 +32,16 @@ Buffers and metadata pass through unchanged; it accepts any caps.
   analyzed frame that saw nothing. A note for producers: buffer pools keep a
   relation meta, cleared, on recycled buffers (`GST_META_FLAG_POOLED`), so a
   producer that attaches results to only some frames should unpool its meta
-  (`analytics_meta::unpool`, as `cactusmirage mode=latest` does), or its
+  (`analytics_meta::unpool`, as `cactusmirage` does in `mode=latest` or
+  with `analysis-interval`), or its
   skipped frames read as "saw nothing". A result attached again to later frames
   (same `x-provenance` PTS as the previous one) is one analysis: time
   advances, but it does not count as another frame.
 - **Hysteresis.** A change must persist for `*-min-frames` consecutive
   analyzed frames *and* `*-min-time` of running time. Time works under
-  variable inference rates; without timestamps only frames count.
+  variable inference rates; without timestamps only frames count. With a
+  producer that analyzes at most every N ms (`cactusmirage
+  analysis-interval`), each of the `*-min-frames` lasts about N ms.
 - **Label churn.** Open-vocabulary detectors drift between names (`poster`
   and `framed picture` for the same box). Use `labels` and `min-score` to
   keep presence from flapping.
@@ -112,7 +115,7 @@ the element needs writable frames, so a shared input buffer is copied.
 | `line-width` | 1 | outline, arrow and border width in pixels |
 | `polygon-opacity`, `mask-opacity` | 0.1, 0.2 | fill opacity of polygons and of segmentation masks |
 | `palette` | `pastel` | `pastel` (by label), `tracking` (by track id), `mono` |
-| `expire-overlay` | 1 s | how long the last result stays on frames without relation meta; 0 draws only frames that carry it |
+| `expire-overlay` | 1 s | how long the last result stays on frames without relation meta; 0 draws only frames that carry it. Keep it at or above the producer's analysis interval |
 
 Formats: exactly the formats `gst_video_blend` handles
 (`GST_VIDEO_OVERLAY_COMPOSITION_BLEND_FORMATS`): BGRx, RGBx, xRGB, xBGR, RGBA,
