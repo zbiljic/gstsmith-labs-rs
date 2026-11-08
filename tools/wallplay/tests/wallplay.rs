@@ -1700,15 +1700,42 @@ fn the_whole_workflow_runs_over_http() {
 
     // Stand in for the browsers: read the codes of frames both displays
     // present, and report them shown 50 ms after the clock reading, the right
-    // display 12 ms later than the left.
+    // display 12 ms later than the left. Each display's leaky queue drops
+    // frames of its own when its warp falls behind, as under load, so pull
+    // until enough frames reached both, keeping to the last 15 s, well inside
+    // the measurement's window.
     let pipeline = app.pipeline().expect("pipeline");
-    let [left, right] = <[Codes; 2]>::try_from(coded_frames(
-        &pipeline,
-        &app.measurement_log(),
-        &["left", "right"],
-        30,
-    ))
-    .expect("two displays");
+    let (mut left, mut right) = (Codes::new(), Codes::new());
+    // Frames both displays delivered, once each: as the source takes over
+    // from the standby, one frame can come with two running times.
+    let in_both = |left: &Codes, right: &Codes| {
+        let mut both: Vec<_> = left
+            .keys()
+            .filter(|pts| right.contains_key(pts))
+            .copied()
+            .collect();
+        both.dedup_by_key(|pts| frame_number(*pts, 30));
+        both
+    };
+    for _ in 0..20 {
+        let [more_left, more_right] = <[Codes; 2]>::try_from(coded_frames(
+            &pipeline,
+            &app.measurement_log(),
+            &["left", "right"],
+            10,
+        ))
+        .expect("two displays");
+        left.extend(more_left);
+        right.extend(more_right);
+        if let Some(newest) = left.keys().chain(right.keys()).max().copied() {
+            let oldest = newest.saturating_sub(gst::ClockTime::from_seconds(15));
+            left.retain(|pts, _| *pts >= oldest);
+            right.retain(|pts, _| *pts >= oldest);
+        }
+        if in_both(&left, &right).len() >= 3 {
+            break;
+        }
+    }
     for (pts, (code, _)) in left.iter().chain(&right) {
         assert_eq!(
             *code,
@@ -1719,8 +1746,7 @@ fn the_whole_workflow_runs_over_http() {
     let now = ok(address, "POST", "/api/clock", &Value::Null)["now"]
         .as_f64()
         .expect("now");
-    let common: Vec<_> = left.keys().filter(|pts| right.contains_key(pts)).collect();
-    // Each branch's leaky queue may drop different frames under load.
+    let common = in_both(&left, &right);
     assert!(common.len() >= 3, "only {} frames in common", common.len());
     for (id, codes, delay) in [("left", &left, 50.0), ("right", &right, 62.0)] {
         let frames: Vec<Value> = common
