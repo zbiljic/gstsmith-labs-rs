@@ -5,9 +5,11 @@
 use gst::glib;
 
 mod relationmetaevents;
+mod relationmetaoverlay;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
-    relationmetaevents::register(plugin)
+    relationmetaevents::register(plugin)?;
+    relationmetaoverlay::register(plugin)
 }
 
 gst::plugin_define!(
