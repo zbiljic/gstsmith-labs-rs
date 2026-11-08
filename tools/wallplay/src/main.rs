@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use wallplay::app::{App, Config};
+use wallplay::auth::ControlToken;
 use wallplay::player::{Fill, PlayerOptions, Signalling, Sink, Warp};
 use wallplay::source::{DEFAULT_SOURCE, DEFAULT_STANDBY, Prepared, Resolver, Source};
 
@@ -49,6 +50,10 @@ Options:
   --signalling-uri URI       Use one external signalling server instead, such
                              as ws://HOST:8443 from gst-webrtc-signalling-server;
                              browsers connect to the same URI
+  --control-token-file FILE  Require the token in this file, of at least 16
+                             letters, digits or -._~, for the control page
+                             and its API; display pages stay open. Without it,
+                             anyone who reaches the server controls it
   --list-devices             List this machine's cameras and screens, and exit
   -h, --help                 Show this help
 
@@ -88,6 +93,7 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Command> {
     let mut first_port = 8443;
     let mut external = None;
     let mut warp = None;
+    let mut control_token = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => listen = value(&arg, args.next())?,
@@ -108,6 +114,12 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Command> {
                     "gpu" => Some(Warp::Gpu),
                     other => bail!("--warp {other:?} is not auto, cpu or gpu"),
                 }
+            }
+            "--control-token-file" => {
+                let path: String = value(&arg, args.next())?;
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("--control-token-file: reading {path}"))?;
+                control_token = Some(ControlToken::new(&text).context("--control-token-file")?);
             }
             "--list-devices" => return Ok(Command::ListDevices),
             "-h" | "--help" => return Ok(Command::Help),
@@ -153,6 +165,7 @@ fn options(mut args: impl Iterator<Item = String>) -> Result<Command> {
             poll_timeout: Duration::from_secs(25),
             max_output,
             sound,
+            control_token,
         },
         warp,
     })))
@@ -194,6 +207,11 @@ fn run(mut options: Options) -> Result<()> {
         address.ip().to_string()
     };
     let state_dir = options.config.state_dir.display().to_string();
+    let controls = if options.config.control_token.is_some() {
+        "need the control token; display pages are open"
+    } else {
+        "open to anyone who reaches this port; see --control-token-file"
+    };
     let app = App::new(options.config)?;
     println!("Control page:  http://{host}:{}/", address.port());
     println!(
@@ -201,6 +219,7 @@ fn run(mut options: Options) -> Result<()> {
         address.port()
     );
     println!("State:         {state_dir}");
+    println!("Controls:      {controls}");
     match (warp, fallback) {
         (Warp::Gpu, _) => println!("Warping:       on the GPU, through OpenGL"),
         (Warp::Cpu, None) => println!("Warping:       on the CPU"),

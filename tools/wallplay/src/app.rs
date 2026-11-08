@@ -27,6 +27,7 @@ use wallcalibrate::detect::{self, Detections, Photo};
 use wallcalibrate::manifest::{Manifest, Placement};
 use wallcalibrate::{pattern, preview, tag};
 
+use crate::auth::{self, ControlToken};
 use crate::capture;
 use crate::drift::{FrameReport, Measurement};
 use crate::framecode::CodeGeometry;
@@ -64,6 +65,9 @@ pub struct Config {
     /// The display that plays the sound at first; without one, the streams
     /// carry none.
     pub sound: Option<String>,
+    /// Required for everything but the display pages; without one, anyone
+    /// who reaches the server controls it.
+    pub control_token: Option<ControlToken>,
 }
 
 /// A display's browser viewport, in CSS pixels.
@@ -589,6 +593,9 @@ impl App {
         } else {
             path.split('/').collect()
         };
+        if let Some(refused) = self.check_token(request, &segments) {
+            return refused;
+        }
         let reply = match (request.method.as_str(), segments.as_slice()) {
             ("GET", []) => Ok(Response::html(CONTROL_PAGE)),
             ("GET", ["display"]) => Ok(Response::html(DISPLAY_PAGE.replace("{{ID}}", ""))),
@@ -664,6 +671,28 @@ impl App {
             )),
         };
         reply.unwrap_or_else(|failure| Response::error(failure.status, &failure.message))
+    }
+
+    /// With a control token, the answer to a request that signs in or lacks
+    /// the token; `None` lets the request through.
+    fn check_token(&self, request: &Request, segments: &[&str]) -> Option<Response> {
+        let token = self.config.control_token.as_ref()?;
+        let to_control_page = || Response::new(303, "text/plain", "").with_header("Location", "/");
+        match (request.method.as_str(), segments) {
+            ("POST", ["login"]) => Some(token.sign_in(&request.form("token").unwrap_or_default())),
+            // Signed in already, as when reloading after signing in.
+            ("GET", ["login"]) if token.authorizes(request) => Some(to_control_page()),
+            // A link with the token, as one the controller bookmarks;
+            // signing in moves it out of the address bar.
+            ("GET", []) if request.query("token").is_some() => {
+                Some(token.sign_in(request.query("token").unwrap_or_default()))
+            }
+            (method, segments) if auth::display_route(method, segments) => None,
+            _ if token.authorizes(request) => None,
+            // Pages a browser opens get the sign-in page.
+            ("GET", [] | ["calibration" | "login"]) => Some(auth::sign_in_page("")),
+            _ => Some(auth::unauthorized()),
+        }
     }
 
     fn file(&self, name: &str) -> Reply {
@@ -1085,8 +1114,8 @@ impl App {
 
     /// Play a pattern or a URL, switching to it while playing. Web pages are
     /// looked up first, which takes a few seconds, without holding the state.
-    /// Pipeline descriptions are refused: over an unauthenticated page they
-    /// could write files.
+    /// Pipeline descriptions are refused, with a control token too: a
+    /// pipeline could write files, and the token crosses plain HTTP.
     fn set_source(&self, source: &Source) -> Reply {
         let invalid = match source {
             Source::Launch(_) => {

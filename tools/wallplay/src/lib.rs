@@ -10,11 +10,13 @@
 //! [`capture`]). While measuring, every output carries its frame
 //! number ([`framecode`]) and the browsers report when they present each
 //! frame ([`drift`]); aligning delays the early displays to match ([`sync`]).
+//! An optional token keeps the controls to those who know it ([`auth`]).
 //!
 //! None of this is part of the `wallwarp` element: the server, the pages,
 //! and the signalling choices are one way to orchestrate it.
 
 pub mod app;
+pub mod auth;
 pub mod capture;
 pub mod drift;
 pub mod framecode;

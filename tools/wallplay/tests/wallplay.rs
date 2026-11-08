@@ -19,6 +19,7 @@ use wall_geometry::{Layout, Point, Quad, Screen, Size};
 use wallcalibrate::manifest::Manifest;
 use wallcalibrate::synth::{self, SynthOptions};
 use wallplay::app::{App, Config};
+use wallplay::auth::ControlToken;
 use wallplay::drift::Measurement;
 use wallplay::framecode::{self, CodeGeometry};
 use wallplay::player::{self, Clock, Fill, Player, PlayerOptions, Sink, Warp, frame_number};
@@ -71,6 +72,15 @@ fn serve_polling(
     state_dir: &std::path::Path,
     poll_timeout: Duration,
 ) -> (std::sync::Arc<App>, SocketAddr) {
+    serve_with(state_dir, poll_timeout, None)
+}
+
+/// Start a server that requires `control_token`, if any, for its controls.
+fn serve_with(
+    state_dir: &std::path::Path,
+    poll_timeout: Duration,
+    control_token: Option<ControlToken>,
+) -> (std::sync::Arc<App>, SocketAddr) {
     init();
     let app = App::new(Config {
         state_dir: state_dir.to_owned(),
@@ -78,6 +88,7 @@ fn serve_polling(
         poll_timeout,
         max_output: 1920,
         sound: None,
+        control_token,
     })
     .expect("app");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -89,12 +100,28 @@ fn serve_polling(
 
 /// One request on its own connection; returns the status and the body.
 fn request(address: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    let (status, _, body) = request_with(address, method, path, &[], body);
+    (status, body)
+}
+
+/// One request with more headers, each a full `Name: value` line; returns
+/// the status, the response head, and the body.
+fn request_with(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[&str],
+    body: &[u8],
+) -> (u16, String, Vec<u8>) {
     let mut stream = TcpStream::connect(address).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("timeout");
+    let extra = headers
+        .iter()
+        .fold(String::new(), |extra, line| extra + line + "\r\n");
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: test\r\nUser-Agent: wallplay-test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: test\r\nUser-Agent: wallplay-test\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).expect("write head");
@@ -109,7 +136,12 @@ fn request(address: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16, 
         .expect("status")
         .parse()
         .expect("status code");
-    (status, response.get(split + 4..).expect("body").to_vec())
+    let head = String::from_utf8_lossy(response.get(..split).expect("head")).into_owned();
+    (
+        status,
+        head,
+        response.get(split + 4..).expect("body").to_vec(),
+    )
 }
 
 fn json_request(address: SocketAddr, method: &str, path: &str, body: &Value) -> (u16, Value) {
@@ -539,6 +571,208 @@ fn requests_out_of_order_are_refused_with_a_reason() {
     let (status, page) = request(address, "GET", "/display/lobby", b"");
     assert_eq!(status, 200);
     assert!(String::from_utf8_lossy(&page).contains(r#"const id = "lobby";"#));
+    // Without a control token, the controls are open, as they always were,
+    // and there is nothing to sign in to.
+    let (status, page) = request(address, "GET", "/", b"");
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&page).contains("/api/state"));
+    assert_eq!(request(address, "POST", "/login", b"token=x").0, 404);
+}
+
+const CONTROL_TOKEN: &str = "test-token-0123456789";
+
+/// Every request of the controller, each of which needs the token when the
+/// server has one.
+fn controller_requests() -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        ("GET", "/", Value::Null),
+        ("GET", "/?token=wrong-token-0123456789", Value::Null),
+        ("GET", "/calibration", Value::Null),
+        ("GET", "/api/state", Value::Null),
+        ("DELETE", "/api/displays/left", Value::Null),
+        ("POST", "/api/patterns", Value::Null),
+        ("GET", "/api/manifest", Value::Null),
+        ("POST", "/api/photo", json!("not a photo")),
+        ("GET", "/api/photo.jpg", Value::Null),
+        ("GET", "/api/displays/left/preview.jpg", Value::Null),
+        ("GET", "/api/calibration", Value::Null),
+        ("PUT", "/api/calibration", json!({})),
+        ("POST", "/api/layout", json!({"canvas": [1920, 1080]})),
+        ("GET", "/api/layout", Value::Null),
+        ("GET", "/api/layout.svg", Value::Null),
+        ("POST", "/api/play", Value::Null),
+        ("POST", "/api/idle", Value::Null),
+        ("GET", "/api/devices", Value::Null),
+        ("POST", "/api/source", json!({"uri": "file:///etc/hosts"})),
+        ("POST", "/api/source", json!({"camera": "0"})),
+        (
+            "POST",
+            "/api/source",
+            json!({"launch": "videotestsrc ! fakesink"}),
+        ),
+        ("POST", "/api/playback", json!({"restart": false})),
+        ("POST", "/api/buffer", json!({"ms": 100})),
+        ("POST", "/api/sound", json!({"display": "left"})),
+        ("POST", "/api/measure", json!({"on": true})),
+        ("GET", "/api/measure", Value::Null),
+        ("POST", "/api/align", json!({"on": true})),
+        ("GET", "/nowhere", Value::Null),
+        ("GET", "/login", Value::Null),
+    ]
+}
+
+#[test]
+fn controls_need_the_token_and_displays_do_not() {
+    let state = tempfile::tempdir().expect("state directory");
+    let token = ControlToken::new(CONTROL_TOKEN).expect("token");
+    let (_app, address) = serve_with(state.path(), Duration::from_millis(200), Some(token));
+    let bearer = format!("Authorization: Bearer {CONTROL_TOKEN}");
+    let cookie = format!("Cookie: wallplay_control={CONTROL_TOKEN}");
+
+    // Displays need nothing: their page, their poll, the clock, and frame
+    // reports work as before.
+    let (status, page) = request(address, "GET", "/display/left", b"");
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&page).contains(r#"const id = "left";"#));
+    assert_eq!(request(address, "GET", "/display", b"").0, 200);
+    assert_eq!(poll(address, "left", 640, 360)["mode"], "idle");
+    let now = ok(address, "POST", "/api/clock", &Value::Null)["now"]
+        .as_f64()
+        .expect("now");
+    let report = json!({"rtt": 1.0, "frames": [[1, now, null]]});
+    assert_eq!(
+        json_request(address, "POST", "/api/displays/left/frames", &report).0,
+        204
+    );
+    // A pattern that does not exist yet is missing, not forbidden.
+    assert_eq!(
+        request(address, "GET", "/api/displays/left/pattern.svg", b"").0,
+        404
+    );
+
+    // Every controller request is refused without the token or with a
+    // wrong one, before it does anything.
+    let wrong = [
+        Vec::new(),
+        vec!["Authorization: Bearer wrong-token-0123456789".to_owned()],
+        vec![format!("Authorization: Basic {CONTROL_TOKEN}")],
+        vec!["Cookie: wallplay_control=wrong-token-0123456789".to_owned()],
+        vec![format!("Cookie: other={CONTROL_TOKEN}")],
+    ];
+    for headers in &wrong {
+        let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+        for (method, path, body) in controller_requests() {
+            let body = if body.is_null() {
+                Vec::new()
+            } else {
+                body.to_string().into_bytes()
+            };
+            let (status, head, page) = request_with(address, method, path, &headers, &body);
+            assert_eq!(status, 401, "{method} {path} with {headers:?}");
+            assert!(head.contains("WWW-Authenticate: Bearer"), "{head}");
+            assert!(!head.contains("Set-Cookie"), "{head}");
+            let page = String::from_utf8_lossy(&page);
+            if method == "GET" && path.starts_with("/?") {
+                assert!(page.contains("Wrong token."), "{page}");
+            } else if method == "GET" && ["/", "/calibration", "/login"].contains(&path) {
+                assert!(page.contains(r#"action="/login""#), "{page}");
+            } else {
+                assert!(page.contains("control token"), "{method} {path}: {page}");
+            }
+        }
+    }
+    assert_eq!(poll(address, "left", 640, 360)["mode"], "idle");
+    for name in ["manifest.json", "calibration.json", "layout.json"] {
+        assert!(!state.path().join(name).exists(), "{name}");
+    }
+
+    // With the token as a bearer token or a cookie, the controls work.
+    for headers in [[bearer.as_str()], [cookie.as_str()]] {
+        let (status, _, body) = request_with(address, "GET", "/api/state", &headers, b"");
+        assert_eq!(status, 200);
+        let state: Value = serde_json::from_slice(&body).expect("state");
+        assert_eq!(state["displays"][0]["id"], "left");
+        let (status, _, page) = request_with(address, "GET", "/", &headers, b"");
+        assert_eq!(status, 200);
+        assert!(String::from_utf8_lossy(&page).contains("/api/state"));
+    }
+    // The token does not unlock pipeline descriptions, which could write
+    // files, since it crosses plain HTTP.
+    let launch = json!({"launch": "videotestsrc ! filesink location=x"}).to_string();
+    let (status, _, _) = request_with(
+        address,
+        "POST",
+        "/api/source",
+        &[&bearer],
+        launch.as_bytes(),
+    );
+    assert_eq!(status, 400);
+    let (status, _, _) = request_with(address, "POST", "/api/patterns", &[&bearer], b"");
+    assert_eq!(status, 200);
+    assert_eq!(poll(address, "left", 640, 360)["mode"], "pattern");
+    assert!(state.path().join("manifest.json").exists());
+    assert_eq!(
+        request(address, "GET", "/api/displays/left/pattern.svg", b"").0,
+        200
+    );
+    let (status, _, _) = request_with(address, "POST", "/api/idle", &[&cookie], b"");
+    assert_eq!(status, 200);
+    assert_eq!(poll(address, "left", 640, 360)["mode"], "idle");
+}
+
+#[test]
+fn signing_in_sets_the_control_cookie() {
+    let state = tempfile::tempdir().expect("state directory");
+    let token = ControlToken::new(CONTROL_TOKEN).expect("token");
+    let (_app, address) = serve_with(state.path(), Duration::from_millis(200), Some(token));
+    let form = ["Content-Type: application/x-www-form-urlencoded"];
+    let (status, head, page) = request_with(
+        address,
+        "POST",
+        "/login",
+        &form,
+        b"token=wrong-token-0123456789",
+    );
+    assert_eq!(status, 401);
+    assert!(!head.contains("Set-Cookie"), "{head}");
+    assert!(String::from_utf8_lossy(&page).contains("Wrong token."));
+
+    // The form and a link with the token both sign in, and send the
+    // browser to the control page without the token in its address.
+    let body = format!("token={CONTROL_TOKEN}");
+    let link = format!("/?token={CONTROL_TOKEN}");
+    for (method, path, body) in [
+        ("POST", "/login", body.as_bytes()),
+        ("GET", link.as_str(), b"".as_slice()),
+    ] {
+        let (status, head, _) = request_with(address, method, path, &form, body);
+        assert_eq!(status, 303, "{method} {path}: {head}");
+        assert!(head.lines().any(|line| line == "Location: /"), "{head}");
+        let cookie = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Set-Cookie: "))
+            .expect("cookie");
+        assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
+        let value = cookie.split(';').next().expect("cookie value");
+        let (status, _, _) = request_with(
+            address,
+            "GET",
+            "/api/state",
+            &[&format!("Cookie: {value}")],
+            b"",
+        );
+        assert_eq!(status, 200);
+        // Signed in, the sign-in page leads to the control page.
+        let (status, head, _) = request_with(
+            address,
+            "GET",
+            "/login",
+            &[&format!("Cookie: {value}")],
+            b"",
+        );
+        assert_eq!(status, 303);
+        assert!(head.lines().any(|line| line == "Location: /"), "{head}");
+    }
 }
 
 /// A synthetic photo of the server's displays showing their patterns, as PNG,

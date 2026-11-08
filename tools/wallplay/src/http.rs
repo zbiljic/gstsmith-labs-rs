@@ -57,6 +57,17 @@ impl Request {
             .map(|(_, value)| value.as_str())
     }
 
+    /// The last field named `name` of an `application/x-www-form-urlencoded`
+    /// body, percent-decoded.
+    #[must_use]
+    pub fn form(&self, name: &str) -> Option<String> {
+        String::from_utf8_lossy(&self.body)
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .rfind(|(key, _)| percent_decode(key) == name)
+            .map(|(_, value)| percent_decode(value))
+    }
+
     /// The body parsed as JSON.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
         serde_json::from_slice(&self.body).context("invalid JSON body")
@@ -68,6 +79,8 @@ impl Request {
 pub struct Response {
     pub status: u16,
     pub content_type: String,
+    /// Headers besides the ones every response carries.
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
@@ -77,8 +90,18 @@ impl Response {
         Self {
             status,
             content_type: content_type.to_owned(),
+            headers: Vec::new(),
             body: body.into(),
         }
+    }
+
+    /// This response with one more header; `value` must not contain a
+    /// line break.
+    #[must_use]
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        assert!(!value.contains(['\r', '\n']), "header value {value:?}");
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
     }
 
     #[must_use]
@@ -112,7 +135,9 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         204 => "No Content",
+        303 => "See Other",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
@@ -280,15 +305,22 @@ fn read_request(stream: &mut impl Read, buffer: &mut Vec<u8>) -> Result<Option<H
 }
 
 fn write_response(stream: &mut impl Write, response: &Response, close: bool) -> io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: {}\r\n\r\n",
+    // One buffer, so that the head leaves in one packet.
+    let mut head = Vec::new();
+    write!(
+        head,
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: {}\r\n",
         response.status,
         reason(response.status),
         response.content_type,
         response.body.len(),
         if close { "close" } else { "keep-alive" },
-    );
-    stream.write_all(head.as_bytes())?;
+    )?;
+    for (name, value) in &response.headers {
+        write!(head, "{name}: {value}\r\n")?;
+    }
+    head.extend_from_slice(b"\r\n");
+    stream.write_all(&head)?;
     stream.write_all(&response.body)?;
     stream.flush()
 }
@@ -444,5 +476,25 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
         assert!(text.contains("Content-Length: 12\r\n") && text.contains("keep-alive"));
         assert!(text.ends_with("{\n  \"a\": 1\n}"));
+        let mut output = Vec::new();
+        let redirect = Response::new(303, "text/plain", "").with_header("Location", "/");
+        write_response(&mut output, &redirect, true).expect("write");
+        let text = String::from_utf8(output).expect("utf-8");
+        assert!(text.starts_with("HTTP/1.1 303 See Other\r\n"), "{text}");
+        assert!(
+            text.ends_with("Connection: close\r\nLocation: /\r\n\r\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn form_fields_are_percent_decoded() {
+        let request = Request {
+            body: b"token=first&path=%2F&token=a%2Bb+c&empty=".to_vec(),
+            ..Request::default()
+        };
+        assert_eq!(request.form("token").as_deref(), Some("a+b c"));
+        assert_eq!(request.form("empty").as_deref(), Some(""));
+        assert_eq!(request.form("missing"), None);
     }
 }

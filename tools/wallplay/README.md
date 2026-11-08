@@ -82,6 +82,7 @@ It prints the control page's address, for example `http://192.168.1.20:8000/`.
 --signalling-port PORT   first port of the per-display signalling servers [default: 8443]
 --signalling-uri URI     one external signalling server for every display
 --warp auto|cpu|gpu      where displays' frames are warped [default: auto]
+--control-token-file FILE require this token for the controls; see Access control
 --list-devices           list this machine's cameras and screens, and exit
 ```
 
@@ -91,7 +92,8 @@ camera or screen of this machine as `--list-devices` names it (see
 description with one video output and at most one audio
 output, such as `"videotestsrc is-live=true pattern=snow"`. The control page
 can switch between patterns and URLs, but not set a pipeline description:
-over an unauthenticated page, a pipeline could write files.
+a pipeline could write files, and the control page has at most a token sent
+over plain HTTP; see [Access control](#access-control).
 
 The state directory keeps `manifest.json`, the photo, `detections.json`,
 `calibration.json`, and `layout.json` under `wallcalibrate`'s names, so a
@@ -482,6 +484,7 @@ Tested with GStreamer 1.28.8 and `rswebrtc` 0.15.4:
 | Request | Purpose |
 |---|---|
 | `GET /`, `GET /display[/ID]` | Control page, display page |
+| `POST /login`, `GET /?token=TOKEN` | Sign in with the form's `token` field or the link, only with `--control-token-file`; see [Access control](#access-control) |
 | `GET /api/displays/ID/poll?since=N&epoch=&w=&h=&scale=&fullscreen=&player=` | Long poll: report the viewport, receive what to show; answers at once when `epoch` is from an earlier run of the server |
 | `POST /api/patterns` | Make a manifest from the online displays' viewports and show it |
 | `POST /api/photo` | Upload a photo (body: JPEG or PNG), detect, and solve |
@@ -502,8 +505,56 @@ Tested with GStreamer 1.28.8 and `rswebrtc` 0.15.4:
 | `GET /api/state`, `DELETE /api/displays/ID` | Everything the control page shows; forget an offline display |
 
 The server is a small HTTP/1.1 implementation on the standard library and
-`httparse`, with one thread per connection, kept-alive connections, and no TLS
-or authentication; run it only on a trusted network.
+`httparse`, with one thread per connection, kept-alive connections, and no
+TLS; run it only on a trusted network.
+
+## Access control
+
+Without `--control-token-file`, anyone who can reach the server controls
+it: what plays, including files and cameras of the server, the calibration,
+and the photo of the wall. With a file holding a token of at least 16
+letters, digits, or `-._~`, such as one from `openssl rand -hex 24`, the
+controls need that token:
+
+```sh
+openssl rand -hex 24 > control-token
+wallplay --control-token-file control-token
+```
+
+The control page asks for the token once and keeps it in a cookie for the
+browser session; scripts send `Authorization: Bearer TOKEN`. A link to
+`/?token=TOKEN` signs in too, though it leaves the token in the browser's
+history. Clearing the site's cookies signs out.
+
+Display pages need no token, so displays still only open
+`/display/ID`. These routes stay open: `GET /display[/ID]`,
+`GET /api/displays/ID/poll`, `GET /api/displays/ID/pattern.svg`,
+`POST /api/clock`, and `POST /api/displays/ID/frames`. Every other route
+needs the token, including the control page, `/calibration`, `/api/state`,
+the photo, the previews, the calibration and layout files, the source, and
+every playback control. Routes added later need it unless they are added to
+the open list.
+
+The token keeps devices that do not know it from controlling the wall; it
+is not a secure channel:
+
+- Over plain HTTP, the token, the cookie, the photo, and the calibration
+  cross the network unencrypted. Anyone who can watch the network, as on
+  an open or shared Wi-Fi network, can read the token and use it.
+- Displays are not authenticated: anyone who can reach the server can
+  register a display ID, report frames that change what aligning does, and
+  watch a display's stream through its signalling port.
+- Cookies are not separated by port: other web servers on the same host
+  name receive the cookie, and pages they serve count as the same site.
+- Requests are read in full, up to the 64 MiB body limit, before the token
+  is checked.
+
+To keep the token private on a network you do not trust, put an HTTPS
+reverse proxy in front of wallplay and have wallplay listen only on the
+loopback interface, as with `--listen 127.0.0.1:8000`. Display pages served
+over HTTPS reach signalling with `wss://` on each display's signalling port,
+so those ports need TLS too, or `--signalling-uri` must name a `wss://`
+server.
 
 ## Development
 
@@ -521,9 +572,11 @@ playback, frame codes matching running times, measurement and aligning from
 simulated browser reports, a new layout while playing, a source that ends,
 restarts, fails, and is replaced while playing, sound that follows the source
 with its picture's offset and turns to silence on standby, and sound moving
-between displays. Layout changes, stream sizes, displays coming and going,
-sources ending, failing and changing, sound, cropping, and frame codes are
-checked on the GPU path too, where OpenGL works.
+between displays. With a control token, every controller route is
+refused without it and every display route stays open. Layout changes,
+stream sizes, displays coming and going, sources ending, failing and
+changing, sound, cropping, and frame codes are checked on the GPU path
+too, where OpenGL works.
 
 With `webrtcsink`, libnice, `uv`, and Playwright's Chromium installed, a full
 check runs the real pages in headless Chromium:
@@ -561,8 +614,9 @@ gpu` picks the warp, `--source` what plays while measuring, as `wallplay`'s
   gst-plugins-good; showing it whole or stretched does not.
 - The measurement covers the browsers, not the panels, and aligning
   corrects only what the browsers report.
-- No authentication or TLS; browsers that require a secure context for the
-  Screen Wake Lock API get none, so turn off the display's own sleep and
-  auto-lock, which also drop it out of fullscreen.
+- No TLS, and authentication only by the optional control token; see
+  [Access control](#access-control). Browsers that require a secure
+  context for the Screen Wake Lock API get none, so turn off the display's
+  own sleep and auto-lock, which also drop it out of fullscreen.
 - Drift and aligning are tested with headless Chromium on one machine and
   on two real displays.
