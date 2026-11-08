@@ -17,7 +17,7 @@ echo "$dest"
 '''
 
 [tasks."cactus:smoke"]
-description = "Run the opt-in real-engine Mirage tests with the pinned weights"
+description = "Run the opt-in engine API tests (cactus crate) with the real engine"
 depends = ["cactus:weights"]
 run = '''
 export CACTUS_MIRAGE_WEIGHTS="$(realpath "${CACTUS_MIRAGE_WEIGHTS:-target/models/mirage.cact}")"

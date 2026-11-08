@@ -1,0 +1,23 @@
+[tasks.build]
+description = "Build the cactus plugin"
+depends = []
+dir = "{{config_root}}/../.."
+run = "cargo build --locked -p gst-plugin-cactus"
+
+[tasks.inspect]
+description = "Build and inspect cactusmirage"
+depends = ["build"]
+dir = "{{config_root}}/../.."
+run = '''
+export GST_PLUGIN_PATH="$PWD/target/debug${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+gst-inspect-1.0 cactusmirage
+'''
+
+[tasks.smoke]
+description = "Run the opt-in cactusmirage element tests with the real engine"
+depends = ["//:cactus:weights"]
+dir = "{{config_root}}/../.."
+run = '''
+export CACTUS_MIRAGE_WEIGHTS="$(realpath "${CACTUS_MIRAGE_WEIGHTS:-target/models/mirage.cact}")"
+cargo test --release --locked -p gst-plugin-cactus --test cactusmirage -- --ignored --nocapture --test-threads=1
+'''
