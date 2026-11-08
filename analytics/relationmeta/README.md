@@ -1,12 +1,14 @@
 # GStreamer relation meta plugin
 
 The `relationmeta` plugin turns GStreamer analytics relation metadata from
-any producer into events and overlays. Its elements read only standard Mtds
-(`ODMtd`, `ClsMtd`, `TrackingMtd`, `SegmentationMtd`) and the generic `x-*`
-documents of [`analytics-meta`](../../utils/analytics-meta/): `x-polygon`,
-`x-relation`, `x-caption`, `x-text` and `x-provenance`. They never read
-producer-specific documents, so they behave the same on `uslsobjectdetect`,
-`ioutracker`, `onvifmeta2relationmeta` and any later producer.
+any producer into events, overlays and JSON records. `relationmetaevents`
+and `relationmetaoverlay` read only standard Mtds (`ODMtd`, `ClsMtd`,
+`TrackingMtd`, `SegmentationMtd`) and the generic `x-*` documents of
+[`analytics-meta`](../../utils/analytics-meta/): `x-polygon`, `x-relation`,
+`x-caption`, `x-text` and `x-provenance`. They never read producer-specific
+documents, so they behave the same on `uslsobjectdetect`, `ioutracker`,
+`onvifmeta2relationmeta` and any later producer. `relationmetatap` records
+everything, producer-specific documents included.
 
 Requires GStreamer 1.28 or newer. Before 1.28.3, copying a buffer drops its
 boxes and everything linked to them, so a frame that is shared when it
@@ -123,6 +125,30 @@ BGRA, ARGB, ABGR, RGB, BGR, I420, YV12, AYUV, YUY2, UYVY, v308, Y41B, Y42B,
 Y444, NV12, NV21, A420, YUV9, YVU9, IYU1 and GRAY8.
 
 `x-provenance` is not drawn.
+
+## `relationmetatap`
+
+A passthrough development tool that writes one JSON line per buffer to
+`location` (truncated on start, flushed at EOS and stop):
+
+```json
+{"pts":40000000,"running-time":40000000,"mtds":[{"id":0,"type":"object-detection","label":"man","x":10,"y":10,"w":50,"h":80,"r":0.0,"confidence":0.7}]}
+```
+
+`mtds` lists every Mtd with its `id`, its `type` (upstream's name; unknown
+types are recorded by name only), its type-specific fields (box, label and
+confidence; classes; tracking info; segmentation location and region ids,
+without mask pixels), its outgoing `relations` when it has any, and JSON
+documents (`x-json`) with their `schema` and parsed `json`, or the raw
+`text` of a document that is not valid JSON. Documents are re-serialized, so
+keys are sorted and numbers normalized, but no value is lost. `mtds` is
+`null` on a buffer without relation meta and `[]` on one with an empty
+relation meta. Unlike the other elements, it records producer-specific
+documents too. Writes block the streaming thread.
+
+| Property | Default | Meaning |
+| --- | --- | --- |
+| `location` | required | path of the JSON lines file |
 
 ## Example
 

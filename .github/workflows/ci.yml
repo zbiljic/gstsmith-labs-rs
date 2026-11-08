@@ -105,6 +105,7 @@ jobs:
           gst-inspect-1.0 relationmeta
           gst-inspect-1.0 relationmetaevents
           gst-inspect-1.0 relationmetaoverlay
+          gst-inspect-1.0 relationmetatap
           gst-inspect-1.0 wallwarp
 
       - name: Read minimum supported Rust version

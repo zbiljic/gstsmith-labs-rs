@@ -1,7 +1,7 @@
 [package]
 name = "gst-plugin-relationmeta"
 version = { workspace = true }
-description = "GStreamer elements that turn analytics relation metadata into events and overlays."
+description = "GStreamer elements that turn analytics relation metadata into events, overlays and JSON records."
 authors = { workspace = true }
 edition = { workspace = true }
 rust-version = { workspace = true }
@@ -32,6 +32,8 @@ gst-base = { workspace = true, features = ["v1_28"] }
 gst-video = { workspace = true, features = ["v1_28"] }
 pango = { workspace = true }
 pangocairo = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 static = []
@@ -47,6 +49,7 @@ path = "src/lib.rs"
 anyhow = { workspace = true }
 gst-app = { workspace = true }
 gst-check = { workspace = true }
+tempfile = "3.27.0"
 
 [lints]
 workspace = true

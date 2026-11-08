@@ -1384,6 +1384,9 @@ dependencies = [
  "gstreamer-video",
  "pango",
  "pangocairo",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

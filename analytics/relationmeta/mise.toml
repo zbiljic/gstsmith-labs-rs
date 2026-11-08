@@ -5,13 +5,14 @@ dir = "{{config_root}}/../.."
 run = "cargo build --locked -p gst-plugin-relationmeta"
 
 [tasks.inspect]
-description = "Build and inspect both relationmeta elements"
+description = "Build and inspect the relationmeta elements"
 depends = ["build"]
 dir = "{{config_root}}/../.."
 run = '''
 export GST_PLUGIN_PATH="$PWD/target/debug${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
 gst-inspect-1.0 relationmetaevents
 gst-inspect-1.0 relationmetaoverlay
+gst-inspect-1.0 relationmetatap
 '''
 
 [tasks.demo]

@@ -1,15 +1,18 @@
 //! `GStreamer` elements that turn analytics relation metadata from any
-//! producer into events and overlays. They read only standard Mtds and the
-//! generic `x-*` documents of `analytics-meta`.
+//! producer into events, overlays and JSON records. `relationmetaevents` and
+//! `relationmetaoverlay` read only standard Mtds and the generic `x-*`
+//! documents of `analytics-meta`; `relationmetatap` records everything.
 
 use gst::glib;
 
 mod relationmetaevents;
 mod relationmetaoverlay;
+mod relationmetatap;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     relationmetaevents::register(plugin)?;
-    relationmetaoverlay::register(plugin)
+    relationmetaoverlay::register(plugin)?;
+    relationmetatap::register(plugin)
 }
 
 gst::plugin_define!(

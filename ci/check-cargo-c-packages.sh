@@ -31,7 +31,7 @@ pc_dir="$libdir/pkgconfig"
 packages=(
   "gst-plugin-cactus|gstcactus|cactus|cactusmirage"
   "gst-plugin-nalsense|gstnalsense|nalsense|nalsenseactivity nalsensereplay"
-  "gst-plugin-relationmeta|gstrelationmeta|relationmeta|relationmetaevents relationmetaoverlay"
+  "gst-plugin-relationmeta|gstrelationmeta|relationmeta|relationmetaevents relationmetaoverlay relationmetatap"
   "gst-plugin-usls|gstusls|usls|uslsobjectdetect uslssegment"
   "gst-plugin-jsontap|gstjsontap|jsontap|jsontap"
   "gst-plugin-ptssampler|gstptssampler|ptssampler|ptssampler"
