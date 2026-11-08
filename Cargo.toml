@@ -10,6 +10,7 @@ members = [
     "utils/analytics-meta",
     "utils/analytics-meta/fixtures/plugin-a",
     "utils/analytics-meta/fixtures/plugin-b",
+    "utils/cactus",
     "utils/cactus-sys",
     "utils/wall-geometry",
     "video/wallwarp",

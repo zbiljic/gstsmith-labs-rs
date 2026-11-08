@@ -1,3 +1,29 @@
+[tasks."cactus:weights"]
+description = "Download the pinned Mirage weights to target/models/mirage.cact"
+run = '''
+set -eu
+dest="${CACTUS_MIRAGE_WEIGHTS:-target/models/mirage.cact}"
+revision=76c1e9e53381aca8fc3843c636216c96ff220122
+expected=4249a0f7515272ff76b9414bec17d7e7daf84b15b66c7fb4f17fce1e66f9f237
+digest() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+if [ -f "$dest" ] && [ "$(digest "$dest")" = "$expected" ]; then echo "$dest"; exit 0; fi
+mkdir -p "$(dirname "$dest")"
+curl --fail --location --silent --show-error --retry 3 --output "$dest.partial" \
+  "https://huggingface.co/Cactus-Compute/mirage/resolve/$revision/mirage.cact"
+actual="$(digest "$dest.partial")"
+if [ "$actual" != "$expected" ]; then rm -f "$dest.partial"; echo "mirage.cact has SHA-256 $actual, expected $expected" >&2; exit 1; fi
+mv "$dest.partial" "$dest"
+echo "$dest"
+'''
+
+[tasks."cactus:smoke"]
+description = "Run the opt-in real-engine Mirage tests with the pinned weights"
+depends = ["cactus:weights"]
+run = '''
+export CACTUS_MIRAGE_WEIGHTS="$(realpath "${CACTUS_MIRAGE_WEIGHTS:-target/models/mirage.cact}")"
+cargo test --release --locked -p cactus --test engine -- --ignored --nocapture --test-threads=1
+'''
+
 [tasks."cactus:deps:check"]
 description = "Check that only the cactus plugin links the Cactus engine"
 run = "ci/check-cactus-links.sh"
