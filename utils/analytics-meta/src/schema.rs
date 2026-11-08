@@ -178,6 +178,21 @@ pub fn add_relation(
     Ok(node)
 }
 
+/// Attaches any document under the Mtd `object` with the per-object
+/// convention (`CONTAIN` from the object, `IS_PART_OF` back), for
+/// producer-specific schemas such as `example/detector/object`.
+pub fn add_document_under<T: Serialize + ?Sized>(
+    meta: MetaMut<'_, '_>,
+    object: u32,
+    schema: &str,
+    value: &T,
+) -> Result<u32, glib::BoolError> {
+    check_ids(meta, &[object])?;
+    let doc = json::add_value(meta, schema, value)?;
+    attach_to_object(meta, object, doc)?;
+    Ok(doc)
+}
+
 /// Attaches a frame `x-caption`.
 pub fn add_caption(meta: MetaMut<'_, '_>, text: &str) -> Result<u32, glib::BoolError> {
     json::add_value(
@@ -389,6 +404,11 @@ mod tests {
         };
         let doc = add_polygon(&mut meta, od, &tiny_overshoot).expect("clamped");
         assert!(add_polygon(&mut meta, 99, &square()).err().is_some());
+        assert!(
+            add_document_under(&mut meta, 99, "example/detector/object", &1)
+                .err()
+                .is_some()
+        );
         assert!(add_relation(&mut meta, od, 99, "on").err().is_some());
         assert_eq!(meta.len(), 2, "a failed call left a document behind");
         let meta = buffer.meta::<AnalyticsRelationMeta>().expect("meta");
