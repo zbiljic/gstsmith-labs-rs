@@ -36,10 +36,14 @@ fn image() -> Vec<u8> {
     data
 }
 
-fn loaded() -> Engine {
-    let mut engine = Engine::lock();
+fn loaded_on(name: &str) -> Engine {
+    let mut engine = Engine::lock(name).expect("engine");
     engine.load_vision(&weights()).expect("Mirage loads");
     engine
+}
+
+fn loaded() -> Engine {
+    loaded_on("")
 }
 
 #[test]
@@ -147,4 +151,38 @@ fn grows_a_small_output_buffer() {
         description.grew_to
     );
     serde_json::from_str::<serde_json::Value>(&description.json).expect("JSON");
+}
+
+#[test]
+#[ignore = "needs the Mirage weights"]
+fn named_engines_hold_their_own_models_and_run_at_once() {
+    let fresh = Engine::lock("fresh").expect("engine");
+    assert_eq!(fresh.models(), cactus::Models::default());
+    drop(fresh);
+    let pixels = image();
+    let describe = |name: &'static str| {
+        let pixels = pixels.clone();
+        std::thread::spawn(move || {
+            let mut engine = loaded_on(name);
+            let frame = PackedRgb::new(&pixels, 160, 120).expect("image");
+            let started = Instant::now();
+            for _ in 0..5 {
+                engine
+                    .describe(frame, Request::default())
+                    .expect("describe");
+            }
+            started.elapsed()
+        })
+    };
+    let alone = describe("first").join().expect("first");
+    let (first, second) = (describe("first"), describe("second"));
+    let together = [first.join().expect("first"), second.join().expect("second")];
+    eprintln!("5 describes: {alone:?} alone, {together:?} on two engines at once");
+    assert!(
+        Engine::lock("fresh")
+            .expect("engine")
+            .models()
+            .eq(&cactus::Models::default()),
+        "loading on other engines leaves this one empty"
+    );
 }

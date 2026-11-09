@@ -11,28 +11,47 @@ engine. It provides two elements:
 
 Requires GStreamer 1.28 or newer.
 
-## The engine
+## Engines
 
-The engine is linked statically through [`cactus-sys`](../../utils/cactus-sys/),
-which fetches prebuilt Apache-2.0 archives pinned by revision and SHA-256 at
-build time. This is a deliberate exception to the workspace rule against
-opaque prebuilt libraries; nothing prebuilt is committed. See that crate for
-the platforms (macOS arm64, Linux arm64 and x86_64) and their C++ runtime
-needs.
+The engine comes through [`cactus-sys`](../../utils/cactus-sys/), which
+fetches prebuilt Apache-2.0 archives pinned by revision and SHA-256 at build
+time and links them into a small shared library that the plugin carries
+inside itself; nothing else is installed. This is a deliberate exception to
+the workspace rule against opaque prebuilt libraries; nothing prebuilt is
+committed. See that crate for the platforms (macOS arm64, Linux arm64 and
+x86_64) and their C++ runtime needs.
 
-The engine is one object per process that holds every model, with no
-handle, so all its elements live in this plugin and share one lock:
+An engine holds one vision and one speech model and runs one call at a
+time. The `engine` property picks the engine an element runs on: elements
+naming the same engine share it, and each name is a separate engine, loaded
+on first use, that runs at the same time as the others. Unset is the
+default engine.
 
-- **One vision and one speech model per process.** The first element of a
-  kind to start loads its weights; another with different weights (by
-  SHA-256) fails at start, even after the first one stopped. There is no
-  unload.
-- **Threads are process-global.** The first explicit `threads` before any
-  weights load wins; later values are ignored with a warning.
-- **Calls are serialized.** Elements wait for each other: a 300 ms
-  `describe` delays a transcription by 300 ms.
-- **One engine stream per process.** Only one `cactuswhistle` can use
+- **One vision and one speech model per engine.** The first element of a
+  kind to start on an engine loads its weights; another with different
+  weights (by SHA-256) on that engine fails at start, even after the first
+  one stopped, and needs an engine of its own. Nothing is unloaded: an
+  engine and its models stay in memory until the process exits, about
+  150 MB with Mirage and 65 MB with Whistle.
+- **Elements on one engine take turns,** in the order they asked: a
+  300 ms `describe` delays a transcription on the same engine by 300 ms.
+- **One stream per engine.** Only one `cactuswhistle` per engine can use
   `mode=stream` at a time; the default `mode=windows` has no such limit.
+- **Threads are per engine.** The first explicit `threads` before the
+  engine loads weights wins; later values are ignored with a warning.
+  Engines running at once share the CPU, so keep their threads together
+  within the performance cores. Measured on one machine with eight
+  performance cores: two engines at the default threads described 1.6
+  times as many frames as one; three at the default threads described
+  fewer than one; four at `threads=2` described twice as many.
+
+```sh
+# Two cameras described at the same time, speech on the default engine
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! videoconvert ! cactusmirage model-file=mirage.cact engine=cam0 mode=latest ! fakesink \
+  v4l2src device=/dev/video2 ! videoconvert ! cactusmirage model-file=mirage.cact engine=cam1 mode=latest ! fakesink \
+  autoaudiosrc ! audioconvert ! audioresample ! queue ! cactuswhistle model-file=whistle.cact ! fakesink
+```
 
 Weights: `mise run cactus:weights` downloads the pinned `mirage.cact` and
 `whistle.cact` to `target/models/`.
@@ -143,7 +162,8 @@ build): about 1.5 KB with `json-output=none`, 5.3 KB with `frame`, 6 KB with
 | `max-analysis-size` | 0 (full size) | longest side of the analyzed copy |
 | `max-frame-bytes` | 128 MiB | covers 8K UHD (99.5 MB packed) |
 | `json-output` | `full` | `full`, `frame`, `none` |
-| `threads` | 0 (engine default) | process-global, see above |
+| `engine` | unset (default engine) | engine name, see [Engines](#engines) |
+| `threads` | 0 (engine default) | per engine, see [Engines](#engines) |
 
 All properties can change only in the NULL and READY states.
 
@@ -184,8 +204,8 @@ Polish, and detects the language unless `language` is set.
   consecutive passes agree on and keeps an unconfirmed tail. Every word the
   engine commits is kept; it can commit a word a step or two after a step
   with nothing pending, so silence counts as settled only a step and a
-  second behind the audio. A process has one engine stream, so a second
-  element in this mode fails at start.
+  second behind the audio. An engine has one stream, so a second element
+  in this mode on the same engine fails at start.
 - **`chunk-duration=0` (`mode=windows`): the whole recording at EOS**, up
   to an hour; the engine windows audio longer than 30 seconds itself.
 - **Cues.** Committed words are grouped into cues that break at a pause
@@ -211,8 +231,8 @@ Polish, and detects the language unless `language` is set.
   leave the element that long after its first word, plus the time its last
   word takes to be committed: a chunk (and `agreement`), or in
   `mode=stream` two steps and a second. `latency=0` reports the sum, plus
-  2 s for transcription and for waiting on the engine lock while another
-  element uses it: 12 s with the defaults. Short cues leave much sooner;
+  2 s for transcription and for waiting while another element uses the
+  engine: 12 s with the defaults. Short cues leave much sooner;
   with a smaller `latency`, a syncing sink may get late cues. In
   `chunk-duration=0` mode it reports 0.
 
@@ -246,7 +266,8 @@ These are single runs on one recording, not benchmarks.
 | `holdback` | 1000 | ms before a window's end where words wait for the next window (`windows`) |
 | `agreement` | 0 | ms before the commit point where words wait for a second, identical transcription (`windows`) |
 | `latency` | 0 (automatic) | ms added to LATENCY queries, as in `whispertranscriber` (`cactusmirage` uses ns) |
-| `threads` | 0 (engine default) | process-global, see above |
+| `engine` | unset (default engine) | engine name, see [Engines](#engines) |
+| `threads` | 0 (engine default) | per engine, see [Engines](#engines) |
 
 All properties can change only in the NULL and READY states.
 

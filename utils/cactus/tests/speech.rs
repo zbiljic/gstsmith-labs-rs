@@ -46,7 +46,11 @@ fn sample() -> Vec<f32> {
 }
 
 fn loaded() -> Engine {
-    let mut engine = Engine::lock();
+    loaded_on("")
+}
+
+fn loaded_on(name: &str) -> Engine {
+    let mut engine = Engine::lock(name).expect("engine");
     engine.load_speech(&weights()).expect("Whistle loads");
     engine
 }
@@ -165,7 +169,10 @@ fn grows_a_small_output_buffer() {
 fn streams_in_steps_and_flushes_the_tail_on_stop() {
     let mut engine = loaded();
     let id = engine.open_stream().expect("stream");
-    assert!(matches!(engine.open_stream(), Err(Error::StreamInUse)));
+    assert!(matches!(
+        engine.open_stream(),
+        Err(Error::StreamInUse { .. })
+    ));
     let pcm = sample();
     let mut words = Vec::new();
     let mut received = 0.0_f64;
@@ -241,4 +248,54 @@ fn stream_calls_size_the_buffer_instead_of_feeding_audio_twice() {
         "{tail}"
     );
     engine.close_stream(id);
+}
+
+#[test]
+#[ignore = "needs the Whistle weights"]
+fn named_engines_each_have_a_stream() {
+    let pcm = sample();
+    let mut first = loaded_on("first");
+    let mut second = loaded_on("second");
+    let streams = (
+        first.open_stream().expect("first stream"),
+        second.open_stream().expect("second stream"),
+    );
+    let mut counts = [0usize; 2];
+    // The two streams take the recording in lockstep, the second engine
+    // starting a second later; neither sees the other's audio.
+    for (step, chunk) in pcm.chunks(16_000).enumerate() {
+        for (index, (engine, id)) in [(&mut first, streams.0), (&mut second, streams.1)]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 1 && step == 0 {
+                continue;
+            }
+            let json = engine
+                .stream_process(id, chunk, SpeechRequest::default())
+                .expect("step")
+                .json;
+            let value: Value = serde_json::from_str(&json).expect("JSON");
+            counts[index] += value["words"].as_array().map_or(0, Vec::len);
+        }
+    }
+    let received = |engine: &mut Engine, id| {
+        let json = engine
+            .stream_process(id, &[0.0; 1600], SpeechRequest::default())
+            .expect("step")
+            .json;
+        serde_json::from_str::<Value>(&json).expect("JSON")["received"]
+            .as_f64()
+            .expect("received")
+    };
+    let seconds = (
+        received(&mut first, streams.0),
+        received(&mut second, streams.1),
+    );
+    eprintln!("words {counts:?}, seconds {seconds:?}");
+    assert!((seconds.0 - 30.1).abs() < 0.01, "{seconds:?}");
+    assert!((seconds.1 - 29.1).abs() < 0.01, "{seconds:?}");
+    assert!(counts.iter().all(|&count| count > 30), "{counts:?}");
+    first.close_stream(streams.0);
+    second.close_stream(streams.1);
 }

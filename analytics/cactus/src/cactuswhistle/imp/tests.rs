@@ -101,6 +101,7 @@ impl Fake {
 impl Transcriber for Fake {
     fn start(
         &mut self,
+        _engine: &str,
         weights: &[u8],
         _threads: u32,
     ) -> Result<(String, cactus::Threads), String> {

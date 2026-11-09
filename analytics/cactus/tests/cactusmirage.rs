@@ -28,6 +28,7 @@ fn registers_with_documented_defaults() -> Result<()> {
     ensure!(element.property::<u64>("analysis-interval") == 0);
     ensure!(element.property::<u32>("max-frame-bytes") == 128 * 1024 * 1024);
     ensure!(element.property::<u32>("threads") == 0);
+    ensure!(element.property::<Option<String>>("engine").is_none());
     ensure!(element.property::<bool>("nms"));
     let nicks = |name: &str| -> Result<String> {
         let value = element.property_value(name);

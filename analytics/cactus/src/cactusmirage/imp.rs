@@ -168,7 +168,7 @@ impl CactusMirage {
         if let Some(fixture) = lock(&self.fixture).as_ref() {
             return fixture();
         }
-        Box::new(describer::Engine)
+        Box::<describer::Engine>::default()
     }
 
     fn running_time(&self, buffer: &gst::BufferRef) -> Option<u64> {
@@ -516,9 +516,14 @@ impl ObjectImpl for CactusMirage {
                     .blurb("Which Cactus documents to attach; generic x-* documents are always written")
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecString::builder("engine")
+                    .nick("Engine")
+                    .blurb("Cactus engine to run on. Elements naming the same engine share it and take turns; each name is a separate engine, with its own models, speech stream and threads, that runs at the same time as the others. Unset is the default engine")
+                    .mutable_ready()
+                    .build(),
                 glib::ParamSpecUInt::builder("threads")
                     .nick("Threads")
-                    .blurb("Engine threads, process-global: the first explicit value before weights load wins; 0 keeps the engine default")
+                    .blurb("Threads of this element's engine: the first explicit value before the engine loads weights wins; 0 keeps the engine default")
                     .maximum(MAX_THREADS)
                     .default_value(0)
                     .mutable_ready()
@@ -556,6 +561,7 @@ impl ObjectImpl for CactusMirage {
                 settings.max_frame_bytes = value.get().unwrap_or(defaults.max_frame_bytes);
             }
             "json-output" => settings.json_output = value.get().unwrap_or(defaults.json_output),
+            "engine" => settings.engine = text(),
             "threads" => settings.threads = value.get().unwrap_or(0),
             other => gst::error!(CAT, imp = self, "unknown property {other}"),
         }
@@ -585,6 +591,7 @@ impl ObjectImpl for CactusMirage {
             "max-analysis-size" => settings.max_analysis_size.to_value(),
             "max-frame-bytes" => settings.max_frame_bytes.to_value(),
             "json-output" => settings.json_output.to_value(),
+            "engine" => settings.engine.to_value(),
             "threads" => settings.threads.to_value(),
             other => {
                 gst::error!(CAT, imp = self, "unknown property {other}");
@@ -649,14 +656,18 @@ impl BaseTransformImpl for CactusMirage {
         })?;
         let mut describer = self.describer();
         let (sha, threads) = describer
-            .start(&weights, settings.threads)
+            .start(
+                settings.engine.as_deref().unwrap_or_default(),
+                &weights,
+                settings.threads,
+            )
             .map_err(|err| gst::error_msg!(gst::LibraryError::Init, ["{path}: {err}"]))?;
         drop(weights);
         match threads {
             cactus::Threads::Ignored { requested, current } => gst::warning!(
                 CAT,
                 imp = self,
-                "threads={requested} is ignored: the process already runs the engine with {current}"
+                "threads={requested} is ignored: the engine already runs with {current}"
             ),
             cactus::Threads::TooLate { requested } => gst::warning!(
                 CAT,
@@ -849,6 +860,7 @@ mod tests {
     impl Describer for Fake {
         fn start(
             &mut self,
+            _engine: &str,
             weights: &[u8],
             _threads: u32,
         ) -> Result<(String, cactus::Threads), String> {

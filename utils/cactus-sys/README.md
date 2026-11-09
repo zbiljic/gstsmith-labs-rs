@@ -20,7 +20,32 @@ the workspace rule against opaque prebuilt libraries:
 `OUT_DIR` and checks both against SHA-256 values copied from the manifest
 (the default `download` feature). Set `CACTUS_LIB_DIR` to a directory
 holding `libcactus.a` (and `cactus.h`) to build offline. Documentation
-builds (`DOCS_RS`) skip linking.
+builds (`DOCS_RS`) embed no engine.
+
+## Independent copies
+
+The engine keeps its models, speech stream and settings in globals. So
+that one process can run several engines, `build.rs` links the archive into
+a shared library that exports only the `cactus_*` functions, with the
+target's C compiler (`CC` and the other variables of the `cc` crate apply),
+and the crate embeds its bytes. `Api::load_copy` loads another copy each
+time and returns its function pointers:
+
+- on Linux from an anonymous in-memory file (`memfd_create`, asking for an
+  executable one as the `vm.memfd_noexec` sysctl requires), so nothing
+  touches the disk and a `noexec` temporary directory does not matter.
+  Where that fails, or `/proc` is missing, it falls back to the temporary
+  file below;
+- elsewhere from a file of its own in the temporary directory, removed
+  once loaded, because the dynamic loader treats a second load of one file
+  as the same library.
+
+Copies are loaded with local symbols and never unloaded. The library has
+no Linux `SONAME` on purpose: glibc would treat every copy as the first.
+On macOS the copies carry only the linker's ad-hoc signature, so a
+hardened-runtime host with library validation refuses them even when the
+plugin itself is signed; such a host needs the
+`com.apple.security.cs.disable-library-validation` entitlement.
 
 **Header pin.** `HEADER_SHA256` records the SHA-256 of the `cactus.h` the
 declarations were written from. On an engine bump the download fails until
@@ -43,14 +68,16 @@ the newest under `/usr/lib/llvm-*/lib`, or the directory in
 
 ## Safety
 
-The engine is one process-wide object with no handle, and its calls are not
-thread-safe: every call must be serialized, and `cactus_last_error` read
-right after a failure. The `cactus` crate does both. The exported functions
+An engine copy has no handle, and its calls are not thread-safe: every call
+to one copy must be serialized, and `cactus_last_error` read right after a
+failure. Different copies can run at the same time. The `cactus` crate
+does both. The exported functions
 contain no C++ `catch` handlers; the only throws in the archive come from
 libc++ (allocation failure, length and range checks, `regex` errors on fixed
 patterns). If one ever reached an `extern "C"` call, Rust would abort the
 process.
 
-Only the `gstcactus` plugin may link this crate: `links = "cactus"` stops two
-different crates with that key, not two dependents of this one, so
-`ci/check-cactus-links.sh` (part of `mise run deps:check`) enforces it.
+Only the `gstcactus` plugin may depend on this crate, so the engine is
+embedded once: `links = "cactus"` stops two different crates with that key,
+not two dependents of this one, so `ci/check-cactus-links.sh` (part of
+`mise run deps:check`) enforces it.

@@ -31,6 +31,7 @@ version = "0.1.0"
 anyhow = "1.0.104"
 atomic_refcell = "0.1.14"
 cairo-rs = "0.22.9"
+cc = "1.10.0"
 criterion = "0.8.2"
 gst = { package = "gstreamer", version = "0.25.4", features = ["v1_24"] }
 gst-analytics = { package = "gstreamer-analytics", version = "0.25.4", features = ["v1_28"] }
@@ -41,6 +42,7 @@ gst-plugin-version-helper = "0.8.4"
 gst-video = { package = "gstreamer-video", version = "0.25.4" }
 h264-reader = "0.9.0"
 image = { version = "0.25.10", default-features = false }
+libc = "0.2.191"
 memchr = "2.8.3"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "api-28"] }
 pango = "0.22.9"

@@ -48,9 +48,9 @@ pub enum Mode {
     #[default]
     #[enum_value(name = "Transcribe rolling windows and stitch them", nick = "windows")]
     Windows,
-    /// The engine's streaming transcriber, one per process.
+    /// The engine's streaming transcriber, one per engine.
     #[enum_value(
-        name = "The engine's streaming transcriber, one per process",
+        name = "The engine's streaming transcriber, one per engine",
         nick = "stream"
     )]
     Stream,
@@ -62,6 +62,7 @@ struct Settings {
     model_file: Option<String>,
     language: Option<String>,
     keywords: Option<String>,
+    engine: Option<String>,
     threads: u32,
     chunk_duration: u32,
     context_duration: u32,
@@ -77,6 +78,7 @@ impl Default for Settings {
             model_file: None,
             language: None,
             keywords: None,
+            engine: None,
             threads: 0,
             chunk_duration: 2000,
             context_duration: 10_000,
@@ -357,7 +359,7 @@ impl ObjectImpl for CactusWhistle {
             vec![
                 glib::ParamSpecEnum::builder_with_default("mode", defaults.mode)
                     .nick("Mode")
-                    .blurb("windows transcribes rolling windows and stitches them; stream uses the engine's streaming transcriber, of which a process has one")
+                    .blurb("windows transcribes rolling windows and stitches them; stream uses the engine's streaming transcriber, of which each engine has one")
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecString::builder("model-file")
@@ -375,9 +377,14 @@ impl ObjectImpl for CactusWhistle {
                     .blurb("Comma-separated words to bias recognition towards, such as names")
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecString::builder("engine")
+                    .nick("Engine")
+                    .blurb("Cactus engine to run on. Elements naming the same engine share it and take turns; each name is a separate engine, with its own models, speech stream and threads, that runs at the same time as the others. Unset is the default engine")
+                    .mutable_ready()
+                    .build(),
                 glib::ParamSpecUInt::builder("threads")
                     .nick("Threads")
-                    .blurb("Engine threads, process-global: the first explicit value before weights load wins; 0 keeps the engine default")
+                    .blurb("Threads of this element's engine: the first explicit value before the engine loads weights wins; 0 keeps the engine default")
                     .maximum(256)
                     .mutable_ready()
                     .build(),
@@ -430,6 +437,7 @@ impl ObjectImpl for CactusWhistle {
             "model-file" => settings.model_file = text(),
             "language" => settings.language = text(),
             "keywords" => settings.keywords = text(),
+            "engine" => settings.engine = text(),
             "threads" => settings.threads = number(settings.threads),
             "chunk-duration" => settings.chunk_duration = number(settings.chunk_duration),
             "context-duration" => settings.context_duration = number(settings.context_duration),
@@ -447,6 +455,7 @@ impl ObjectImpl for CactusWhistle {
             "model-file" => settings.model_file.to_value(),
             "language" => settings.language.to_value(),
             "keywords" => settings.keywords.to_value(),
+            "engine" => settings.engine.to_value(),
             "threads" => settings.threads.to_value(),
             "chunk-duration" => settings.chunk_duration.to_value(),
             "context-duration" => settings.context_duration.to_value(),
@@ -555,13 +564,17 @@ impl CactusWhistle {
         })?;
         let mut transcriber = self.new_transcriber();
         let (sha, threads) = transcriber
-            .start(&weights, settings.threads)
+            .start(
+                settings.engine.as_deref().unwrap_or_default(),
+                &weights,
+                settings.threads,
+            )
             .map_err(|err| gst::error_msg!(gst::LibraryError::Init, ["{path}: {err}"]))?;
         match threads {
             cactus::Threads::Ignored { requested, current } => gst::warning!(
                 CAT,
                 imp = self,
-                "threads={requested} is ignored: the process already runs the engine with {current}"
+                "threads={requested} is ignored: the engine already runs with {current}"
             ),
             cactus::Threads::TooLate { requested } => gst::warning!(
                 CAT,

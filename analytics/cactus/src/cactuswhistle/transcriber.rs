@@ -14,9 +14,14 @@ pub struct Request {
 
 /// Loads weights and transcribes 16 kHz mono PCM with word times.
 pub trait Transcriber: Send {
-    /// Sets threads, then loads the weights. Returns their SHA-256 and what
-    /// happened to the thread setting.
-    fn start(&mut self, weights: &[u8], threads: u32) -> Result<(String, cactus::Threads), String>;
+    /// Sets threads on the named engine, then loads the weights there.
+    /// Returns their SHA-256 and what happened to the thread setting.
+    fn start(
+        &mut self,
+        engine: &str,
+        weights: &[u8],
+        threads: u32,
+    ) -> Result<(String, cactus::Threads), String>;
     /// Returns the engine JSON for `pcm`, with word timestamps.
     fn transcribe(&mut self, pcm: &[f32], request: &Request) -> Result<String, String>;
     /// Reserves the engine's one speech stream.
@@ -29,16 +34,25 @@ pub trait Transcriber: Send {
     fn reset_stream(&mut self);
 }
 
-/// The process-wide Cactus engine.
+/// A named Cactus engine, chosen at start.
 #[derive(Default)]
 pub struct Engine {
+    name: String,
     stream: Option<cactus::StreamId>,
+}
+
+impl Engine {
+    fn lock(&self) -> Result<cactus::Engine, String> {
+        cactus::Engine::lock(&self.name).map_err(|err| err.to_string())
+    }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        if let Some(id) = self.stream.take() {
-            cactus::Engine::lock().close_stream(id);
+        if let Some(id) = self.stream.take()
+            && let Ok(mut engine) = self.lock()
+        {
+            engine.close_stream(id);
         }
     }
 }
@@ -52,15 +66,21 @@ fn speech_request(request: &Request) -> cactus::SpeechRequest<'_> {
 }
 
 impl Transcriber for Engine {
-    fn start(&mut self, weights: &[u8], threads: u32) -> Result<(String, cactus::Threads), String> {
-        let mut engine = cactus::Engine::lock();
+    fn start(
+        &mut self,
+        engine: &str,
+        weights: &[u8],
+        threads: u32,
+    ) -> Result<(String, cactus::Threads), String> {
+        engine.clone_into(&mut self.name);
+        let mut engine = self.lock()?;
         let threads = engine.set_threads(threads);
         engine.load_speech(weights).map_err(|err| err.to_string())?;
         Ok((cactus::sha256_hex(weights), threads))
     }
 
     fn transcribe(&mut self, pcm: &[f32], request: &Request) -> Result<String, String> {
-        cactus::Engine::lock()
+        self.lock()?
             .transcribe(pcm, speech_request(request))
             .map(|transcription| transcription.json)
             .map_err(|err| err.to_string())
@@ -68,11 +88,7 @@ impl Transcriber for Engine {
 
     fn open_stream(&mut self) -> Result<(), String> {
         if self.stream.is_none() {
-            self.stream = Some(
-                cactus::Engine::lock()
-                    .open_stream()
-                    .map_err(|err| err.to_string())?,
-            );
+            self.stream = Some(self.lock()?.open_stream().map_err(|err| err.to_string())?);
         }
         Ok(())
     }
@@ -84,7 +100,7 @@ impl Transcriber for Engine {
         last: bool,
     ) -> Result<Vec<String>, String> {
         let id = self.stream.ok_or("the stream is not open")?;
-        let mut engine = cactus::Engine::lock();
+        let mut engine = self.lock()?;
         let mut steps = Vec::new();
         if !pcm.is_empty() {
             let step = engine.stream_process(id, pcm, speech_request(request));
@@ -104,8 +120,10 @@ impl Transcriber for Engine {
     }
 
     fn reset_stream(&mut self) {
-        if let Some(id) = self.stream {
-            let _tail = cactus::Engine::lock().stream_stop(id);
+        if let Some(id) = self.stream
+            && let Ok(mut engine) = self.lock()
+        {
+            let _tail = engine.stream_stop(id);
         }
     }
 }

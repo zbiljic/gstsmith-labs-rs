@@ -1,6 +1,7 @@
-//! `GStreamer` elements running models on the Cactus engine. The engine is
-//! one process-wide object that holds every model, so its vision and speech
-//! elements share this plugin and one lock.
+//! `GStreamer` elements running models on Cactus engines. An engine holds
+//! one model of each kind and runs one call at a time; the `engine` property
+//! picks which engine an element uses, and differently named engines run at
+//! the same time.
 
 use gst::glib;
 

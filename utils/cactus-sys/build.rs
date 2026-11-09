@@ -1,13 +1,18 @@
-//! Links the pinned Cactus engine archive.
+//! Builds the engine library the crate embeds.
 //!
 //! With `CACTUS_LIB_DIR` set, `libcactus.a` (and, if present, `cactus.h`)
 //! are taken from that directory. Otherwise the `download` feature fetches
 //! both for the target from the pinned Hugging Face revision and checks them
 //! against SHA-256 values copied from the release `manifest.json`.
 //!
+//! The archive is linked into a shared library that exports only the
+//! `cactus_*` functions, and the crate embeds its bytes: the engine keeps
+//! its state in globals, so every independent engine is another loaded copy
+//! of this library.
+//!
 //! The engine's C++ runtime is LLVM libc++ (`std::__1`). macOS links the
 //! system `libc++.dylib`. Linux links `libc++.a` and `libc++abi.a`
-//! statically, and they stay hidden in the plugin library, so a process that
+//! statically, and they stay hidden in the engine library, so a process that
 //! also loads libstdc++ plugins never sees two C++ runtimes. At run time
 //! only glibc and `libgcc_s` are needed; the archives reference only
 //! long-standing glibc symbols (`__isoc99_*`, no `__isoc23_*`), so the glibc
@@ -216,16 +221,79 @@ fn libcxx_dir(min_version: u32) -> Result<PathBuf> {
     }
 }
 
+/// Links `libcactus.a` from `dir` into a shared library in `OUT_DIR` that
+/// exports only `cactus_*`, with the target's C compiler as the linker.
+fn link_engine(dir: &Path, os: &str, arch: &str) -> Result<PathBuf> {
+    let out = PathBuf::from(env::var("OUT_DIR")?);
+    let archive = dir.join("libcactus.a");
+    let mut command = cc::Build::new()
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .try_get_compiler()?
+        .to_command();
+    let library = if os == "macos" {
+        let library = out.join("libcactus-engine.dylib");
+        command
+            .args(["-dynamiclib", "-o"])
+            .arg(&library)
+            .arg(format!("-Wl,-force_load,{}", archive.display()))
+            .args([
+                "-Wl,-exported_symbol,_cactus_*",
+                "-Wl,-install_name,@rpath/libcactus-engine.dylib",
+                "-lc++",
+            ]);
+        library
+    } else {
+        // The x86_64 archive calls std::__1::__hash_memory, which libc++
+        // exports only from LLVM 21 on; the arm64 archive links with 18.
+        let libcxx = libcxx_dir(if arch == "x86_64" { 21 } else { 18 })?;
+        // No `-soname`: glibc would then treat every copy as the first one.
+        let library = out.join("libcactus-engine.so");
+        let exports = out.join("cactus-engine.map");
+        fs::write(&exports, "{ global: cactus_*; local: *; };\n")?;
+        command
+            .args(["-shared", "-o"])
+            .arg(&library)
+            .arg("-Wl,--whole-archive")
+            .arg(&archive)
+            .arg("-Wl,--no-whole-archive")
+            .arg(libcxx.join("libc++.a"))
+            .arg(libcxx.join("libc++abi.a"))
+            .arg(format!("-Wl,--version-script={}", exports.display()))
+            .args([
+                "-Wl,--exclude-libs,libc++.a:libc++abi.a",
+                "-Wl,-Bsymbolic",
+                "-Wl,-z,noexecstack",
+                "-lpthread",
+                "-lm",
+            ]);
+        library
+    };
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "linking the engine library failed ({}): {command:?}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(library)
+}
+
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CACTUS_LIB_DIR");
     println!("cargo:rerun-if-env-changed=CACTUS_LIBCXX_DIR");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rustc-env=CACTUS_ENGINE_VERSION={VERSION}");
-    // Documentation builds skip linking. This is not a feature, because the
-    // workspace gates build with --all-features and must link the engine.
+    // Documentation builds embed no engine. This is not a feature, because
+    // the workspace gates build with --all-features and must embed it.
     if env::var_os("DOCS_RS").is_some() {
+        let empty = PathBuf::from(env::var("OUT_DIR")?).join("no-engine");
+        fs::write(&empty, [])?;
         println!("cargo:rustc-env=CACTUS_HEADER_SHA256=unchecked");
+        println!("cargo:rustc-env=CACTUS_ENGINE_LIBRARY={}", empty.display());
         return Ok(());
     }
     let os = env::var("CARGO_CFG_TARGET_OS")?;
@@ -246,17 +314,10 @@ fn main() -> Result<()> {
     );
     println!("cargo:root={}", dir.display());
     println!("cargo:include={}", dir.display());
-    println!("cargo:rustc-link-search=native={}", dir.display());
-    println!("cargo:rustc-link-lib=static=cactus");
-    if os == "macos" {
-        println!("cargo:rustc-link-lib=dylib=c++");
-    } else {
-        // The x86_64 archive calls std::__1::__hash_memory, which libc++
-        // exports only from LLVM 21 on; the arm64 archive links with 18.
-        let libcxx = libcxx_dir(if arch == "x86_64" { 21 } else { 18 })?;
-        println!("cargo:rustc-link-search=native={}", libcxx.display());
-        println!("cargo:rustc-link-lib=static=c++");
-        println!("cargo:rustc-link-lib=static=c++abi");
-    }
+    let library = link_engine(&dir, &os, &arch)?;
+    println!(
+        "cargo:rustc-env=CACTUS_ENGINE_LIBRARY={}",
+        library.display()
+    );
     Ok(())
 }

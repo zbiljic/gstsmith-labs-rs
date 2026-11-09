@@ -127,6 +127,7 @@ pub struct Settings {
     pub max_analysis_size: u32,
     pub max_frame_bytes: u32,
     pub json_output: JsonOutput,
+    pub engine: Option<String>,
     pub threads: u32,
 }
 
@@ -158,6 +159,7 @@ impl Default for Settings {
             max_analysis_size: 0,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             json_output: JsonOutput::Full,
+            engine: None,
             threads: 0,
         }
     }

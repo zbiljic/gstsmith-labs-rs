@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Only gstcactus may link the Cactus engine: it is one process-wide object,
-# and `links = "cactus"` does not stop two crates from depending on
-# cactus-sys. Fail when anything else reaches it through normal dependencies.
+# Only gstcactus may embed the Cactus engine, so it ships once, and
+# `links = "cactus"` does not stop two crates from depending on cactus-sys.
+# Fail when anything else reaches it through normal dependencies.
 
 set -euo pipefail
 

@@ -364,6 +364,8 @@ dependencies = [
 name = "cactus-sys"
 version = "0.1.0"
 dependencies = [
+ "cc",
+ "libc",
  "sha2",
  "ureq",
 ]

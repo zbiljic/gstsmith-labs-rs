@@ -1,7 +1,7 @@
 [package]
 name = "cactus"
 version = { workspace = true }
-description = "Safe access to the process-wide Cactus 4.1.0 engine."
+description = "Safe access to named Cactus 4.1.0 engines."
 authors = { workspace = true }
 edition = { workspace = true }
 rust-version = { workspace = true }

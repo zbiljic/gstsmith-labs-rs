@@ -36,6 +36,7 @@ fn registers_with_documented_defaults() -> Result<()> {
     ensure!(element.property::<u32>("holdback") == 1000);
     ensure!(element.property::<u32>("agreement") == 0);
     ensure!(element.property::<u32>("latency") == 0);
+    ensure!(element.property::<Option<String>>("engine").is_none());
     let src = factory
         .static_pad_templates()
         .into_iter()
@@ -147,15 +148,55 @@ fn transcribes_the_whole_recording() -> Result<()> {
 }
 
 #[test]
+#[ignore = "needs the Whistle weights and the speech sample"]
+fn streams_on_two_engines_at_once() -> Result<()> {
+    let first = std::thread::spawn(|| transcribe("mode=stream chunk-duration=1000 engine=one"));
+    let second = transcribe("mode=stream chunk-duration=1000 engine=two");
+    let first = first
+        .join()
+        .map_err(|_panic| anyhow::anyhow!("panicked"))??;
+    check(&first)?;
+    check(&second?)
+}
+
+#[test]
+#[ignore = "needs the Whistle weights and the speech sample"]
+fn one_engine_has_one_stream() -> Result<()> {
+    init()?;
+    let pipeline = gst::parse::launch(&format!(
+        "audiotestsrc ! audio/x-raw,format=F32LE,rate=16000,channels=1 ! tee name=t \
+         t. ! queue ! cactuswhistle model-file={weights} mode=stream engine=shared ! fakesink \
+         t. ! queue ! cactuswhistle model-file={weights} mode=stream engine=shared ! fakesink",
+        weights = path("CACTUS_WHISTLE_WEIGHTS")?
+    ))?;
+    let started = pipeline.set_state(gst::State::Paused);
+    let bus = pipeline.bus().context("bus")?;
+    let error = bus.pop_filtered(&[gst::MessageType::Error]);
+    pipeline.set_state(gst::State::Null)?;
+    ensure!(started.is_err(), "the second stream is refused");
+    let message = error.context("an error message")?;
+    let gst::MessageView::Error(error) = message.view() else {
+        anyhow::bail!("not an error: {message:?}");
+    };
+    let text = format!("{} {}", error.error(), error.debug().unwrap_or_default());
+    ensure!(
+        text.contains("Cactus engine \"shared\" holds one speech stream"),
+        "{text}"
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "needs the Whistle and Mirage weights and the speech sample"]
-fn shares_the_engine_with_cactusmirage() -> Result<()> {
+fn runs_beside_cactusmirage() -> Result<()> {
     init()?;
     let mirage = gst::parse::launch(&format!(
         "videotestsrc num-buffers=10 ! video/x-raw,width=320,height=240 ! videoconvert ! \
-         cactusmirage model-file={} ! fakesink",
+         cactusmirage model-file={} engine=vision ! fakesink",
         path("CACTUS_MIRAGE_WEIGHTS")?
     ))?;
     mirage.set_state(gst::State::Playing)?;
+    // On the default engine, beside Mirage on its own.
     let speech = std::thread::spawn(|| transcribe("mode=stream chunk-duration=1000"));
     let bus = mirage.bus().context("bus")?;
     let done = bus

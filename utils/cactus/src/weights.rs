@@ -1,5 +1,5 @@
 //! Classifies `.cact` archives before the engine loads one, because loading
-//! replaces a process-global model slot.
+//! fills an engine's model slot for the life of the process.
 //!
 //! A `.cact` archive (upstream `needle/model/export.py`) is a header of 48
 //! little-endian `u32` fields and one `f32`, a `f32` codebook, a directory of

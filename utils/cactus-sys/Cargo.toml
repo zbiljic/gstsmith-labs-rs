@@ -1,7 +1,7 @@
 [package]
 name = "cactus-sys"
 version = { workspace = true }
-description = "Raw FFI to the statically linked Cactus 4.1.0 engine."
+description = "Raw FFI to independent copies of the embedded Cactus 4.1.0 engine."
 authors = { workspace = true }
 edition = { workspace = true }
 rust-version = { workspace = true }
@@ -11,6 +11,9 @@ repository = { workspace = true }
 publish = false
 links = "cactus"
 build = "build.rs"
+
+[dependencies]
+libc = { workspace = true }
 
 [features]
 default = ["download"]
@@ -22,5 +25,6 @@ download = ["dep:ureq"]
 workspace = true
 
 [build-dependencies]
+cc = { workspace = true }
 sha2 = { workspace = true }
 ureq = { workspace = true, optional = true }
