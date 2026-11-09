@@ -88,7 +88,7 @@ fn other_vision_weights_cannot_replace_loaded_ones() {
         *last ^= 0xff;
     }
     let error = engine.load_vision(&other).expect_err("other weights");
-    assert!(matches!(error, Error::VisionInUse { .. }), "{error}");
+    assert!(matches!(error, Error::ModelInUse { .. }), "{error}");
 }
 
 #[test]

@@ -59,6 +59,16 @@ pub enum Kind {
     Vision,
 }
 
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Text => "text",
+            Self::Speech => "speech",
+            Self::Vision => "vision",
+        })
+    }
+}
+
 fn u32_at(blob: &[u8], offset: usize) -> Option<u32> {
     let bytes = blob.get(offset..offset.checked_add(4)?)?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
