@@ -25,6 +25,9 @@ are being established before promotion to
     - `cactusmirage`: Describe frames with the Mirage vision model: objects
       with outlines, recognized text, relations, captions and form answers
       as analytics metadata, plus the engine's full JSON.
+    - `cactuswhistle`: Transcribe speech with the Whistle model into timed
+      text cues, in rolling windows or with the engine's streaming
+      transcriber.
 
   - [`nalsense`](analytics/nalsense/): Portable H.264 and H.265 encoded-video
     activity analysis and bounded IDR replay.

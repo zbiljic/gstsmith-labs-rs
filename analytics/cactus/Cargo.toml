@@ -1,7 +1,7 @@
 [package]
 name = "gst-plugin-cactus"
 version = { workspace = true }
-description = "GStreamer elements running Cactus engine models: Mirage scene description."
+description = "GStreamer elements running Cactus engine models: Mirage scene description and Whistle speech to text."
 authors = { workspace = true }
 edition = { workspace = true }
 rust-version = { workspace = true }
@@ -31,6 +31,7 @@ gst-analytics = { workspace = true }
 gst-base = { workspace = true, features = ["v1_28"] }
 gst-video = { workspace = true, features = ["v1_28"] }
 image = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [features]

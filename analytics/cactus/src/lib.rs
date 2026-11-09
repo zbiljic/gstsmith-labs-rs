@@ -5,9 +5,11 @@
 use gst::glib;
 
 mod cactusmirage;
+mod cactuswhistle;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
-    cactusmirage::register(plugin)
+    cactusmirage::register(plugin)?;
+    cactuswhistle::register(plugin)
 }
 
 gst::plugin_define!(

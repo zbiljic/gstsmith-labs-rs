@@ -1313,6 +1313,7 @@ dependencies = [
  "gstreamer-check",
  "gstreamer-video",
  "image",
+ "serde",
  "serde_json",
 ]
 

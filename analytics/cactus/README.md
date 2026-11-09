@@ -1,9 +1,13 @@
 # GStreamer Cactus plugin
 
 The `cactus` plugin runs models on the [Cactus](https://cactuscompute.com)
-engine. It provides `cactusmirage`, which describes video frames with
-[Mirage](https://cactuscompute.com/blog/mirage), an open-vocabulary vision
-model, and writes the result as GStreamer analytics metadata.
+engine. It provides two elements:
+
+- `cactusmirage` describes video frames with
+  [Mirage](https://cactuscompute.com/blog/mirage), an open-vocabulary vision
+  model, and writes the result as GStreamer analytics metadata.
+- `cactuswhistle` transcribes speech with
+  [Whistle](https://cactuscompute.com/blog/whistle) into timed text cues.
 
 Requires GStreamer 1.28 or newer.
 
@@ -19,16 +23,19 @@ needs.
 The engine is one object per process that holds every model, with no
 handle, so all its elements live in this plugin and share one lock:
 
-- **One vision model per process.** The first `cactusmirage` to start loads
-  its weights; another with different weights (by SHA-256) fails at start,
-  even after the first one stopped. There is no unload.
+- **One vision and one speech model per process.** The first element of a
+  kind to start loads its weights; another with different weights (by
+  SHA-256) fails at start, even after the first one stopped. There is no
+  unload.
 - **Threads are process-global.** The first explicit `threads` before any
   weights load wins; later values are ignored with a warning.
-- **Calls are serialized.** Two `cactusmirage` elements, or a later speech
-  element, wait for each other.
+- **Calls are serialized.** Elements wait for each other: a 300 ms
+  `describe` delays a transcription by 300 ms.
+- **One engine stream per process.** Only one `cactuswhistle` can use
+  `mode=stream` at a time; the default `mode=windows` has no such limit.
 
-Weights: `mise run cactus:weights` downloads the pinned `mirage.cact` to
-`target/models/mirage.cact`.
+Weights: `mise run cactus:weights` downloads the pinned `mirage.cact` and
+`whistle.cact` to `target/models/`.
 
 ## `cactusmirage`
 
@@ -151,6 +158,106 @@ All properties can change only in the NULL and READY states.
 - Bitmap masks are not selectable yet: they need one instance
   `SegmentationMtd` per frame through a multi-region bridge.
 
+## `cactuswhistle`
+
+Speech to text, with the pads of `whispertranscriber`: 16 kHz mono F32LE in
+(put `audioconvert ! audioresample` before it), `text/x-raw,format=utf8`
+cues out. Klass `Text/Audio/Filter`, long name `Transcriber`, rank none.
+Whistle understands English, German, French, Spanish, Italian, Dutch and
+Polish, and detects the language unless `language` is set.
+
+- **`mode=windows` (default): rolling windows.** Once `chunk-duration` of
+  audio past the commit point has arrived, the element transcribes a window
+  made of up to `context-duration` of already committed audio and that new
+  audio. Each call is stateless, so any number of elements can share the
+  engine. Words ending within `holdback` of the window's end wait for the
+  next window, which hears them with the audio that follows (like
+  `whispertranscriber`'s `live-edge-offset`); the commit point therefore
+  trails each window by the holdback, and windows run every
+  `chunk-duration − holdback` of input: with the defaults, a 12 s window
+  every second, 10–30% of a laptop CPU core. With `agreement`, words near
+  the commit point also wait until two consecutive windows transcribe them
+  alike. Context words that repeat committed ones are dropped, so each word
+  is committed once.
+- **`mode=stream`: the engine's streaming transcriber.** Each
+  `chunk-duration` step goes to the engine, which commits the words two
+  consecutive passes agree on and keeps an unconfirmed tail. Every word the
+  engine commits is kept; it can commit a word a step or two after a step
+  with nothing pending, so silence counts as settled only a step and a
+  second behind the audio. A process has one engine stream, so a second
+  element in this mode fails at start.
+- **`chunk-duration=0` (`mode=windows`): the whole recording at EOS**, up
+  to an hour; the engine windows audio longer than 30 seconds itself.
+- **Cues.** Committed words are grouped into cues that break at a pause
+  over 1 s, after 7 s or 84 characters, or at sentence punctuation once the
+  cue lasts 1.2 s. A cue stays open across windows until one of those
+  happens, so sentences are not cut at window boundaries. Cue PTS and
+  durations come from Whistle's word times (80 ms steps), on the input
+  timeline. GAP events cover the time before the open cue, so downstream
+  elements keep moving through silence; the first one, empty, marks the
+  start, so sinks preroll before the first cue.
+- **Metadata.** A `cactuswhistle` element message per window or step
+  carries `window-start`, `window-end` (seconds), `transcription-seconds`,
+  `words`, `committed`, `cues`, `language` and `pending`, the engine's
+  unconfirmed text in `mode=stream` (empty otherwise). A change in the
+  detected language is sent downstream as a `language-code` tag.
+- **Timeline.** Gaps in the input (GAP events or missing time) are filled
+  with silence, which Whistle transcribes in about 0.1 ms per second. A
+  flush, a new segment or a stream start drops audio not yet transcribed
+  and starts over.
+- **Latency.** Transcription runs on the streaming thread; for live sources
+  put a `queue` before the element. A cue's PTS is its first word, and the
+  cue stays open for up to 8 s (7 s of words, then a pause), so a cue can
+  leave the element that long after its first word, plus the time its last
+  word takes to be committed: a chunk (and `agreement`), or in
+  `mode=stream` two steps and a second. `latency=0` reports the sum, plus
+  2 s for transcription and for waiting on the engine lock while another
+  element uses it: 12 s with the defaults. Short cues leave much sooner;
+  with a smaller `latency`, a syncing sink may get late cues. In
+  `chunk-duration=0` mode it reports 0.
+
+Measured on an arm64 laptop CPU: transcribing a 12 s window takes 0.1–0.3 s,
+30 s about 0.75 s. On a 96 s synthetic three-voice recording with a known
+script, the word error rates were:
+
+| Setting | Word error rate |
+| --- | --- |
+| `chunk-duration=0` (whole recording) | 5.5% |
+| default (`windows`, 2 s chunks, 10 s context, 1 s holdback) | 5.1% |
+| `windows`, 5 s context | 7.1% |
+| `windows`, 5 s chunks, 2 s holdback | 5.9% |
+| `mode=stream`, 2 s steps | 6.3% |
+| `mode=stream`, 1 s steps | 6.7% |
+| `mode=stream`, 0.5 s steps | 5.9% |
+
+Short windows lose words: the model needs a few seconds around a word.
+These are single runs on one recording, not benchmarks.
+
+### Properties
+
+| Property | Default | Meaning |
+| --- | --- | --- |
+| `model-file` | unset (required) | Whistle `.cact` weights |
+| `mode` | `windows` | `windows` or `stream` |
+| `language` | empty (detect) | `en`, `de`, `fr`, `es`, `it`, `nl` or `pl` |
+| `keywords` | empty | comma-separated words to favour, such as names |
+| `chunk-duration` | 2000 | ms of new audio per window or stream step; 0 transcribes at EOS (`windows` only) |
+| `context-duration` | 10000 | ms of committed audio repeated before each window (`windows`) |
+| `holdback` | 1000 | ms before a window's end where words wait for the next window (`windows`) |
+| `agreement` | 0 | ms before the commit point where words wait for a second, identical transcription (`windows`) |
+| `latency` | 0 (automatic) | ms added to LATENCY queries, as in `whispertranscriber` (`cactusmirage` uses ns) |
+| `threads` | 0 (engine default) | process-global, see above |
+
+All properties can change only in the NULL and READY states.
+
+### Known limitations
+
+- Noisy audio makes Whistle repeat phrases and invent words, and it can
+  hear short phrases such as "Thank you." in static at the start of a
+  window. On such audio, rolling windows, the engine's stream and the
+  whole recording each make different mistakes.
+- There is no speaker attribution and no translation.
+
 ## Examples
 
 Run from the repository root after `mise run build` and
@@ -187,6 +294,19 @@ GST_PLUGIN_PATH="$PWD/target/debug" gst-launch-1.0 \
   ! autovideosink
 ```
 
+Subtitles for a recording:
+
+```sh
+GST_PLUGIN_PATH="$PWD/target/debug" gst-launch-1.0 -q \
+  filesrc location=in.wav \
+  ! decodebin3 \
+  ! audioconvert \
+  ! audioresample \
+  ! cactuswhistle model-file=target/models/whistle.cact \
+  ! srtenc \
+  ! fdsink > in.srt
+```
+
 ## Development
 
 ```sh
@@ -195,5 +315,7 @@ mise run //analytics/cactus:inspect
 mise run //analytics/cactus:smoke
 ```
 
-The default tests use a fake engine behind the element's `Describer` trait;
-the smoke tests run the real engine with the pinned weights.
+The default tests use a fake engine behind each element's `Describer` or
+`Transcriber` trait; the smoke tests run the real engine with the pinned
+weights and the public-domain Apollo 13 "Houston, we've had a problem"
+recording, which `mise run cactus:weights` also downloads.
