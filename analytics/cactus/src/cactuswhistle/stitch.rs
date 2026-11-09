@@ -64,6 +64,22 @@ pub struct Cue {
     pub text: String,
 }
 
+/// Whether a cue of two or more words is spoken faster than `max_rate`
+/// words per second, timed to at least one 80 ms step. Whistle invents
+/// short phrases such as "Thank you." in noise, crammed into a step or two;
+/// people say at most about six words a second. `max_rate` 0 never drops.
+/// Words are counted between spaces, so a stray punctuation token counts.
+pub fn too_fast(cue: &Cue, max_rate: u32) -> bool {
+    let words = cue.text.split_whitespace().count();
+    let duration_ms = (cue.end_ms - cue.start_ms).max(80);
+    max_rate > 0
+        && words >= 2
+        && i64::try_from(words)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000)
+            > i64::from(max_rate).saturating_mul(duration_ms)
+}
+
 /// Groups time-ordered words into cues.
 pub fn group(words: &[Word], limits: Limits) -> Vec<Cue> {
     let mut cues = Vec::new();
@@ -118,6 +134,9 @@ fn same_text(a: &str, b: &str) -> bool {
 pub struct Committed {
     pub words: Vec<Word>,
     pub cues: Vec<Cue>,
+    /// The window was the last one or had stalled, so its words committed
+    /// as heard, without holdback or agreement.
+    pub forced: bool,
 }
 
 /// Audio covered by one transcription, on the stream timeline.
@@ -241,7 +260,11 @@ impl Stitcher {
         let keep_from = self.committed_until - self.context_ms - 1000;
         self.history.retain(|word| word.end_ms >= keep_from);
         let cues = self.close_cues(&fresh, forced);
-        Committed { words: fresh, cues }
+        Committed {
+            words: fresh,
+            cues,
+            forced,
+        }
     }
 
     /// Groups the open and newly committed words into cues and returns those
@@ -311,6 +334,26 @@ mod tests {
 
     fn stitcher() -> Stitcher {
         Stitcher::new(5000, 1000, 30_000, Limits::default())
+    }
+
+    #[test]
+    fn drops_phrases_spoken_too_fast() {
+        let cue = |text: &str, start_ms, end_ms| Cue {
+            start_ms,
+            end_ms,
+            text: text.to_owned(),
+        };
+        assert!(too_fast(&cue("Thank you.", 0, 80), 10));
+        assert!(too_fast(&cue("Thank you.", 0, 0), 10));
+        assert!(!too_fast(&cue("Thank you.", 0, 80), 0));
+        assert!(!too_fast(&cue("Thank you.", 0, 240), 10));
+        assert!(!too_fast(&cue("Yes.", 0, 0), 10));
+        // A fast cue measured in clean speech (the fastest was 5 words a
+        // second).
+        assert!(!too_fast(
+            &cue("where are we with the new cluster?", 0, 1520),
+            10
+        ));
     }
 
     #[test]

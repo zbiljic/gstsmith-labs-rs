@@ -184,7 +184,8 @@ Speech to text, with the pads of `whispertranscriber`: 16 kHz mono F32LE in
 (put `audioconvert ! audioresample` before it), `text/x-raw,format=utf8`
 cues out. Klass `Text/Audio/Filter`, long name `Transcriber`, rank none.
 Whistle understands English, German, French, Spanish, Italian, Dutch and
-Polish, and detects the language unless `language` is set.
+Polish, and detects the language unless `language` is set; a tag such as
+`en-US` counts as its language.
 
 - **`mode=windows` (default): rolling windows.** Once `chunk-duration` of
   audio past the commit point has arrived, the element transcribes a window
@@ -195,10 +196,16 @@ Polish, and detects the language unless `language` is set.
   `whispertranscriber`'s `live-edge-offset`); the commit point therefore
   trails each window by the holdback, and windows run every
   `chunk-duration − holdback` of input: with the defaults, a 12 s window
-  every second, 10–30% of a laptop CPU core. With `agreement`, words near
-  the commit point also wait until two consecutive windows transcribe them
-  alike. Context words that repeat committed ones are dropped, so each word
-  is committed once.
+  every second, 10–30% of a laptop CPU core. Words also wait until two
+  consecutive windows transcribe them alike: with the default `agreement`
+  of 2000, the chunk length, every new word does, which drops phrases a
+  single window invents in noise and costs no accuracy on clean speech.
+  Keep `agreement` at or above `chunk-duration` for that; a smaller one
+  checks only the words that end within it of the commit point, and 0
+  none. The input's last window commits its words as heard, and so does a
+  window that has waited two chunks and the holdback past the commit point
+  for two windows to agree. Context words that repeat committed ones are
+  dropped, so each word is committed once.
 - **`mode=stream`: the engine's streaming transcriber.** Each
   `chunk-duration` step goes to the engine, which commits the words two
   consecutive passes agree on and keeps an unconfirmed tail. Every word the
@@ -216,9 +223,16 @@ Polish, and detects the language unless `language` is set.
   timeline. GAP events cover the time before the open cue, so downstream
   elements keep moving through silence; the first one, empty, marks the
   start, so sinks preroll before the first cue.
+- **Invented phrases.** In static, Whistle can hear a short phrase such as
+  "Thank you." and time it to a step or two. Cues of two or more words
+  spoken faster than `max-word-rate` (10 words a second; speech rarely
+  passes 6) are dropped, in both modes, except from a window that commits
+  as heard (above), whose last words can be timed to zero length.
 - **Metadata.** A `cactuswhistle` element message per window or step
   carries `window-start`, `window-end` (seconds), `transcription-seconds`,
-  `words`, `committed`, `cues`, `language` and `pending`, the engine's
+  `words`, `committed`, `cues`, `dropped` (cues spoken too fast),
+  `forced` (the window committed as heard),
+  `language` and `pending`, the engine's
   unconfirmed text in `mode=stream` (empty otherwise). A change in the
   detected language is sent downstream as a `language-code` tag.
 - **Timeline.** Gaps in the input (GAP events or missing time) are filled
@@ -229,10 +243,11 @@ Polish, and detects the language unless `language` is set.
   put a `queue` before the element. A cue's PTS is its first word, and the
   cue stays open for up to 8 s (7 s of words, then a pause), so a cue can
   leave the element that long after its first word, plus the time its last
-  word takes to be committed: a chunk (and `agreement`), or in
+  word takes to be committed: a chunk, or with `agreement` up to two
+  chunks and the holdback (a window that commits as heard), or in
   `mode=stream` two steps and a second. `latency=0` reports the sum, plus
   2 s for transcription and for waiting while another element uses the
-  engine: 12 s with the defaults. Short cues leave much sooner;
+  engine: 15 s with the defaults. Short cues leave much sooner;
   with a smaller `latency`, a syncing sink may get late cues. In
   `chunk-duration=0` mode it reports 0.
 
@@ -243,9 +258,10 @@ script, the word error rates were:
 | Setting | Word error rate |
 | --- | --- |
 | `chunk-duration=0` (whole recording) | 5.5% |
-| default (`windows`, 2 s chunks, 10 s context, 1 s holdback) | 5.1% |
-| `windows`, 5 s context | 7.1% |
-| `windows`, 5 s chunks, 2 s holdback | 5.9% |
+| default (`windows`, 2 s chunks, 10 s context, 1 s holdback, 2 s agreement) | 5.1% |
+| `windows` without agreement | 5.1% |
+| `windows`, 5 s context, no agreement | 7.1% |
+| `windows`, 5 s chunks, 2 s holdback, no agreement | 5.9% |
 | `mode=stream`, 2 s steps | 6.3% |
 | `mode=stream`, 1 s steps | 6.7% |
 | `mode=stream`, 0.5 s steps | 5.9% |
@@ -259,24 +275,36 @@ These are single runs on one recording, not benchmarks.
 | --- | --- | --- |
 | `model-file` | unset (required) | Whistle `.cact` weights |
 | `mode` | `windows` | `windows` or `stream` |
-| `language` | empty (detect) | `en`, `de`, `fr`, `es`, `it`, `nl` or `pl` |
+| `language` | empty (detect) | `en`, `de`, `fr`, `es`, `it`, `nl` or `pl`, or a tag such as `en-US` (read back as set) |
+| `language-code` | empty (detect) | the same setting, under the name `transcriberbin` sets |
 | `keywords` | empty | comma-separated words to favour, such as names |
 | `chunk-duration` | 2000 | ms of new audio per window or stream step; 0 transcribes at EOS (`windows` only) |
 | `context-duration` | 10000 | ms of committed audio repeated before each window (`windows`) |
 | `holdback` | 1000 | ms before a window's end where words wait for the next window (`windows`) |
-| `agreement` | 0 | ms before the commit point where words wait for a second, identical transcription (`windows`) |
+| `agreement` | 2000 | ms before the commit point where words wait for a second, identical transcription (`windows`) |
+| `max-word-rate` | 10 | words per second above which a cue of two or more words is dropped; 0 keeps every cue |
 | `latency` | 0 (automatic) | ms added to LATENCY queries, as in `whispertranscriber` (`cactusmirage` uses ns) |
 | `engine` | unset (default engine) | engine name, see [Engines](#engines) |
 | `threads` | 0 (engine default) | per engine, see [Engines](#engines) |
 
 All properties can change only in the NULL and READY states.
 
+### In `transcriberbin`
+
+`cactuswhistle` can be the `transcriber` of `transcriberbin` (set on its
+`sink_audio` pad), which turns the cues into closed captions on the video.
+`transcriberbin` sets the element's `latency` to its own (4 s by default),
+and its `language-code` when the pad's changes, restarting the transcriber
+so that it takes effect. Cues that come later than
+that latency are placed on later frames rather than dropped; a
+`transcriberbin` latency of 15 s keeps the captions on time.
+
 ### Known limitations
 
-- Noisy audio makes Whistle repeat phrases and invent words, and it can
-  hear short phrases such as "Thank you." in static at the start of a
-  window. On such audio, rolling windows, the engine's stream and the
-  whole recording each make different mistakes.
+- Noisy audio makes Whistle repeat phrases and invent words. Agreement and
+  `max-word-rate` drop the short phrases it invents in static, not longer
+  ones. On such audio, rolling windows, the engine's stream and the whole
+  recording each make different mistakes.
 - There is no speaker attribution and no translation.
 
 ## Examples

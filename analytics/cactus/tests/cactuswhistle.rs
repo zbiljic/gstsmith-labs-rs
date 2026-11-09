@@ -34,7 +34,8 @@ fn registers_with_documented_defaults() -> Result<()> {
     ensure!(element.property::<u32>("chunk-duration") == 2000);
     ensure!(element.property::<u32>("context-duration") == 10_000);
     ensure!(element.property::<u32>("holdback") == 1000);
-    ensure!(element.property::<u32>("agreement") == 0);
+    ensure!(element.property::<u32>("agreement") == 2000);
+    ensure!(element.property::<u32>("max-word-rate") == 10);
     ensure!(element.property::<u32>("latency") == 0);
     ensure!(element.property::<Option<String>>("engine").is_none());
     let src = factory

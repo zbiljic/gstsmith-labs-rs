@@ -29,6 +29,9 @@ struct Calls {
     quiet_pending: bool,
     /// Words the windows hear instead of `SCRIPT`.
     script: Option<&'static [(&'static str, i64, i64)]>,
+    /// A word only the first window hears, as Whistle invents phrases in
+    /// noise that the next window does not repeat.
+    invented: Option<(&'static str, i64, i64)>,
 }
 
 type Shared = Arc<Mutex<Calls>>;
@@ -120,11 +123,14 @@ impl Transcriber for Fake {
             if calls.windows.len() > 100 {
                 return Err("the same window again and again".to_owned());
             }
-            calls.script.unwrap_or(&SCRIPT)
+            let invented = calls.invented.filter(|_| calls.windows.len() == 1);
+            (calls.script.unwrap_or(&SCRIPT), invented)
         };
+        let (script, invented) = script;
         // Words that started in the window, over audio, cut off at its end.
-        let heard: Vec<_> = script
+        let heard: Vec<_> = invented
             .iter()
+            .chain(script)
             .filter(|(_, start, _)| {
                 (first..end).contains(start)
                     && pcm
@@ -288,7 +294,7 @@ fn gaps(harness: &mut gst_check::Harness) -> Vec<(u64, u64)> {
 
 #[test]
 fn windows_commit_each_word_once_on_the_input_timeline() -> Result<()> {
-    let (mut harness, calls, _weights) = whistle(&[])?;
+    let (mut harness, calls, _weights) = whistle(&[("agreement", 0u32.to_value())])?;
     push_audio(&mut harness, 0, AUDIO_MS)?;
     ensure!(harness.push_event(gst::event::Eos::new()));
     ensure!(cues(&mut harness)? == expected());
@@ -312,8 +318,59 @@ fn windows_commit_each_word_once_on_the_input_timeline() -> Result<()> {
 }
 
 #[test]
+fn agreement_drops_a_word_only_one_window_hears() -> Result<()> {
+    for (agreement, invented) in [(None, false), (Some(0u32), true)] {
+        let properties: Vec<_> = agreement
+            .map(|ms| ("agreement", ms.to_value()))
+            .into_iter()
+            .collect();
+        let (mut harness, calls, _weights) = whistle(&properties)?;
+        lock(&calls).invented = Some(("Thanks", 100, 400));
+        push_audio(&mut harness, 0, AUDIO_MS)?;
+        ensure!(harness.push_event(gst::event::Eos::new()));
+        let cues = cues(&mut harness)?;
+        let mut expected = expected();
+        if invented {
+            expected[0] = (100, 1400, "Thanks Hello there.".to_owned());
+        }
+        ensure!(cues == expected, "agreement {agreement:?}: {cues:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn drops_cues_spoken_too_fast() -> Result<()> {
+    const FAST: [(&str, i64, i64); 5] = [
+        ("Thank", 100, 140),
+        ("you.", 140, 180),
+        ("General", 3000, 3500),
+        ("Kenobi.", 3500, 4200),
+        ("Bye.", 7000, 7600),
+    ];
+    for (rate, kept) in [(None, false), (Some(0u32), true)] {
+        let properties: Vec<_> = rate
+            .map(|rate| ("max-word-rate", rate.to_value()))
+            .into_iter()
+            .collect();
+        let (mut harness, calls, _weights) = whistle(&properties)?;
+        lock(&calls).script = Some(&FAST);
+        push_audio(&mut harness, 0, AUDIO_MS)?;
+        ensure!(harness.push_event(gst::event::Eos::new()));
+        let cues = cues(&mut harness)?;
+        let mut expected = expected();
+        if kept {
+            expected[0] = (100, 80, "Thank you.".to_owned());
+        } else {
+            expected.remove(0);
+        }
+        ensure!(cues == expected, "max-word-rate {rate:?}: {cues:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn a_word_longer_than_a_chunk_waits_for_more_audio() -> Result<()> {
-    let (mut harness, calls, _weights) = whistle(&[])?;
+    let (mut harness, calls, _weights) = whistle(&[("agreement", 0u32.to_value())])?;
     // Each window cuts the long word at its end, past the holdback, so it
     // commits nothing until the word is over.
     lock(&calls).script = Some(&[
@@ -450,11 +507,27 @@ fn reports_latency_from_the_chunks() -> Result<()> {
     let (mut harness, _calls, _weights) = whistle(&[("agreement", 2000u32.to_value())])?;
     harness.set_upstream_latency(gst::ClockTime::from_mseconds(20));
     let latency = harness.query_latency().context("latency")?;
-    // An open cue (8 s), a chunk and the agreement, then processing.
+    // An open cue (8 s), a stalled window's wait (two chunks and the
+    // holdback, more than a chunk and the agreement), then processing.
     ensure!(
-        latency == gst::ClockTime::from_mseconds(20 + 8000 + 2000 + 2000 + 2000),
+        latency == gst::ClockTime::from_mseconds(20 + 8000 + 5000 + 2000),
         "{latency}"
     );
+    Ok(())
+}
+
+#[test]
+fn takes_language_tags_under_either_name() -> Result<()> {
+    gst::init()?;
+    let (element, _calls, _weights) = element(&[("language-code", "en-US".to_value())])?;
+    let read = |name: &str| element.property::<Option<String>>(name);
+    ensure!(read("language").as_deref() == Some("en-US"));
+    element.set_state(gst::State::Paused)?;
+    element.set_state(gst::State::Null)?;
+    element.set_property("language", "DE_at");
+    ensure!(read("language-code").as_deref() == Some("DE_at"));
+    element.set_state(gst::State::Paused)?;
+    element.set_state(gst::State::Null)?;
     Ok(())
 }
 
@@ -462,7 +535,9 @@ fn reports_latency_from_the_chunks() -> Result<()> {
 fn refuses_bad_settings_at_start() -> Result<()> {
     gst::init()?;
     for properties in [
-        vec![("language", "en-US".to_value())],
+        vec![("language", "ja".to_value())],
+        vec![("language-code", "pt-BR".to_value())],
+        vec![("language", "-US".to_value())],
         vec![("holdback", 2000u32.to_value())],
         vec![
             ("mode", Mode::Stream.to_value()),

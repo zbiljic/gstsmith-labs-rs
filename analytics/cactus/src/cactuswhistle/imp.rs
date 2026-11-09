@@ -6,7 +6,7 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 
-use super::stitch::{Cue, Limits, Stitcher, Window};
+use super::stitch::{Cue, Limits, Stitcher, Window, too_fast};
 use super::transcriber::{self, Request, Transcriber};
 
 #[cfg(test)]
@@ -68,7 +68,43 @@ struct Settings {
     context_duration: u32,
     holdback: u32,
     agreement: u32,
+    max_word_rate: u32,
     latency: u32,
+}
+
+/// What one window or stream step did, for the log and element message.
+struct Summary<'a> {
+    start_ms: i64,
+    end_ms: i64,
+    elapsed: std::time::Duration,
+    words: usize,
+    committed: usize,
+    cues: usize,
+    dropped: usize,
+    forced: bool,
+    language: &'a str,
+    pending: &'a str,
+}
+
+/// Drops cues spoken implausibly fast; returns the rest and how many went.
+fn drop_too_fast(cues: Vec<Cue>, max_rate: u32) -> (Vec<Cue>, usize) {
+    let total = cues.len();
+    let kept: Vec<Cue> = cues
+        .into_iter()
+        .filter(|cue| !too_fast(cue, max_rate))
+        .collect();
+    let dropped = total - kept.len();
+    (kept, dropped)
+}
+
+/// The primary language of a tag such as `en-US` or `pt_BR`, lowercased:
+/// Whistle knows languages, not regions.
+fn primary_language(tag: &str) -> String {
+    tag.trim()
+        .split(['-', '_'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 impl Default for Settings {
@@ -83,7 +119,8 @@ impl Default for Settings {
             chunk_duration: 2000,
             context_duration: 10_000,
             holdback: 1000,
-            agreement: 0,
+            agreement: 2000,
+            max_word_rate: 10,
             latency: 0,
         }
     }
@@ -95,15 +132,19 @@ impl Settings {
     }
 
     /// The longest a cue's PTS can be behind its push: the cue stays open
-    /// for up to `max_open_ms`, its last word is committed a chunk (and the
-    /// agreement margin) later, or for the stream two steps and the settle
-    /// margin later, then processing.
+    /// for up to `max_open_ms`, its last word is committed a chunk (with
+    /// agreement, the agreement margin or a stalled window) later, or for
+    /// the stream two steps and the settle margin later, then processing.
     fn latency(&self) -> gst::ClockTime {
         let ms = match self.latency {
             0 if self.live() => {
                 let chunk = i64::from(self.chunk_duration);
                 let commit = match self.mode {
-                    Mode::Windows => chunk + i64::from(self.agreement),
+                    // Words two windows disagree on wait until the window
+                    // stalls and commits them as heard.
+                    Mode::Windows if self.agreement > 0 => (chunk + i64::from(self.agreement))
+                        .max(2 * chunk + i64::from(self.holdback)),
+                    Mode::Windows => chunk,
                     Mode::Stream => 2 * chunk + STREAM_SETTLE_MS,
                 };
                 Limits::default().max_open_ms() + commit + AUTO_PROCESSING_MS
@@ -134,15 +175,17 @@ impl Settings {
 
     /// Checks the settings and makes the request every window sends.
     fn request(&self) -> Result<Request, String> {
-        let language = self
+        let tag = self
             .language
-            .clone()
-            .filter(|language| !language.is_empty());
-        if let Some(language) = &language
+            .as_deref()
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty());
+        let language = tag.map(primary_language);
+        if let (Some(tag), Some(language)) = (tag, &language)
             && !LANGUAGES.contains(&language.as_str())
         {
             return Err(format!(
-                "language {language} is not one of {}",
+                "language {tag} is not one of {}",
                 LANGUAGES.join(", ")
             ));
         }
@@ -369,7 +412,12 @@ impl ObjectImpl for CactusWhistle {
                     .build(),
                 glib::ParamSpecString::builder("language")
                     .nick("Language")
-                    .blurb("Spoken language: en, de, fr, es, it, nl or pl; empty detects it in each window")
+                    .blurb("Spoken language: en, de, fr, es, it, nl or pl, or a tag such as en-US; empty detects it in each window")
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecString::builder("language-code")
+                    .nick("Language code")
+                    .blurb("Same as language, under the name transcriberbin sets")
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecString::builder("keywords")
@@ -412,14 +460,21 @@ impl ObjectImpl for CactusWhistle {
                 milliseconds(
                     "agreement",
                     "Agreement",
-                    "Words ending within this many milliseconds of the commit point wait until two consecutive windows transcribe them alike; 0 disables (mode=windows)",
+                    "Words ending within this many milliseconds of the commit point wait until two consecutive windows transcribe them alike; at chunk-duration or more every word does, which drops phrases a single window invents; 0 disables (mode=windows)",
                     MAX_WINDOW_MS,
                     defaults.agreement,
                 ),
+                glib::ParamSpecUInt::builder("max-word-rate")
+                    .nick("Max word rate")
+                    .blurb("Cues of two or more words spoken faster than this many words per second are dropped as invented; 0 keeps every cue")
+                    .maximum(1000)
+                    .default_value(defaults.max_word_rate)
+                    .mutable_ready()
+                    .build(),
                 milliseconds(
                     "latency",
                     "Latency",
-                    "Reported cue delay in milliseconds; 0 uses two chunks (three with agreement or mode=stream) plus 2000",
+                    "Reported cue delay in milliseconds; 0 reports the longest a cue can wait: 8000 while it stays open, a chunk, or with agreement up to two chunks and the holdback (mode=stream: two steps and 1000), until its last word commits, and 2000 for processing",
                     3_600_000,
                     defaults.latency,
                 ),
@@ -435,7 +490,9 @@ impl ObjectImpl for CactusWhistle {
         match pspec.name() {
             "mode" => settings.mode = value.get().unwrap_or(settings.mode),
             "model-file" => settings.model_file = text(),
-            "language" => settings.language = text(),
+            "language" | "language-code" => {
+                settings.language = text();
+            }
             "keywords" => settings.keywords = text(),
             "engine" => settings.engine = text(),
             "threads" => settings.threads = number(settings.threads),
@@ -443,6 +500,7 @@ impl ObjectImpl for CactusWhistle {
             "context-duration" => settings.context_duration = number(settings.context_duration),
             "holdback" => settings.holdback = number(settings.holdback),
             "agreement" => settings.agreement = number(settings.agreement),
+            "max-word-rate" => settings.max_word_rate = number(settings.max_word_rate),
             "latency" => settings.latency = number(settings.latency),
             other => gst::error!(CAT, imp = self, "unknown property {other}"),
         }
@@ -453,7 +511,7 @@ impl ObjectImpl for CactusWhistle {
         match pspec.name() {
             "mode" => settings.mode.to_value(),
             "model-file" => settings.model_file.to_value(),
-            "language" => settings.language.to_value(),
+            "language" | "language-code" => settings.language.to_value(),
             "keywords" => settings.keywords.to_value(),
             "engine" => settings.engine.to_value(),
             "threads" => settings.threads.to_value(),
@@ -461,6 +519,7 @@ impl ObjectImpl for CactusWhistle {
             "context-duration" => settings.context_duration.to_value(),
             "holdback" => settings.holdback.to_value(),
             "agreement" => settings.agreement.to_value(),
+            "max-word-rate" => settings.max_word_rate.to_value(),
             "latency" => settings.latency.to_value(),
             other => {
                 gst::error!(CAT, imp = self, "unknown property {other}");
@@ -924,7 +983,7 @@ impl CactusWhistle {
             job.window
         };
         let words = transcript.words.len();
-        let (cues, committed, safe_ms, language) = {
+        let (cues, dropped, forced, committed, safe_ms, language) = {
             let mut state = lock(&self.state);
             let Some(stitcher) = state.stitcher.as_mut() else {
                 return Err(gst::FlowError::Flushing);
@@ -944,32 +1003,33 @@ impl CactusWhistle {
                     state.language.clone_from(&transcript.language);
                     transcript.language.clone()
                 });
-            (committed.cues, committed.words.len(), safe_ms, language)
+            let (cues, dropped) = if committed.forced {
+                (committed.cues, 0)
+            } else {
+                drop_too_fast(committed.cues, state.settings.max_word_rate)
+            };
+            let forced = committed.forced;
+            (
+                cues,
+                dropped,
+                forced,
+                committed.words.len(),
+                safe_ms,
+                language,
+            )
         };
-        let start_ms = sample_ms(job.first);
-        gst::debug!(
-            CAT,
-            imp = self,
-            "{:.2}-{:.2} s in {elapsed:?}: {words} words, {committed} committed, {} cues",
-            seconds(start_ms),
-            seconds(job.window.end_ms),
-            cues.len()
-        );
-        let summary = gst::Structure::builder("cactuswhistle")
-            .field("window-start", seconds(start_ms))
-            .field("window-end", seconds(job.window.end_ms))
-            .field("transcription-seconds", elapsed.as_secs_f64())
-            .field("words", u32::try_from(words).unwrap_or(u32::MAX))
-            .field("committed", u32::try_from(committed).unwrap_or(u32::MAX))
-            .field("cues", u32::try_from(cues.len()).unwrap_or(u32::MAX))
-            .field("language", transcript.language.as_str())
-            .field("pending", transcript.pending.as_str())
-            .build();
-        let _posted = self.obj().post_message(
-            gst::message::Element::builder(summary)
-                .src(&*self.obj())
-                .build(),
-        );
+        self.report(&Summary {
+            start_ms: sample_ms(job.first),
+            end_ms: job.window.end_ms,
+            elapsed,
+            words,
+            committed,
+            cues: cues.len(),
+            dropped,
+            forced,
+            language: &transcript.language,
+            pending: &transcript.pending,
+        });
         if let Some(language) = language {
             let mut tags = gst::TagList::new();
             tags.make_mut()
@@ -992,6 +1052,40 @@ impl CactusWhistle {
         Ok(())
     }
 
+    /// Logs a window or step and posts its element message.
+    fn report(&self, summary: &Summary<'_>) {
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        gst::debug!(
+            CAT,
+            imp = self,
+            "{:.2}-{:.2} s in {:?}: {} words, {} committed, {} cues, {} dropped",
+            seconds(summary.start_ms),
+            seconds(summary.end_ms),
+            summary.elapsed,
+            summary.words,
+            summary.committed,
+            summary.cues,
+            summary.dropped
+        );
+        let structure = gst::Structure::builder("cactuswhistle")
+            .field("window-start", seconds(summary.start_ms))
+            .field("window-end", seconds(summary.end_ms))
+            .field("transcription-seconds", summary.elapsed.as_secs_f64())
+            .field("words", count(summary.words))
+            .field("committed", count(summary.committed))
+            .field("cues", count(summary.cues))
+            .field("dropped", count(summary.dropped))
+            .field("forced", summary.forced)
+            .field("language", summary.language)
+            .field("pending", summary.pending)
+            .build();
+        let _posted = self.obj().post_message(
+            gst::message::Element::builder(structure)
+                .src(&*self.obj())
+                .build(),
+        );
+    }
+
     /// Pushes the open cue at EOS when no audio is left to transcribe.
     fn close_open_cue(&self) -> Result<(), gst::FlowError> {
         let (cues, start) = {
@@ -1003,6 +1097,8 @@ impl CactusWhistle {
                 return Ok(());
             };
             let end_ms = stitcher.committed_until();
+            // The last words commit as heard, and may be zero-length; the
+            // rate rule is for phrases invented at a window's start.
             let committed = stitcher.accept(Vec::new(), Window { end_ms, last: true });
             (committed.cues, start)
         };
