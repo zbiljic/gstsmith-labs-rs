@@ -31,7 +31,7 @@ version = "0.1.0"
 anyhow = "1.0.104"
 atomic_refcell = "0.1.14"
 cairo-rs = "0.22.9"
-cc = "1.10.0"
+cc = "1.11.1"
 criterion = "0.8.2"
 gst = { package = "gstreamer", version = "0.25.4", features = ["v1_24"] }
 gst-analytics = { package = "gstreamer-analytics", version = "0.25.4", features = ["v1_28"] }
