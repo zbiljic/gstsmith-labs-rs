@@ -91,7 +91,6 @@ fn normalization(points: impl Iterator<Item = Point> + Clone) -> Result<Matrix, 
 /// return `None` when the system is singular to working precision.
 #[expect(
     clippy::indexing_slicing,
-    clippy::needless_range_loop,
     reason = "elimination updates one row from another, with indices bounded by the array length N"
 )]
 fn solve<const N: usize>(mut matrix: [[f64; N]; N], mut rhs: [f64; N]) -> Option<[f64; N]> {
