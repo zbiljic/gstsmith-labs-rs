@@ -73,12 +73,12 @@ name = "analytics-meta-fixture-a"
 version = "0.1.0"
 dependencies = [
  "analytics-meta",
- "analytics-meta-fixture-b",
  "anyhow",
  "gstreamer",
  "gstreamer-analytics",
  "gstreamer-base",
  "gstreamer-check",
+ "serde_json",
 ]
 
 [[package]]

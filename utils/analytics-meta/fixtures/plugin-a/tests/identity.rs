@@ -7,42 +7,70 @@
 //! so the parent test re-runs this binary as a child with libtest's
 //! `--exact`/`--nocapture` flags. That assumes plain `cargo test`, not a
 //! custom harness or nextest.
+//!
+//! The parent also builds both plugins and tells the children where they are,
+//! so running the tests needs `cargo` and a target directory it can write to.
 
+use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, ensure};
 use gst::prelude::*;
 
 const CHILD_ENV: &str = "JSONMTD_IDENTITY_CHILD";
+const PLUGINS_ENV: &str = "JSONMTD_IDENTITY_PLUGINS";
 const RUNS: usize = 24;
 
-/// Finds a fixture plugin library. Cargo leaves the metadata hash out of
-/// `cdylib` file names of path packages, and builds a dev-dependency's
-/// `cdylib` in `deps/` next to this binary (the package's own one is uplifted
-/// to the parent directory).
-fn plugin_file(stem: &str) -> Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    let deps = exe.parent().context("test binary directory")?;
-    let file = format!(
-        "{}{stem}{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
+/// Builds both fixture plugins and returns their libraries as a path list.
+///
+/// Cargo keeps the layout of its target directory to itself, so the paths
+/// come from the artifact messages of a build that names both packages. That
+/// build uses the dev profile, whichever profile this test was built with.
+fn build_plugins() -> Result<OsString> {
+    let output = Command::new(env!("CARGO"))
+        .args(["build", "--locked"])
+        .arg("--message-format=json-render-diagnostics")
+        .args(["-p", "analytics-meta-fixture-a"])
+        .args(["-p", "analytics-meta-fixture-b"])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "building the fixture plugins failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    [Some(deps), deps.parent()]
-        .into_iter()
-        .flatten()
-        .map(|dir| dir.join(&file))
-        .find(|path| path.exists())
-        .with_context(|| format!("{file} not built next to {}", exe.display()))
+    let mut artifacts = Vec::new();
+    for line in String::from_utf8(output.stdout)?.lines() {
+        let message: serde_json::Value = serde_json::from_str(line)?;
+        if let Some(files) = message.get("filenames").and_then(|files| files.as_array()) {
+            artifacts.extend(
+                files
+                    .iter()
+                    .filter_map(|file| file.as_str())
+                    .map(PathBuf::from),
+            );
+        }
+    }
+    let mut plugins = Vec::new();
+    for stem in ["gstjsonmtdfixturea", "gstjsonmtdfixtureb"] {
+        let file = format!("{DLL_PREFIX}{stem}{DLL_SUFFIX}");
+        let plugin = artifacts
+            .iter()
+            .find(|path| path.file_name() == Some(file.as_ref()))
+            .with_context(|| format!("Cargo reported no {file}"))?;
+        plugins.push(plugin);
+    }
+    Ok(std::env::join_paths(plugins)?)
 }
 
 fn load_plugins() -> Result<(gst::Element, gst::Element)> {
     gst::init()?;
-    for stem in ["gstjsonmtdfixturea", "gstjsonmtdfixtureb"] {
-        gst::Plugin::load_file(plugin_file(stem)?)?;
+    let plugins = std::env::var_os(PLUGINS_ENV).context("no plugins from the parent")?;
+    for plugin in std::env::split_paths(&plugins) {
+        gst::Plugin::load_file(plugin)?;
     }
     let a = gst::ElementFactory::make("jsonmtdprobea").build()?;
     let b = gst::ElementFactory::make("jsonmtdprobeb").build()?;
@@ -180,9 +208,15 @@ fn seeded_other_child() -> Result<String> {
 
 /// Runs this test function again in a fresh process with `scenario`.
 fn run_child(test: &str, scenario: &str) -> Result<String> {
+    static PLUGINS: OnceLock<Result<OsString>> = OnceLock::new();
+    let plugins = PLUGINS
+        .get_or_init(build_plugins)
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
     let output = Command::new(std::env::current_exe()?)
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, scenario)
+        .env(PLUGINS_ENV, plugins)
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     ensure!(
