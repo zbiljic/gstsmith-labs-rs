@@ -230,6 +230,8 @@ jobs:
           install_args: rust
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
       - name: Test and lint optional CoreML
         run: |
           cargo test --locked -p gst-plugin-usls --all-targets --features coreml
