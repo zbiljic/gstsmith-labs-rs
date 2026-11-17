@@ -1,6 +1,6 @@
 # cactus
 
-Safe access to named [Cactus](https://cactuscompute.com) 4.1.0 engines
+Safe access to named [Cactus](https://cactuscompute.com) 4.1.2 engines
 through [`cactus-sys`](../cactus-sys/).
 
 - **Named engines, taking turns.** The C ABI has no handle: an engine keeps

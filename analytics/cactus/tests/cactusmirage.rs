@@ -100,7 +100,7 @@ fn describes_a_frame_with_the_real_engine() -> Result<()> {
         .next()
         .context("frame record")?;
     let record: serde_json::Value = serde_json::from_str(record.json)?;
-    ensure!(record["engine"] == "4.1.0", "{record}");
+    ensure!(record["engine"] == "4.1.2", "{record}");
     ensure!(record["response"].is_object(), "{record}");
     Ok(())
 }

@@ -1,6 +1,6 @@
 # cactus-sys
 
-Raw FFI to the [Cactus](https://cactuscompute.com) 4.1.0 engine, which runs
+Raw FFI to the [Cactus](https://cactuscompute.com) 4.1.2 engine, which runs
 Mirage (vision), Whistle (speech) and Needle (text) models. The 13 functions
 of `cactus.h` are declared by hand; no bindgen or libclang is needed.
 

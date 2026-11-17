@@ -3,7 +3,8 @@
 //! With `CACTUS_LIB_DIR` set, `libcactus.a` (and, if present, `cactus.h`)
 //! are taken from that directory. Otherwise the `download` feature fetches
 //! both for the target from the pinned Hugging Face revision and checks them
-//! against SHA-256 values copied from the release `manifest.json`.
+//! against SHA-256 values copied from the release `manifest.json` (SHA-256
+//! `7810f99aba876fea8f9a34e921397a9e782d113b25daab37ee6db7c9808ffe20`).
 //!
 //! The archive is linked into a shared library that exports only the
 //! `cactus_*` functions, and the crate embeds its bytes: the engine keeps
@@ -27,9 +28,9 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
 
-const VERSION: &str = "4.1.0";
+const VERSION: &str = "4.1.2";
 #[cfg(feature = "download")]
-const REVISION: &str = "4e822c9036be2eb0e47ef556df32a818bb1572ef";
+const REVISION: &str = "569a10bb4f0e87331abcf874903c0e5139d38aae";
 #[cfg(feature = "download")]
 const BASE_URL: &str = "https://huggingface.co/Cactus-Compute/cactus/resolve";
 /// `cactus.h` is identical on every platform.
@@ -42,19 +43,19 @@ const ARCHIVES: &[(&str, &str, &str, &str)] = &[
         "macos",
         "aarch64",
         "macos-arm64",
-        "4105ce155432e60f1337f158074059c96d5b8907549051ef869a0b0414f0c3ae",
+        "ae4c7c37d94a9a0fd27fbe4c7435f099d00a14b031a9bbd2b5156b84ed0dbef3",
     ),
     (
         "linux",
         "aarch64",
         "linux-arm64",
-        "cd020ac6b125f80cf16f9ee25d9d606402369612b77e5fa2845dc85d7aaebcbc",
+        "dab92942724a1104e733d02a1578a519ebb3bb7cc40a201e0b2a7b30ff34ab26",
     ),
     (
         "linux",
         "x86_64",
         "linux-x86_64",
-        "0c58951e0e4353a2a302621d714e19a3069b11c9f3e06b1409457f571cc900ec",
+        "872eac49308b19405b9979be4ae6c18ddb934fcd62854cae7a88a36e322f3a5d",
     ),
 ];
 
