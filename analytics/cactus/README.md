@@ -54,7 +54,8 @@ gst-launch-1.0 \
 ```
 
 Weights: `mise run cactus:weights` downloads the pinned `mirage.cact` and
-`whistle.cact` to `target/models/`.
+`whistle.cact` to `~/.cache/cactus/models/` and links them from
+`target/models/`.
 
 ## `cactusmirage`
 

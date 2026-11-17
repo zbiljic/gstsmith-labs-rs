@@ -54,5 +54,6 @@ The default tests need no weights. Real-engine tests are opt-in:
 mise run cactus:smoke
 ```
 
-That fetches the pinned Mirage and Whistle weights and a speech sample to
-`target/models/` and runs `tests/engine.rs` and `tests/speech.rs`.
+That fetches the pinned Mirage and Whistle weights to
+`~/.cache/cactus/models/` (linked from `target/models/`) and a speech sample
+to `target/models/`, and runs `tests/engine.rs` and `tests/speech.rs`.

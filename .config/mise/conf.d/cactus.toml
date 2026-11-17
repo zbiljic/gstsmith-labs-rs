@@ -1,5 +1,5 @@
 [tasks."cactus:weights"]
-description = "Download the pinned Mirage and Whistle weights to target/models"
+description = "Download the pinned Mirage and Whistle weights to ~/.cache/cactus and link them from target/models"
 run = '''
 set -eu
 digest() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
@@ -7,16 +7,41 @@ fetch() {
   dest="$1" url="$2" expected="$3"
   if [ -f "$dest" ] && [ "$(digest "$dest")" = "$expected" ]; then echo "$dest"; return; fi
   mkdir -p "$(dirname "$dest")"
-  curl --fail --location --silent --show-error --retry 3 --output "$dest.partial" "$url"
-  actual="$(digest "$dest.partial")"
-  if [ "$actual" != "$expected" ]; then rm -f "$dest.partial"; echo "$url has SHA-256 $actual, expected $expected" >&2; exit 1; fi
-  mv "$dest.partial" "$dest"
+  partial="$dest.partial.$$"
+  curl --fail --location --silent --show-error --retry 3 --output "$partial" "$url" || { rm -f "$partial"; exit 1; }
+  actual="$(digest "$partial")"
+  if [ "$actual" != "$expected" ]; then rm -f "$partial"; echo "$url has SHA-256 $actual, expected $expected" >&2; exit 1; fi
+  mv "$partial" "$dest"
   echo "$dest"
 }
-fetch "${CACTUS_MIRAGE_WEIGHTS:-target/models/mirage.cact}" \
+# Weights live in ~/.cache/cactus/models/<checksum prefix>/, a cache other
+# Cactus tools share, so they download once; target/models links to them.
+model() {
+  override="$1" name="$2" url="$3" expected="$4"
+  if [ -n "$override" ]; then fetch "$override" "$url" "$expected"; return; fi
+  cached="$HOME/.cache/cactus/models/$(printf %.16s "$expected")/$name"
+  old="target/models/$name"
+  # A copy from before the shared cache moves there instead of downloading.
+  if [ ! -f "$cached" ] && [ -f "$old" ] && [ ! -L "$old" ] && [ "$(digest "$old")" = "$expected" ]; then
+    mkdir -p "$(dirname "$cached")"
+    mv "$old" "$cached"
+  fi
+  fetch "$cached" "$url" "$expected" >/dev/null
+  # Other tools reuse the file when the marker holds both checksums.
+  printf '%s\n%s\n' "$expected" "$expected" >"$cached.sha256.$$"
+  if cmp -s "$cached.sha256.$$" "$cached.sha256"; then
+    rm -f "$cached.sha256.$$"
+  else
+    mv "$cached.sha256.$$" "$cached.sha256"
+  fi
+  mkdir -p target/models
+  ln -sfn "$cached" "target/models/$name"
+  echo "target/models/$name"
+}
+model "${CACTUS_MIRAGE_WEIGHTS:-}" mirage.cact \
   https://huggingface.co/Cactus-Compute/mirage/resolve/76c1e9e53381aca8fc3843c636216c96ff220122/mirage.cact \
   4249a0f7515272ff76b9414bec17d7e7daf84b15b66c7fb4f17fce1e66f9f237
-fetch "${CACTUS_WHISTLE_WEIGHTS:-target/models/whistle.cact}" \
+model "${CACTUS_WHISTLE_WEIGHTS:-}" whistle.cact \
   https://huggingface.co/Cactus-Compute/whistle/resolve/741118687e1f008f06d1351a402a731274789790/whistle.cact \
   b6e02f048568ac5d01a2042556c658061e699acbc0aa2a1439f52f3d461dffeb
 # The public-domain Apollo 13 "Houston, we've had a problem" exchange, 30 s.
