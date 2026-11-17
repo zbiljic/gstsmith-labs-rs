@@ -1,6 +1,8 @@
 //! Real-engine tests, off the default gate. They need the pinned Mirage
-//! weights: `mise run cactus:smoke`, or set `CACTUS_MIRAGE_WEIGHTS` and run
-//! `cargo test -p cactus --test engine -- --ignored --test-threads=1`.
+//! weights, and the thread test the Whistle weights too: `mise run
+//! cactus:smoke`, or set `CACTUS_MIRAGE_WEIGHTS` and `CACTUS_WHISTLE_WEIGHTS`
+//! and run `cargo test -p cactus --test engine -- --ignored
+//! --test-threads=1`.
 
 #![expect(
     clippy::expect_used,
@@ -10,12 +12,15 @@
 
 use std::time::Instant;
 
-use cactus::{Engine, Error, PackedRgb, Request};
+use cactus::{Engine, Error, PackedRgb, Request, Threads};
+
+fn read(variable: &str) -> Vec<u8> {
+    let path = std::env::var(variable).unwrap_or_else(|_err| panic!("{variable} is not set"));
+    std::fs::read(&path).unwrap_or_else(|err| panic!("reading {path}: {err}"))
+}
 
 fn weights() -> Vec<u8> {
-    let path =
-        std::env::var("CACTUS_MIRAGE_WEIGHTS").expect("CACTUS_MIRAGE_WEIGHTS names mirage.cact");
-    std::fs::read(&path).unwrap_or_else(|err| panic!("reading {path}: {err}"))
+    read("CACTUS_MIRAGE_WEIGHTS")
 }
 
 /// A 160x120 frame: a bright square on a dark gradient.
@@ -38,7 +43,7 @@ fn image() -> Vec<u8> {
 
 fn loaded_on(name: &str) -> Engine {
     let mut engine = Engine::lock(name).expect("engine");
-    engine.load_vision(&weights()).expect("Mirage loads");
+    engine.load_vision(&weights(), 0).expect("Mirage loads");
     engine
 }
 
@@ -80,7 +85,7 @@ fn describes_an_image() {
 fn other_vision_weights_cannot_replace_loaded_ones() {
     let mut engine = loaded();
     engine
-        .load_vision(&weights())
+        .load_vision(&weights(), 0)
         .expect("the same weights load again");
     assert_eq!(
         engine.vision_weights(),
@@ -91,19 +96,61 @@ fn other_vision_weights_cannot_replace_loaded_ones() {
     if let Some(last) = other.last_mut() {
         *last ^= 0xff;
     }
-    let error = engine.load_vision(&other).expect_err("other weights");
+    let error = engine.load_vision(&other, 0).expect_err("other weights");
     assert!(matches!(error, Error::ModelInUse { .. }), "{error}");
 }
 
+/// The threads of this process, as the OS counts them.
+#[cfg(target_os = "linux")]
+fn process_threads() -> i64 {
+    let tasks = std::fs::read_dir("/proc/self/task").expect("task list");
+    i64::try_from(tasks.count()).expect("thread count")
+}
+
+/// The threads of this process, as the OS counts them.
+#[cfg(not(target_os = "linux"))]
+fn process_threads() -> i64 {
+    let ps = std::process::Command::new("ps")
+        .args(["-M", &std::process::id().to_string()])
+        .output()
+        .expect("ps");
+    let lines = String::from_utf8_lossy(&ps.stdout).lines().count();
+    i64::try_from(lines).expect("thread count") - 1
+}
+
+/// The threads a load on engine `name` adds to the process. Counts are
+/// for the whole process, so other tests must not run at the same time
+/// (`--test-threads=1`).
+fn new_threads(name: &str, load: impl FnOnce(&mut Engine) -> cactus::Result<Threads>) -> i64 {
+    let mut engine = Engine::lock(name).expect("engine");
+    let before = process_threads();
+    load(&mut engine).expect("weights load");
+    process_threads() - before
+}
+
 #[test]
-#[ignore = "needs the Mirage weights"]
-fn threads_after_loading_are_too_late() {
-    // No other test sets threads, so the first explicit value comes after
-    // Mirage is loaded and has no effect.
-    let mut engine = loaded();
+#[ignore = "needs the Mirage and Whistle weights"]
+fn each_model_keeps_the_threads_it_was_loaded_with() {
+    let (vision, speech) = (weights(), read("CACTUS_WHISTLE_WEIGHTS"));
+    // A model at n threads adds n - 1 workers, whatever the CPU count.
+    let two = new_threads("threads-2", |engine| engine.load_vision(&vision, 2));
+    // 13 is above every engine default, so the reset below is visible.
+    let many = new_threads("threads-13", |engine| engine.load_vision(&vision, 13));
+    assert_eq!(many - two, 11, "{two} and {many} new threads");
+    // 0 after an explicit count is the engine's choice again, and the
+    // second model on an engine gets its own threads.
+    let default = new_threads("threads-0", |engine| engine.load_speech(&speech, 0));
+    let after_many = new_threads("threads-13", |engine| engine.load_speech(&speech, 0));
+    assert_eq!(after_many, default, "speech at 0 after vision at 13");
+    let mut engine = Engine::lock("threads-2").expect("engine");
+    assert_eq!(engine.load_vision(&vision, 0), Ok(Threads::Applied(2)));
+    assert_eq!(engine.load_vision(&vision, 2), Ok(Threads::Applied(2)));
     assert_eq!(
-        engine.set_threads(3),
-        cactus::Threads::TooLate { requested: 3 }
+        engine.load_vision(&vision, 3),
+        Ok(Threads::Kept {
+            requested: 3,
+            current: 2
+        })
     );
 }
 

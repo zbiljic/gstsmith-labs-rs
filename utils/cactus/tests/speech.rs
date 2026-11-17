@@ -51,7 +51,7 @@ fn loaded() -> Engine {
 
 fn loaded_on(name: &str) -> Engine {
     let mut engine = Engine::lock(name).expect("engine");
-    engine.load_speech(&weights()).expect("Whistle loads");
+    engine.load_speech(&weights(), 0).expect("Whistle loads");
     engine
 }
 
@@ -152,7 +152,7 @@ fn reports_an_unknown_language_and_refuses_other_weights() {
     if let Some(last) = other.last_mut() {
         *last ^= 0xff;
     }
-    let error = engine.load_speech(&other).expect_err("other weights");
+    let error = engine.load_speech(&other, 0).expect_err("other weights");
     assert!(matches!(error, Error::ModelInUse { .. }), "{error}");
 }
 

@@ -43,11 +43,14 @@ through [`cactus-sys`](../cactus-sys/).
   can run between steps without disturbing the stream. Stream calls are
   never retried on an output overflow, because a retry would feed the
   audio again; the buffer is sized for the step first.
-- **Threads.** `set_threads(0)` keeps the engine default and never calls the
-  engine. The first explicit value wins for the engine and applies only to
-  models loaded afterwards: set threads before loading weights. A later
-  different value returns `Threads::Ignored`, a first value after a model
-  is loaded `Threads::TooLate`.
+- **Threads.** `load_vision` and `load_speech` take the threads the model
+  runs with, counting the calling thread (`n` adds `n - 1` workers), up to
+  `MAX_THREADS`; `0` is the engine's choice (on macOS the CPU count up to
+  4; on Linux the usable CPUs up to 12, or the fast cores up to 4 where
+  cores differ). The engine gives each model its own threads when it
+  loads the model and never resizes them, so loading the same weights
+  again with a different explicit count returns `Threads::Kept` with the
+  count they keep.
 
 ## Tests
 

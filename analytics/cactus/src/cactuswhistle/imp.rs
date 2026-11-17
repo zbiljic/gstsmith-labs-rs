@@ -441,13 +441,13 @@ impl ObjectImpl for CactusWhistle {
                     .build(),
                 glib::ParamSpecString::builder("engine")
                     .nick("Engine")
-                    .blurb("Cactus engine to run on. Elements naming the same engine share it and take turns; each name is a separate engine, with its own models, speech stream and threads, that runs at the same time as the others. Unset is the default engine")
+                    .blurb("Cactus engine to run on. Elements naming the same engine share it and take turns; each name is a separate engine, with its own models and speech stream, that runs at the same time as the others. Unset is the default engine")
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecUInt::builder("threads")
                     .nick("Threads")
-                    .blurb("Threads of this element's engine: the first explicit value before the engine loads weights wins; 0 keeps the engine default")
-                    .maximum(256)
+                    .blurb("Threads of the model this element loads, fixed for the life of the process; 0 is the engine's choice (up to 4 on macOS, up to 12 on Linux)")
+                    .maximum(cactus::MAX_THREADS)
                     .mutable_ready()
                     .build(),
                 milliseconds(
@@ -666,20 +666,20 @@ impl CactusWhistle {
                 settings.threads,
             )
             .map_err(|err| gst::error_msg!(gst::LibraryError::Init, ["{path}: {err}"]))?;
-        match threads {
-            cactus::Threads::Ignored { requested, current } => gst::warning!(
+        if let cactus::Threads::Kept { requested, current } = threads {
+            gst::warning!(
                 CAT,
                 imp = self,
-                "threads={requested} is ignored: the engine already runs with {current}"
-            ),
-            cactus::Threads::TooLate { requested } => gst::warning!(
-                CAT,
-                imp = self,
-                "threads={requested} is ignored: weights were loaded before it was set"
-            ),
-            cactus::Threads::EngineDefault | cactus::Threads::Applied(_) => {}
+                "threads={requested} is ignored: this engine already runs these weights with {}",
+                crate::thread_count(current)
+            );
         }
-        gst::info!(CAT, imp = self, "loaded Whistle weights {sha}");
+        gst::info!(
+            CAT,
+            imp = self,
+            "loaded Whistle weights {sha} with {}",
+            crate::thread_count(threads.count())
+        );
         let request = match request {
             Some(request) => request,
             None => self.request(&settings, &weights).map_err(invalid)?,

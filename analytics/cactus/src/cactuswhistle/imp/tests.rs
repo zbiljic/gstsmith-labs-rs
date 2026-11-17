@@ -111,7 +111,7 @@ impl Transcriber for Fake {
         if weights.is_empty() {
             return Err("empty weights".to_owned());
         }
-        Ok(("fake-sha".to_owned(), cactus::Threads::EngineDefault))
+        Ok(("fake-sha".to_owned(), cactus::Threads::Applied(0)))
     }
 
     fn transcribe(&mut self, pcm: &[f32], _request: &Request) -> Result<String, String> {

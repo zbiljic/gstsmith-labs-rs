@@ -8,6 +8,15 @@ use gst::glib;
 mod cactusmirage;
 mod cactuswhistle;
 
+/// A model's thread count for logs; `0` is the engine's choice.
+fn thread_count(count: u32) -> String {
+    if count == 0 {
+        "the engine's default threads".to_owned()
+    } else {
+        format!("threads={count}")
+    }
+}
+
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     cactusmirage::register(plugin)?;
     cactuswhistle::register(plugin)

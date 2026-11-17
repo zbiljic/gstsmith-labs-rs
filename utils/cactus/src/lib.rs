@@ -123,18 +123,51 @@ impl Models {
     }
 }
 
-/// What `set_threads` did. The setting belongs to the engine and applies
-/// only to models loaded afterwards, so set threads before loading weights.
+/// The most threads a model can be loaded with. The engine creates them
+/// all and cannot report a failure to create them, so larger requests are
+/// clamped.
+pub const MAX_THREADS: u32 = 256;
+
+/// The threads a loaded model runs with, counting the thread that calls
+/// the engine: `n` adds `n - 1` workers. The engine gives each model its
+/// own threads when it loads the model and never resizes them. `0` is the
+/// engine's choice: on macOS the CPU count up to 4; on Linux the usable
+/// CPUs up to 12, or the fast cores up to 4 where cores differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Threads {
-    /// 0 requested: the engine keeps its own choice.
-    EngineDefault,
-    /// The value was applied, or was already in effect.
+    /// The model runs with this count. A request of `0` for weights that
+    /// are already loaded takes whatever they were loaded with.
     Applied(u32),
-    /// Another explicit value came first and stays in effect.
-    Ignored { requested: u32, current: u32 },
-    /// A model is already loaded and keeps the engine default.
-    TooLate { requested: u32 },
+    /// These weights were already loaded with `current`, which they keep.
+    Kept { requested: u32, current: u32 },
+}
+
+impl Threads {
+    /// What already-loaded weights with `current` threads give a request
+    /// for `requested`.
+    fn reuse(current: u32, requested: u32) -> Self {
+        if requested == 0 || requested == current {
+            Self::Applied(current)
+        } else {
+            Self::Kept { requested, current }
+        }
+    }
+
+    /// The count the model runs with; `0` is the engine's choice.
+    #[must_use]
+    pub fn count(self) -> u32 {
+        match self {
+            Self::Applied(count) | Self::Kept { current: count, .. } => count,
+        }
+    }
+}
+
+/// A model in one of the engine's slots.
+struct Loaded {
+    /// The SHA-256 (hex) of its weights.
+    identity: String,
+    /// The threads it was loaded with; `0` is the engine default.
+    threads: u32,
 }
 
 /// A tightly packed RGB24 image: `width * height * 3` bytes, no row padding.
@@ -222,9 +255,8 @@ struct Stream {
 }
 
 struct State {
-    vision: Option<String>,
-    speech: Option<String>,
-    threads: Option<u32>,
+    vision: Option<Loaded>,
+    speech: Option<Loaded>,
     stream: Option<Stream>,
     streams: u64,
     output: Vec<u8>,
@@ -277,7 +309,6 @@ impl Instance {
             state: Mutex::new(State {
                 vision: None,
                 speech: None,
-                threads: None,
                 stream: None,
                 streams: 0,
                 output: Vec::new(),
@@ -404,13 +435,19 @@ impl Engine {
     /// The SHA-256 (hex) of the loaded vision weights.
     #[must_use]
     pub fn vision_weights(&self) -> Option<&str> {
-        self.state.vision.as_deref()
+        self.state
+            .vision
+            .as_ref()
+            .map(|loaded| loaded.identity.as_str())
     }
 
     /// The SHA-256 (hex) of the loaded speech weights.
     #[must_use]
     pub fn speech_weights(&self) -> Option<&str> {
-        self.state.speech.as_deref()
+        self.state
+            .speech
+            .as_ref()
+            .map(|loaded| loaded.identity.as_str())
     }
 
     /// The last engine error. Read it right after a failing call.
@@ -428,48 +465,23 @@ impl Engine {
             .to_owned()
     }
 
-    /// Sets the engine thread count. `0` leaves the engine default and never
-    /// calls the engine; the first explicit value wins for the engine, and
-    /// only before any model is loaded. Values above `i32::MAX` are clamped.
-    pub fn set_threads(&mut self, threads: u32) -> Threads {
-        if threads == 0 {
-            return Threads::EngineDefault;
-        }
-        let threads = threads.min(u32::try_from(c_int::MAX).unwrap_or(u32::MAX));
-        if self.state.threads.is_none() && self.models() != Models::default() {
-            return Threads::TooLate { requested: threads };
-        }
-        match self.state.threads {
-            Some(current) if current == threads => Threads::Applied(threads),
-            Some(current) => Threads::Ignored {
-                requested: threads,
-                current,
-            },
-            None => {
-                let value = c_int::try_from(threads).unwrap_or(c_int::MAX);
-                // SAFETY: a plain setter; the guard serializes engine calls.
-                unsafe { (self.api().cactus_set_threads)(value) };
-                self.state.threads = Some(threads);
-                Threads::Applied(threads)
-            }
-        }
-    }
-
-    /// Loads vision weights, identified by their SHA-256. Loading the same
-    /// bytes again does nothing. Different vision weights are refused by
-    /// this engine for the life of the process: it has one vision slot and no unload,
-    /// and another caller may be using the loaded model.
-    pub fn load_vision(&mut self, weights: &[u8]) -> Result<()> {
-        self.load(Kind::Vision, weights)
+    /// Loads vision weights, identified by their SHA-256, to run with
+    /// `threads` (see [`Threads`]; values above [`MAX_THREADS`] are
+    /// clamped). Loading the same bytes again does nothing, and they keep the
+    /// threads they were loaded with. Different vision weights are refused by
+    /// this engine for the life of the process: it has one vision slot and no
+    /// unload, and another caller may be using the loaded model.
+    pub fn load_vision(&mut self, weights: &[u8], threads: u32) -> Result<Threads> {
+        self.load(Kind::Vision, weights, threads)
     }
 
     /// Loads speech weights, with the same rules as [`Self::load_vision`]
-    /// for the engine's one speech slot.
-    pub fn load_speech(&mut self, weights: &[u8]) -> Result<()> {
-        self.load(Kind::Speech, weights)
+    /// for the engine's one speech slot. Each model has its own threads.
+    pub fn load_speech(&mut self, weights: &[u8], threads: u32) -> Result<Threads> {
+        self.load(Kind::Speech, weights, threads)
     }
 
-    fn load(&mut self, kind: Kind, weights: &[u8]) -> Result<()> {
+    fn load(&mut self, kind: Kind, weights: &[u8], threads: u32) -> Result<Threads> {
         match weights::kind(weights) {
             Some(found) if found == kind => {}
             Some(other) => {
@@ -497,13 +509,16 @@ impl Engine {
                 return Err(Error::Weights("text models are not supported".to_owned()));
             }
         };
-        match slot.as_deref() {
-            Some(loaded) if loaded == identity => return Ok(()),
+        let threads = threads.min(MAX_THREADS);
+        match slot {
+            Some(loaded) if loaded.identity == identity => {
+                return Ok(Threads::reuse(loaded.threads, threads));
+            }
             Some(loaded) => {
                 return Err(Error::ModelInUse {
                     engine: self.instance.name.clone(),
                     kind,
-                    loaded: loaded.to_owned(),
+                    loaded: loaded.identity.clone(),
                     requested: identity,
                 });
             }
@@ -511,9 +526,15 @@ impl Engine {
         }
         let len = u64::try_from(weights.len())
             .map_err(|_err| Error::Input("weights are too large".to_owned()))?;
+        let api = *self.api();
+        // The engine sizes the model's threads from this setting while it
+        // loads, and keeps the setting for later loads, so it is set (or
+        // reset to the default with 0) before every load.
+        // SAFETY: a plain setter; the guard serializes engine calls.
+        unsafe { (api.cactus_set_threads)(c_int::try_from(threads).unwrap_or(0)) };
         // SAFETY: the engine reads `len` bytes from `weights`, which stay
         // borrowed for the call, and copies them; the guard serializes calls.
-        let code = unsafe { (self.api().cactus_load)(weights.as_ptr(), len) };
+        let code = unsafe { (api.cactus_load)(weights.as_ptr(), len) };
         if code < 0 {
             return Err(Error::Engine {
                 operation: "load",
@@ -533,8 +554,8 @@ impl Engine {
                 "the engine did not load the weights as a {kind} model"
             )));
         }
-        *slot = Some(identity);
-        Ok(())
+        *slot = Some(Loaded { identity, threads });
+        Ok(Threads::Applied(threads))
     }
 
     /// Describes an image. The output buffer starts at [`INITIAL_OUTPUT`]
@@ -880,12 +901,12 @@ mod tests {
         let mut engine = Engine::lock("test-vision").expect("engine");
         let speech = weights::tests::archive(13, 3246.0);
         assert!(matches!(
-            engine.load_vision(&speech),
+            engine.load_vision(&speech, 0),
             Err(Error::Weights(_))
         ));
         let mut old = weights::tests::archive(36, 4721.0);
         old[0..4].copy_from_slice(&0x05e1_2a83u32.to_le_bytes());
-        let error = engine.load_vision(&old).expect_err("old generation");
+        let error = engine.load_vision(&old, 0).expect_err("old generation");
         assert!(
             error.to_string().contains("another engine generation"),
             "{error}"
@@ -903,7 +924,7 @@ mod tests {
     fn the_engine_refuses_non_speech_weights_and_transcribes_nothing_without_them() {
         let mut engine = Engine::lock("test-speech").expect("engine");
         let vision = weights::tests::archive(36, 4721.0);
-        let error = engine.load_speech(&vision).expect_err("vision weights");
+        let error = engine.load_speech(&vision, 0).expect_err("vision weights");
         assert_eq!(
             error.to_string(),
             "these are vision weights, not speech weights"
@@ -936,19 +957,20 @@ mod tests {
     }
 
     #[test]
-    fn the_first_explicit_thread_count_wins() {
-        let mut engine = Engine::lock("test-threads").expect("engine");
-        assert_eq!(engine.set_threads(0), Threads::EngineDefault);
-        assert_eq!(engine.set_threads(4), Threads::Applied(4));
-        assert_eq!(engine.set_threads(4), Threads::Applied(4));
+    fn loaded_weights_keep_their_threads() {
+        assert_eq!(Threads::reuse(3, 0), Threads::Applied(3));
+        assert_eq!(Threads::reuse(3, 3), Threads::Applied(3));
+        assert_eq!(Threads::reuse(0, 0), Threads::Applied(0));
+        let kept = Threads::reuse(0, 2);
         assert_eq!(
-            engine.set_threads(2),
-            Threads::Ignored {
+            kept,
+            Threads::Kept {
                 requested: 2,
-                current: 4
+                current: 0
             }
         );
-        assert_eq!(engine.set_threads(0), Threads::EngineDefault);
+        assert_eq!(kept.count(), 0);
+        assert_eq!(Threads::reuse(4, 2).count(), 4);
     }
 
     #[test]

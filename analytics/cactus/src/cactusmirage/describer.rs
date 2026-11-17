@@ -4,8 +4,8 @@ use super::settings::Request;
 
 /// Loads weights and describes packed RGB images.
 pub trait Describer: Send {
-    /// Sets threads on the named engine, then loads the weights there.
-    /// Returns their SHA-256 and what happened to the thread setting.
+    /// Loads the weights on the named engine to run with `threads`.
+    /// Returns their SHA-256 and the threads the model runs with.
     fn start(
         &mut self,
         engine: &str,
@@ -43,8 +43,9 @@ impl Describer for Engine {
     ) -> Result<(String, cactus::Threads), String> {
         engine.clone_into(&mut self.name);
         let mut engine = self.lock()?;
-        let threads = engine.set_threads(threads);
-        engine.load_vision(weights).map_err(|err| err.to_string())?;
+        let threads = engine
+            .load_vision(weights, threads)
+            .map_err(|err| err.to_string())?;
         Ok((cactus::sha256_hex(weights), threads))
     }
 

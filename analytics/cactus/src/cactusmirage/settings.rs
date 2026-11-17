@@ -86,7 +86,7 @@ pub enum JsonOutput {
 }
 
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 128 * 1024 * 1024;
-pub const MAX_THREADS: u32 = 256;
+pub const MAX_THREADS: u32 = cactus::MAX_THREADS;
 
 /// Options that have their own property, which `extra-options` may not set.
 const OWNED_KEYS: &[&str] = &[

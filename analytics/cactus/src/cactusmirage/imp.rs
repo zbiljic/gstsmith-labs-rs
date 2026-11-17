@@ -518,12 +518,12 @@ impl ObjectImpl for CactusMirage {
                     .build(),
                 glib::ParamSpecString::builder("engine")
                     .nick("Engine")
-                    .blurb("Cactus engine to run on. Elements naming the same engine share it and take turns; each name is a separate engine, with its own models, speech stream and threads, that runs at the same time as the others. Unset is the default engine")
+                    .blurb("Cactus engine to run on. Elements naming the same engine share it and take turns; each name is a separate engine, with its own models and speech stream, that runs at the same time as the others. Unset is the default engine")
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecUInt::builder("threads")
                     .nick("Threads")
-                    .blurb("Threads of this element's engine: the first explicit value before the engine loads weights wins; 0 keeps the engine default")
+                    .blurb("Threads of the model this element loads, fixed for the life of the process; 0 is the engine's choice (up to 4 on macOS, up to 12 on Linux)")
                     .maximum(MAX_THREADS)
                     .default_value(0)
                     .mutable_ready()
@@ -663,18 +663,13 @@ impl BaseTransformImpl for CactusMirage {
             )
             .map_err(|err| gst::error_msg!(gst::LibraryError::Init, ["{path}: {err}"]))?;
         drop(weights);
-        match threads {
-            cactus::Threads::Ignored { requested, current } => gst::warning!(
+        if let cactus::Threads::Kept { requested, current } = threads {
+            gst::warning!(
                 CAT,
                 imp = self,
-                "threads={requested} is ignored: the engine already runs with {current}"
-            ),
-            cactus::Threads::TooLate { requested } => gst::warning!(
-                CAT,
-                imp = self,
-                "threads={requested} is ignored: weights were loaded before it was set"
-            ),
-            cactus::Threads::EngineDefault | cactus::Threads::Applied(_) => {}
+                "threads={requested} is ignored: this engine already runs these weights with {}",
+                crate::thread_count(current)
+            );
         }
         // A dry run turns bad options, a bad language or a malformed form
         // into a state-change error instead of silently empty frames.
@@ -686,7 +681,8 @@ impl BaseTransformImpl for CactusMirage {
         gst::info!(
             CAT,
             imp = self,
-            "loaded {path} (SHA-256 {sha}); options checked in {:?}",
+            "loaded {path} (SHA-256 {sha}) with {}; options checked in {:?}",
+            crate::thread_count(threads.count()),
             started.elapsed()
         );
         match settings.mode {
@@ -867,7 +863,7 @@ mod tests {
             if weights.is_empty() {
                 return Err("empty weights".to_owned());
             }
-            Ok(("fake-sha".to_owned(), cactus::Threads::EngineDefault))
+            Ok(("fake-sha".to_owned(), cactus::Threads::Applied(0)))
         }
 
         #[expect(

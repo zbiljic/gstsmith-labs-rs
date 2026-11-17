@@ -37,13 +37,21 @@ default engine.
   300 ms `describe` delays a transcription on the same engine by 300 ms.
 - **One stream per engine.** Only one `cactuswhistle` per engine can use
   `mode=stream` at a time; the default `mode=windows` has no such limit.
-- **Threads are per engine.** The first explicit `threads` before the
-  engine loads weights wins; later values are ignored with a warning.
-  Engines running at once share the CPU, so keep their threads together
-  within the performance cores. Measured on one machine with eight
-  performance cores: two engines at the default threads described 1.6
-  times as many frames as one; three at the default threads described
-  fewer than one; four at `threads=2` described twice as many.
+- **Threads are per model.** Each model gets its own threads when its
+  engine loads it: `threads` of the element that loads it, or at `0` the
+  engine's choice (on macOS the CPU count up to 4; on Linux the usable
+  CPUs up to 12, or the fast cores up to 4 where cores differ). A
+  `cactusmirage` and a `cactuswhistle` on one engine can have different
+  counts. Elements that share loaded weights share their threads: a
+  different explicit `threads` is ignored with a warning. A model's
+  threads wait while another model on its engine runs, so only engines
+  running at once share the CPU; keep their threads together within the
+  performance cores. Measured on a Mac with eight performance cores: two
+  engines at the default threads described 1.6 times as many frames as
+  one; three at the default threads described fewer than one; four at
+  `threads=2` described twice as many. On Linux the engine pins every
+  model's worker threads to the same lowest-numbered cores, so engines
+  running at once may scale differently there.
 
 ```sh
 # Two cameras described at the same time, speech on the default engine
@@ -164,7 +172,7 @@ build): about 1.5 KB with `json-output=none`, 5.3 KB with `frame`, 6 KB with
 | `max-frame-bytes` | 128 MiB | covers 8K UHD (99.5 MB packed) |
 | `json-output` | `full` | `full`, `frame`, `none` |
 | `engine` | unset (default engine) | engine name, see [Engines](#engines) |
-| `threads` | 0 (engine default) | per engine, see [Engines](#engines) |
+| `threads` | 0 (engine default) | per model, see [Engines](#engines) |
 
 All properties can change only in the NULL and READY states.
 
@@ -289,7 +297,7 @@ These are single runs on one recording, not benchmarks.
 | `max-word-rate` | 10 | words per second above which a cue of two or more words is dropped; 0 keeps every cue |
 | `latency` | 0 (automatic) | ms added to LATENCY queries, as in `whispertranscriber` (`cactusmirage` uses ns) |
 | `engine` | unset (default engine) | engine name, see [Engines](#engines) |
-| `threads` | 0 (engine default) | per engine, see [Engines](#engines) |
+| `threads` | 0 (engine default) | per model, see [Engines](#engines) |
 
 All properties can change only in the NULL and READY states.
 
