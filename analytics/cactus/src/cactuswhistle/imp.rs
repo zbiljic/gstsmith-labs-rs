@@ -37,8 +37,6 @@ const STREAM_SETTLE_MS: i64 = 1000;
 /// The largest window part a property can ask for. Whistle transcribes up
 /// to 30 seconds in one pass.
 const MAX_WINDOW_MS: u32 = 30_000;
-/// Codes Whistle can be told to expect.
-const LANGUAGES: [&str; 7] = ["en", "de", "fr", "es", "it", "nl", "pl"];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, glib::Enum)]
 #[repr(u32)]
@@ -107,6 +105,26 @@ fn primary_language(tag: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// The code of `languages` that `tag` names, in the weights' spelling:
+/// the tag itself, ignoring ASCII case and `-` against `_`, or else its
+/// primary language.
+fn resolve_language(tag: &str, languages: &[impl AsRef<str>]) -> Result<String, String> {
+    let normal = |code: &str| code.trim().to_ascii_lowercase().replace('_', "-");
+    let find = |code: &str| {
+        languages
+            .iter()
+            .map(AsRef::as_ref)
+            .find(|language| normal(language) == code)
+    };
+    find(&normal(tag))
+        .or_else(|| find(&primary_language(tag)))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            let languages: Vec<_> = languages.iter().map(AsRef::as_ref).collect();
+            format!("language {tag} is not one of {}", languages.join(", "))
+        })
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -173,31 +191,27 @@ impl Settings {
         .with_agreement_ms(i64::from(self.agreement))
     }
 
-    /// Checks the settings and makes the request every window sends.
-    fn request(&self) -> Result<Request, String> {
-        let tag = self
+    /// Checks the settings that need no weights.
+    fn check(&self) -> Result<(), String> {
+        match self.mode {
+            Mode::Windows if self.live() && self.holdback >= self.chunk_duration => {
+                Err("holdback must be shorter than chunk-duration".to_owned())
+            }
+            Mode::Stream if !self.live() => Err("mode=stream needs a chunk-duration".to_owned()),
+            Mode::Windows | Mode::Stream => Ok(()),
+        }
+    }
+
+    /// Makes the request every window sends, with the language among the
+    /// `languages` of the weights.
+    fn request(&self, languages: &[impl AsRef<str>]) -> Result<Request, String> {
+        let language = self
             .language
             .as_deref()
             .map(str::trim)
-            .filter(|tag| !tag.is_empty());
-        let language = tag.map(primary_language);
-        if let (Some(tag), Some(language)) = (tag, &language)
-            && !LANGUAGES.contains(&language.as_str())
-        {
-            return Err(format!(
-                "language {tag} is not one of {}",
-                LANGUAGES.join(", ")
-            ));
-        }
-        match self.mode {
-            Mode::Windows if self.live() && self.holdback >= self.chunk_duration => {
-                return Err("holdback must be shorter than chunk-duration".to_owned());
-            }
-            Mode::Stream if !self.live() => {
-                return Err("mode=stream needs a chunk-duration".to_owned());
-            }
-            Mode::Windows | Mode::Stream => {}
-        }
+            .filter(|tag| !tag.is_empty())
+            .map(|tag| resolve_language(tag, languages))
+            .transpose()?;
         let keywords = self.keywords.as_deref().map(|keywords| {
             keywords
                 .split(',')
@@ -412,7 +426,7 @@ impl ObjectImpl for CactusWhistle {
                     .build(),
                 glib::ParamSpecString::builder("language")
                     .nick("Language")
-                    .blurb("Spoken language: en, de, fr, es, it, nl or pl, or a tag such as en-US; empty detects it in each window")
+                    .blurb("Spoken language: one the weights list (en, de, fr, es, it, nl or pl for the published ones), or a tag such as en-US; empty detects it in each window")
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecString::builder("language-code")
@@ -610,17 +624,40 @@ impl CactusWhistle {
         Box::<transcriber::Engine>::default()
     }
 
+    /// The request for `settings`, with the language among those `weights`
+    /// list, or the published ones when they list none.
+    fn request(&self, settings: &Settings, weights: &[u8]) -> Result<Request, String> {
+        if let Some(languages) = cactus::weights::speech_languages(weights) {
+            gst::debug!(CAT, imp = self, "the weights list {}", languages.join(", "));
+            settings.request(&languages)
+        } else {
+            gst::debug!(
+                CAT,
+                imp = self,
+                "the weights list no languages; using the published ones"
+            );
+            settings.request(&cactus::weights::DEFAULT_SPEECH_LANGUAGES)
+        }
+    }
+
     fn start(&self) -> Result<(), gst::ErrorMessage> {
         let settings = lock(&self.settings).clone();
-        let request = settings
-            .request()
-            .map_err(|err| gst::error_msg!(gst::LibraryError::Settings, ["{err}"]))?;
+        let invalid = |err| gst::error_msg!(gst::LibraryError::Settings, ["{err}"]);
+        settings.check().map_err(invalid)?;
         let path = settings.model_file.clone().ok_or_else(|| {
             gst::error_msg!(gst::ResourceError::NotFound, ["model-file is required"])
         })?;
         let weights = std::fs::read(&path).map_err(|err| {
             gst::error_msg!(gst::ResourceError::OpenRead, ["reading {path}: {err}"])
         })?;
+        // Speech weights are checked before the engine loads them. Weights of
+        // another kind reach the engine first, which refuses them by kind
+        // rather than by the languages their tokenizer lists.
+        let early = cactus::weights::kind(&weights) == Some(cactus::Kind::Speech);
+        let request = early
+            .then(|| self.request(&settings, &weights))
+            .transpose()
+            .map_err(invalid)?;
         let mut transcriber = self.new_transcriber();
         let (sha, threads) = transcriber
             .start(
@@ -643,6 +680,10 @@ impl CactusWhistle {
             cactus::Threads::EngineDefault | cactus::Threads::Applied(_) => {}
         }
         gst::info!(CAT, imp = self, "loaded Whistle weights {sha}");
+        let request = match request {
+            Some(request) => request,
+            None => self.request(&settings, &weights).map_err(invalid)?,
+        };
         if settings.mode == Mode::Stream {
             transcriber
                 .open_stream()

@@ -13,12 +13,15 @@ through [`cactus-sys`](../cactus-sys/).
   different names run at the same time. A panic during a turn ends it.
   Engines are never unloaded.
 - **Weights.** `load_vision` and `load_speech` classify the `.cact`
-  archive first (the vision or audio manifest after `final_norm`, as
-  `cactus-go` does) and fail clearly on weights of another kind and on
+  archive first (by the vision or audio manifest after `final_norm`) and
+  fail clearly on weights of another kind and on
   weights from another engine generation. Weights are identified by their
   SHA-256. Loading the same bytes again does nothing; different weights of
   a kind are refused by that engine for the life of the process, because
   an engine has one slot per kind and no unload.
+  `weights::speech_languages` reads the language codes speech weights
+  accept from their tokenizer, as upstream does;
+  `weights::DEFAULT_SPEECH_LANGUAGES` are those of the published weights.
 - **`describe`.** Takes a tightly packed RGB24 image and a request (options
   as a JSON object, empty meaning `{}`; language; newline-separated
   keywords) and returns the engine's JSON unchanged with its token count.

@@ -127,6 +127,15 @@ fn silence_is_empty_and_short_calls_are_stateless() {
 
 #[test]
 #[ignore = "needs the Whistle weights"]
+fn the_published_weights_list_the_default_languages() {
+    assert_eq!(
+        cactus::weights::speech_languages(&weights()).expect("tokenizer languages"),
+        cactus::weights::DEFAULT_SPEECH_LANGUAGES
+    );
+}
+
+#[test]
+#[ignore = "needs the Whistle weights"]
 fn reports_an_unknown_language_and_refuses_other_weights() {
     let mut engine = loaded();
     let error = engine

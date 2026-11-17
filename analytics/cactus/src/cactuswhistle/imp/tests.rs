@@ -532,6 +532,32 @@ fn takes_language_tags_under_either_name() -> Result<()> {
 }
 
 #[test]
+fn takes_the_languages_the_weights_list() -> Result<()> {
+    let request = |languages: &[&str], tag: &str| {
+        Settings {
+            language: Some(tag.to_owned()),
+            ..Settings::default()
+        }
+        .request(languages)
+        .map(|request| request.language)
+        .map_err(anyhow::Error::msg)
+    };
+    let tuned = ["pt-BR", "pt", "en"];
+    ensure!(request(&tuned, "pt-BR")?.as_deref() == Some("pt-BR"));
+    ensure!(request(&tuned, "pt_br")?.as_deref() == Some("pt-BR"));
+    ensure!(request(&tuned, "pt-PT")?.as_deref() == Some("pt"));
+    ensure!(request(&tuned, "EN_gb")?.as_deref() == Some("en"));
+    ensure!(request(&tuned, " ")?.is_none());
+    ensure!(request(&["EN"], "en-US")?.as_deref() == Some("EN"));
+    let error = request(&tuned, "de").err().map(|err| err.to_string());
+    ensure!(
+        error.as_deref() == Some("language de is not one of pt-BR, pt, en"),
+        "{error:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn refuses_bad_settings_at_start() -> Result<()> {
     gst::init()?;
     for properties in [

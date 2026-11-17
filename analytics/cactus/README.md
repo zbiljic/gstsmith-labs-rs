@@ -184,9 +184,12 @@ All properties can change only in the NULL and READY states.
 Speech to text, with the pads of `whispertranscriber`: 16 kHz mono F32LE in
 (put `audioconvert ! audioresample` before it), `text/x-raw,format=utf8`
 cues out. Klass `Text/Audio/Filter`, long name `Transcriber`, rank none.
-Whistle understands English, German, French, Spanish, Italian, Dutch and
-Polish, and detects the language unless `language` is set; a tag such as
-`en-US` counts as its language.
+The published Whistle weights understand English, German, French, Spanish,
+Italian, Dutch and Polish; the element reads the list from the weights, so
+fine-tuned weights bring their own, and falls back to those seven when the
+weights list none. It detects the language unless `language` is set; a tag
+such as `en-US` counts as its language unless the weights list the tag
+itself (case and `-` or `_` do not matter).
 
 - **`mode=windows` (default): rolling windows.** Once `chunk-duration` of
   audio past the commit point has arrived, the element transcribes a window
@@ -276,7 +279,7 @@ These are single runs on one recording, not benchmarks.
 | --- | --- | --- |
 | `model-file` | unset (required) | Whistle `.cact` weights |
 | `mode` | `windows` | `windows` or `stream` |
-| `language` | empty (detect) | `en`, `de`, `fr`, `es`, `it`, `nl` or `pl`, or a tag such as `en-US` (read back as set) |
+| `language` | empty (detect) | a language the weights list (`en`, `de`, `fr`, `es`, `it`, `nl` or `pl` for the published ones), or a tag such as `en-US` (read back as set) |
 | `language-code` | empty (detect) | the same setting, under the name `transcriberbin` sets |
 | `keywords` | empty | comma-separated words to favour, such as names |
 | `chunk-duration` | 2000 | ms of new audio per window or stream step; 0 transcribes at EOS (`windows` only) |

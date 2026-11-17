@@ -1,13 +1,14 @@
 //! Classifies `.cact` archives before the engine loads one, because loading
-//! fills an engine's model slot for the life of the process.
+//! fills an engine's model slot for the life of the process, and reads the
+//! languages speech weights accept.
 //!
 //! A `.cact` archive (upstream `needle/model/export.py`) is a header of 48
 //! little-endian `u32` fields and one `f32`, a `f32` codebook, a directory of
 //! 44-byte tensor records, then the tensor data. The format tag does not say
 //! which kind of model follows; the record after `final_norm` does: a head
 //! manifest for text, an audio manifest for speech, a vision manifest for
-//! Mirage. This mirrors `weightsKind` in `cactus-go`, including its head
-//! code and audio manifest checks.
+//! Mirage. Head codes and the audio manifest's layout version and sample
+//! rate are checked too.
 
 /// The `.cact` generation tag of engine 4.x weights.
 pub const GENERATION_TAG: u32 = 0x05e1_2a84;
@@ -89,9 +90,9 @@ pub fn tag(blob: &[u8]) -> Option<u32> {
     u32_at(blob, 0)
 }
 
-/// Classifies an archive of engine 4.x weights; `None` for anything else.
-#[must_use]
-pub fn kind(blob: &[u8]) -> Option<Kind> {
+/// The offset and record count of the tensor directory of engine 4.x
+/// weights, when it fits in `blob`.
+fn tensor_directory(blob: &[u8]) -> Option<(u64, u64)> {
     if blob.len() < HEADER_SIZE || tag(blob)? != GENERATION_TAG {
         return None;
     }
@@ -99,14 +100,18 @@ pub fn kind(blob: &[u8]) -> Option<Kind> {
     let count = field(blob, TENSOR_COUNT)?;
     let directory =
         u64::try_from(HEADER_SIZE).ok()? + field(blob, CODEBOOK_SIZE)?.checked_mul(4)?;
+    let record_size = u64::try_from(RECORD_SIZE).ok()?;
+    (directory <= len && count <= (len - directory) / record_size).then_some((directory, count))
+}
+
+/// Classifies an archive of engine 4.x weights; `None` for anything else.
+#[must_use]
+pub fn kind(blob: &[u8]) -> Option<Kind> {
+    let (directory, count) = tensor_directory(blob)?;
+    let len = u64::try_from(blob.len()).ok()?;
     let (layers, sites) = (field(blob, LAYERS)?, field(blob, ENGRAM_SITES)?);
     let record_size = u64::try_from(RECORD_SIZE).ok()?;
-    if directory > len
-        || count > (len - directory) / record_size
-        || field(blob, MODEL_WIDTH)? == 0
-        || layers == 0
-        || sites > MAX_ENGRAM_SITES
-    {
+    if field(blob, MODEL_WIDTH)? == 0 || layers == 0 || sites > MAX_ENGRAM_SITES {
         return None;
     }
     let per_layer = LAYER_TENSORS
@@ -165,6 +170,66 @@ pub fn kind(blob: &[u8]) -> Option<Kind> {
         }
         _ => None,
     }
+}
+
+/// The languages of the published Whistle weights, for an archive whose
+/// tokenizer lists none.
+pub const DEFAULT_SPEECH_LANGUAGES: [&str; 7] = ["en", "de", "fr", "es", "it", "nl", "pl"];
+
+/// A speech tokenizer is a 24-byte header whose first `u32` is the piece
+/// count, then per piece five bytes of score and flags, a `u16` length and
+/// the UTF-8 text.
+const TOKENIZER_HEADER_SIZE: usize = 24;
+const TOKENIZER_PIECE_SIZE: usize = 7;
+
+/// The language codes speech weights accept, read as upstream does: the
+/// trailing run of `<|code|>` pieces in the tokenizer, the archive's first
+/// raw tensor without dimensions. `None` for other kinds of weights, whose
+/// tokenizers list other languages, and for speech weights without that
+/// layout.
+#[must_use]
+pub fn speech_languages(blob: &[u8]) -> Option<Vec<String>> {
+    if kind(blob)? != Kind::Speech {
+        return None;
+    }
+    let (directory, count) = tensor_directory(blob)?;
+    let len = u64::try_from(blob.len()).ok()?;
+    let end = directory + count * u64::try_from(RECORD_SIZE).ok()?;
+    let directory = usize::try_from(directory).ok()?;
+    let record = (0..usize::try_from(count).ok()?)
+        .map(|i| directory + i * RECORD_SIZE)
+        .find(|&record| blob.get(record..record + 2) == Some(&[DTYPE_RAW, 0]))?;
+    let (offset, size) = (u64_at(blob, record + 20)?, u64_at(blob, record + 28)?);
+    if offset < end || offset > len || size > len - offset {
+        return None;
+    }
+    tokenizer_languages(
+        blob.get(usize::try_from(offset).ok()?..usize::try_from(offset + size).ok()?)?,
+    )
+}
+
+fn tokenizer_languages(data: &[u8]) -> Option<Vec<String>> {
+    let pieces = usize::try_from(u32_at(data, 0)?).ok()?;
+    let mut rest = data.get(TOKENIZER_HEADER_SIZE..)?;
+    if pieces > rest.len() / TOKENIZER_PIECE_SIZE {
+        return None;
+    }
+    let mut languages = Vec::new();
+    for _ in 0..pieces {
+        let (entry, tail) = rest.split_at_checked(TOKENIZER_PIECE_SIZE)?;
+        let length = usize::from(u16::from_le_bytes(entry.get(5..)?.try_into().ok()?));
+        let (piece, tail) = tail.split_at_checked(length)?;
+        rest = tail;
+        let code = std::str::from_utf8(piece)
+            .ok()
+            .and_then(|piece| piece.strip_prefix("<|")?.strip_suffix("|>"))
+            .filter(|code| !code.is_empty());
+        match code {
+            Some(code) => languages.push(code.to_owned()),
+            None => languages.clear(),
+        }
+    }
+    (!languages.is_empty()).then_some(languages)
 }
 
 #[cfg(test)]
@@ -236,5 +301,82 @@ pub(crate) mod tests {
         assert!(!valid_heads(&codes(&[0x3c00, 0x3c00])));
         assert!(!valid_heads(&codes(&[0x1234])));
         assert!(!valid_heads(&[0x00]));
+    }
+
+    fn tokenizer(pieces: &[&str]) -> Vec<u8> {
+        let mut data = vec![0u8; TOKENIZER_HEADER_SIZE];
+        data[..4].copy_from_slice(&u32::try_from(pieces.len()).unwrap().to_le_bytes());
+        for piece in pieces {
+            let mut entry = [0u8; TOKENIZER_PIECE_SIZE];
+            entry[5..].copy_from_slice(&u16::try_from(piece.len()).unwrap().to_le_bytes());
+            data.extend_from_slice(&entry);
+            data.extend_from_slice(piece.as_bytes());
+        }
+        data
+    }
+
+    /// A speech archive: an audio manifest with the layout version and
+    /// sample rate, then a placeholder tensor.
+    fn speech_archive() -> Vec<u8> {
+        let mut blob = archive(13, 3246.0);
+        let manifest = blob.len() - 13 * 4;
+        blob[manifest + 4..manifest + 8].copy_from_slice(&1.0f32.to_le_bytes());
+        blob[manifest + 36..manifest + 40].copy_from_slice(&16_000.0f32.to_le_bytes());
+        blob
+    }
+
+    /// `blob` with a tokenizer of `pieces` as the tensor after its manifest.
+    fn with_tokenizer(mut blob: Vec<u8>, pieces: &[&str]) -> Vec<u8> {
+        let index = usize::try_from(FIXED_TENSORS + LAYER_TENSORS).unwrap() + 1;
+        let record = HEADER_SIZE + index * RECORD_SIZE;
+        let tokenizer = tokenizer(pieces);
+        let offset = u64::try_from(blob.len()).unwrap();
+        blob[record] = DTYPE_RAW;
+        blob[record + 20..record + 28].copy_from_slice(&offset.to_le_bytes());
+        blob[record + 28..record + 36]
+            .copy_from_slice(&u64::try_from(tokenizer.len()).unwrap().to_le_bytes());
+        blob.extend_from_slice(&tokenizer);
+        blob
+    }
+
+    fn speech_with_tokenizer(pieces: &[&str]) -> Vec<u8> {
+        with_tokenizer(speech_archive(), pieces)
+    }
+
+    #[test]
+    fn reads_speech_languages_from_the_tokenizer() {
+        let cases: [(&[&str], Option<&[&str]>); 6] = [
+            (
+                &["<|im_start|>", "<|im_end|>", "a", "b", "<|en|>", "<|de|>"],
+                Some(&["en", "de"]),
+            ),
+            (&["<|pt|>", "word", "<|en|>"], Some(&["en"])),
+            (&["<|en|>", "word"], None),
+            (&["<|en|>", "<||>"], None),
+            (&[], None),
+            (&["x", "<|pt-BR|>", "<|en|>"], Some(&["pt-BR", "en"])),
+        ];
+        for (pieces, want) in cases {
+            let want = want.map(|codes| codes.iter().map(ToString::to_string).collect());
+            let blob = speech_with_tokenizer(pieces);
+            assert_eq!(kind(&blob), Some(Kind::Speech), "{pieces:?}");
+            assert_eq!(speech_languages(&blob), want, "{pieces:?}");
+        }
+        assert_eq!(speech_languages(&speech_archive()), None, "no tokenizer");
+        let vision = with_tokenizer(archive(36, 4721.0), &["<|en|>"]);
+        assert_eq!(kind(&vision), Some(Kind::Vision));
+        assert_eq!(speech_languages(&vision), None, "vision weights");
+    }
+
+    #[test]
+    fn truncated_tokenizers_have_no_languages() {
+        let blob = speech_with_tokenizer(&["<|en|>"]);
+        assert!(speech_languages(&blob).is_some());
+        for size in 0..blob.len() {
+            assert_eq!(speech_languages(&blob[..size]), None, "{size} bytes");
+        }
+        let mut huge = tokenizer(&["<|en|>"]);
+        huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(tokenizer_languages(&huge), None);
     }
 }
