@@ -29,6 +29,13 @@ are being established before promotion to
       text cues, in rolling windows or with the engine's streaming
       transcriber.
 
+  - [`diarization`](analytics/diarization/): Speaker diarization for
+    transcription cues.
+    - `diarizer`: Label timed text cues with who spoke them, using a speaker
+      embedding model on ONNX Runtime: speaker metadata, speaker-change
+      events, bus messages, names set while playing, and an optional text
+      prefix.
+
   - [`nalsense`](analytics/nalsense/): Portable H.264 and H.265 encoded-video
     activity analysis and bounded IDR replay.
     - `nalsenseactivity`: Detect inexpensive compressed-stream activity hints

@@ -3,7 +3,7 @@
 //! - [`json`]: `JsonMtd`, a schema-tagged JSON document type shared by every
 //!   plugin in the process.
 //! - [`schema`]: generic `x-*` documents (polygons, relation predicates,
-//!   captions, text, provenance) and their relation conventions.
+//!   captions, text, provenance, speakers) and their relation conventions.
 //! - [`record`]: a JSON record of a whole relation meta.
 //! - [`segmentation`]: binary GRAY8 segmentation masks.
 //! - [`unpool`]: stop buffer pools from keeping a cleared relation meta.

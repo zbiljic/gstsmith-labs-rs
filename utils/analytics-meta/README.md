@@ -41,6 +41,7 @@ works with any producer that writes them.
 | `x-caption` | the frame | `{"text": "..."}` |
 | `x-text` | an `ODMtd` labelled `text-line`, `CONTAIN` and `IS_PART_OF` | `{"string": "...", "score": 0.7}` |
 | `x-provenance` | the frame | `{"pts": ..., "running-time": ..., "producer": "..."}` |
+| `x-speaker` | the buffer, normally a text cue | `{"id": "...", "n": 2, "name": "...", "label": "...", "confidence": 0.7, "new": false, "known": false, "model": "..."}`; an analyzed cue with an unknown speaker has `id`, `n`, `name` and `label` `null` |
 
 No document stores Mtd ids: upstream's transforms renumber ids but copy
 relation edges, so predicates live in their own nodes. Upstream's

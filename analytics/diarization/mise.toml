@@ -4,13 +4,23 @@ depends = []
 dir = "{{config_root}}/../.."
 run = "cargo build --locked -p gst-plugin-diarization"
 
+[tasks.inspect]
+description = "Build and inspect diarizer"
+depends = ["build"]
+dir = "{{config_root}}/../.."
+run = '''
+export GST_PLUGIN_PATH="$PWD/target/debug${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+gst-inspect-1.0 diarizer
+'''
+
 [tasks.smoke]
-description = "Run the opt-in tests with the real speaker model"
-depends = ["//:diarization:models"]
+description = "Run the opt-in tests with the real speaker model and labelled conversations"
+depends = ["//:diarization:models", "//:diarization:samples"]
 dir = "{{config_root}}/../.."
 run = '''
 export DIARIZATION_WESPEAKER_MODEL="$(realpath "${DIARIZATION_WESPEAKER_MODEL:-target/models/wespeaker-resnet34.onnx}")"
-cargo test --release --locked -p gst-plugin-diarization --test models -- --ignored --nocapture --test-threads=1
+export DIARIZATION_SAMPLES="$(realpath "${DIARIZATION_SAMPLES:-target/models/diarization-samples}")"
+cargo test --release --locked -p gst-plugin-diarization --test models --test diarizer -- --ignored --nocapture --test-threads=1
 '''
 
 [tasks.references]

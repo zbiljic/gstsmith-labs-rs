@@ -30,6 +30,7 @@ pc_dir="$libdir/pkgconfig"
 # Cargo package | cargo-c library/.pc stem | GStreamer plugin | element names
 packages=(
   "gst-plugin-cactus|gstcactus|cactus|cactusmirage cactuswhistle"
+  "gst-plugin-diarization|gstdiarization|diarization|diarizer"
   "gst-plugin-nalsense|gstnalsense|nalsense|nalsenseactivity nalsensereplay"
   "gst-plugin-relationmeta|gstrelationmeta|relationmeta|relationmetaevents relationmetaoverlay relationmetatap"
   "gst-plugin-usls|gstusls|usls|uslsobjectdetect uslssegment"
@@ -226,7 +227,7 @@ for mapping in "${packages[@]}"; do
     "  GST_PLUGIN_STATIC_REGISTER($plugin);" \
     "!registry_has_plugin(registry, \"$plugin\")"
   static_extra_flags=()
-  if [[ "$plugin" == "usls" && "$(uname -s)" == "Darwin" ]]; then
+  if [[ ("$plugin" == "usls" || "$plugin" == "diarization") && "$(uname -s)" == "Darwin" ]]; then
     # ort-sys emits clang_rt.osx; cargo-c preserves the library name, but its
     # private pkg-config flags cannot infer the consumer's compiler resource dir.
     runtime_dir="$(cc --print-runtime-dir)"

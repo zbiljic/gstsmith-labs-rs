@@ -9,6 +9,7 @@
 //! | `x-caption` | the frame | a scene description |
 //! | `x-text` | an `ODMtd`, `CONTAIN`/`IS_PART_OF` | recognized text |
 //! | `x-provenance` | the frame | which frame a result describes |
+//! | `x-speaker` | the buffer, normally a text cue | who spoke it |
 //!
 //! No schema stores Mtd ids: a transform into a fresh buffer renumbers them,
 //! while relations are copied through the adjacency matrix. Frame documents
@@ -31,6 +32,7 @@ pub const RELATION: &str = "x-relation";
 pub const CAPTION: &str = "x-caption";
 pub const TEXT: &str = "x-text";
 pub const PROVENANCE: &str = "x-provenance";
+pub const SPEAKER: &str = "x-speaker";
 
 type MetaMut<'a, 'b> = &'a mut gst::MetaRefMut<'b, AnalyticsRelationMeta, gst::meta::Standalone>;
 
@@ -76,6 +78,31 @@ pub struct Provenance {
     )]
     pub running_time: Option<u64>,
     pub producer: String,
+}
+
+/// Who spoke a buffer, normally a text cue. A cue that was analyzed but
+/// whose speaker is unknown has `id`, `n`, `name` and `label` unset, so a
+/// consumer can tell it from a cue nobody analyzed. Unset fields are written
+/// as `null`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Speaker {
+    /// Stable for the session, or across sessions when `known`.
+    pub id: Option<String>,
+    /// The speaker's number, counted from 1 in order of appearance.
+    pub n: Option<u32>,
+    pub name: Option<String>,
+    /// The name, or `S{n}` when there is none.
+    pub label: Option<String>,
+    /// How close the cue was to the speaker, or for an unknown speaker to
+    /// the closest one. The scale depends on `model`.
+    pub confidence: Option<f32>,
+    /// This cue introduced the speaker.
+    pub new: bool,
+    /// The speaker was recognized from a stored profile.
+    pub known: bool,
+    /// What produced the document, such as a speaker model profile.
+    pub model: String,
 }
 
 /// A relation found through an `x-relation` node.
@@ -221,6 +248,11 @@ pub fn add_provenance(
     json::add_value(meta, PROVENANCE, provenance)
 }
 
+/// Attaches a frame `x-speaker`.
+pub fn add_speaker(meta: MetaMut<'_, '_>, speaker: &Speaker) -> Result<u32, glib::BoolError> {
+    json::add_value(meta, SPEAKER, speaker)
+}
+
 fn parse<T: for<'de> Deserialize<'de>>(json: &str) -> Option<T> {
     serde_json::from_str(json).ok()
 }
@@ -263,6 +295,15 @@ pub fn caption<'a>(meta: &'a gst::MetaRef<'a, AnalyticsRelationMeta>) -> Option<
 #[must_use]
 pub fn provenance<'a>(meta: &'a gst::MetaRef<'a, AnalyticsRelationMeta>) -> Option<Provenance> {
     json::documents_with_schema(meta, PROVENANCE).find_map(|doc| parse(doc.json))
+}
+
+/// The last frame `x-speaker`: the one the element furthest downstream
+/// attached, when a cue was labelled more than once.
+#[must_use]
+pub fn speaker<'a>(meta: &'a gst::MetaRef<'a, AnalyticsRelationMeta>) -> Option<Speaker> {
+    json::documents_with_schema(meta, SPEAKER)
+        .filter_map(|doc| parse(doc.json))
+        .last()
 }
 
 /// Every relation with a predicate. A node without exactly one subject and
@@ -416,6 +457,66 @@ mod tests {
             json::get(&meta, doc).map(|d| d.json),
             Some(r#"{"rings":[[0.0,0.1,1.0,0.1,0.5,0.5]]}"#)
         );
+    }
+}
+
+#[cfg(test)]
+mod speaker_tests {
+    use super::*;
+
+    #[test]
+    fn speakers_round_trip_with_nulls_for_unknown() {
+        gst::init().expect("GStreamer initializes");
+        let known = Speaker {
+            id: Some("k3f9q2".to_owned()),
+            n: Some(2),
+            name: Some("Lousma".to_owned()),
+            label: Some("Lousma".to_owned()),
+            confidence: Some(0.75),
+            new: false,
+            known: true,
+            model: "wespeaker-resnet34".to_owned(),
+        };
+        let unknown = Speaker {
+            model: "wespeaker-resnet34".to_owned(),
+            ..Speaker::default()
+        };
+        for (written, json) in [
+            (
+                &known,
+                r#"{"id":"k3f9q2","n":2,"name":"Lousma","label":"Lousma","confidence":0.75,"new":false,"known":true,"model":"wespeaker-resnet34"}"#,
+            ),
+            (
+                &unknown,
+                r#"{"id":null,"n":null,"name":null,"label":null,"confidence":null,"new":false,"known":false,"model":"wespeaker-resnet34"}"#,
+            ),
+        ] {
+            let mut buffer = gst::Buffer::new();
+            {
+                let mut meta = crate::relation_meta_mut(buffer.make_mut()).expect("meta");
+                add_speaker(&mut meta, written).expect("speaker");
+            }
+            let meta = buffer.meta::<AnalyticsRelationMeta>().expect("meta");
+            assert_eq!(speaker(&meta).as_ref(), Some(written));
+            assert_eq!(
+                json::documents_with_schema(&meta, SPEAKER)
+                    .map(|doc| doc.json)
+                    .next(),
+                Some(json)
+            );
+        }
+        // A cue labelled twice reads as the later label.
+        let mut buffer = gst::Buffer::new();
+        {
+            let mut meta = crate::relation_meta_mut(buffer.make_mut()).expect("meta");
+            add_speaker(&mut meta, &unknown).expect("speaker");
+            add_speaker(&mut meta, &known).expect("speaker");
+        }
+        let meta = buffer.meta::<AnalyticsRelationMeta>().expect("meta");
+        assert_eq!(speaker(&meta).as_ref(), Some(&known));
+        let sparse: Speaker = serde_json::from_str(r#"{"n":1}"#).expect("parse");
+        assert_eq!(sparse.n, Some(1));
+        assert!(sparse.id.is_none() && !sparse.known);
     }
 }
 

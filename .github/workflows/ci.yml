@@ -107,6 +107,8 @@ jobs:
           gst-inspect-1.0 cactus
           gst-inspect-1.0 cactusmirage
           gst-inspect-1.0 cactuswhistle
+          gst-inspect-1.0 diarization
+          gst-inspect-1.0 diarizer
           gst-inspect-1.0 nalsense
           gst-inspect-1.0 nalsenseactivity
           gst-inspect-1.0 nalsensereplay

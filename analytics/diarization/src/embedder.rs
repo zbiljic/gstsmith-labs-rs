@@ -149,6 +149,25 @@ fn probe(len: usize) -> Vec<f32> {
         .collect()
 }
 
+/// A model that turns one segment of audio into one speaker embedding.
+pub trait SegmentEmbedder: Send {
+    /// The profile the model runs with.
+    fn profile(&self) -> &Profile;
+    /// The L2-normalized embedding of one segment of mono PCM at the
+    /// profile's sample rate.
+    fn embed(&mut self, pcm: &[f32]) -> Result<Vec<f32>, Error>;
+}
+
+impl SegmentEmbedder for Embedder {
+    fn profile(&self) -> &Profile {
+        Self::profile(self)
+    }
+
+    fn embed(&mut self, pcm: &[f32]) -> Result<Vec<f32>, Error> {
+        Self::embed(self, pcm)
+    }
+}
+
 /// A loaded speaker model.
 pub struct Embedder {
     session: Session,

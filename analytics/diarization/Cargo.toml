@@ -21,10 +21,12 @@ versioning = false
 import_library = false
 
 [package.metadata.capi.pkg_config]
-requires_private = "gstreamer-1.0 >= 1.24, gobject-2.0, glib-2.0, gmodule-2.0"
+requires_private = "gstreamer-1.0 >= 1.28, gstreamer-analytics-1.0 >= 1.28, gobject-2.0, glib-2.0, gmodule-2.0"
 
 [dependencies]
-gst = { workspace = true }
+analytics-meta = { path = "../../utils/analytics-meta" }
+gst = { workspace = true, features = ["v1_28"] }
+gst-analytics = { workspace = true }
 ort = { workspace = true, features = ["download-binaries", "tls-rustls", "copy-dylibs"] }
 sha2 = { workspace = true }
 
@@ -34,13 +36,18 @@ static = []
 capi = []
 doc = []
 
+[dev-dependencies]
+anyhow = { workspace = true }
+gst-app = { workspace = true }
+gst-check = { workspace = true }
+
 [lib]
 name = "gstdiarization"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
-[build-dependencies]
-gst-plugin-version-helper = { workspace = true }
-
 [lints]
 workspace = true
+
+[build-dependencies]
+gst-plugin-version-helper = { workspace = true }

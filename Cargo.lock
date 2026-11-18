@@ -1323,8 +1323,13 @@ dependencies = [
 name = "gst-plugin-diarization"
 version = "0.1.0"
 dependencies = [
+ "analytics-meta",
+ "anyhow",
  "gst-plugin-version-helper",
  "gstreamer",
+ "gstreamer-analytics",
+ "gstreamer-app",
+ "gstreamer-check",
  "ort",
  "sha2",
 ]

@@ -1,21 +1,21 @@
 //! Speaker diarization for transcription cues.
 //!
-//! This first part holds the speaker models: a Kaldi-compatible filterbank
-//! front-end, the qualified model profiles and an ONNX Runtime embedder.
-//! The `diarizer` element that assigns speakers to cues builds on them.
+//! - `diarizer`: the element that labels timed text cues with speakers.
+//! - [`speakers`]: online clustering of cue embeddings, numbers, merges and
+//!   labels.
+//! - [`embedder`], [`fbank`], [`profile`]: the speaker models, a
+//!   Kaldi-compatible filterbank front-end and the qualified model profiles.
 
 use gst::glib;
 
+mod diarizer;
 pub mod embedder;
 pub mod fbank;
 pub mod profile;
+pub mod speakers;
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the signature plugin_define! expects"
-)]
-fn plugin_init(_plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
-    Ok(())
+fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
+    diarizer::register(plugin)
 }
 
 gst::plugin_define!(

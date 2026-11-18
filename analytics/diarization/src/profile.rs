@@ -80,10 +80,12 @@ pub fn wespeaker_resnet34() -> Profile {
         // NaN below ten frames; half a second keeps clear of that.
         min_samples: 8_000,
         max_samples: 160_000,
-        // Measured on clean read speech; recalibrated on real audio before
-        // they are relied on.
+        // Matching was measured on cue clustering: 0.35 merged two speakers
+        // of a two-person recording whose different-speaker cosines reach
+        // 0.49, while 0.40 kept read-speech conversations as they were.
+        // Recalibrated on more real audio before they are relied on.
         thresholds: Thresholds {
-            matching: 0.35,
+            matching: 0.4,
             bind: 0.6,
             update: 0.6,
         },
