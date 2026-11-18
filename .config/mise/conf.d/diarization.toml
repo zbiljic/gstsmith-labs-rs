@@ -1,0 +1,21 @@
+[tasks."diarization:models"]
+description = "Download the pinned speaker model to target/models"
+run = '''
+set -eu
+digest() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+fetch() {
+  dest="$1" url="$2" expected="$3"
+  if [ -f "$dest" ] && [ "$(digest "$dest")" = "$expected" ]; then echo "$dest"; return; fi
+  mkdir -p "$(dirname "$dest")"
+  partial="$dest.partial.$$"
+  curl --fail --location --silent --show-error --retry 3 --output "$partial" "$url" || { rm -f "$partial"; exit 1; }
+  actual="$(digest "$partial")"
+  if [ "$actual" != "$expected" ]; then rm -f "$partial"; echo "$url has SHA-256 $actual, expected $expected" >&2; exit 1; fi
+  mv "$partial" "$dest"
+  echo "$dest"
+}
+# WeSpeaker ResNet34-LM (CC-BY-4.0, WeSpeaker).
+fetch "${DIARIZATION_WESPEAKER_MODEL:-target/models/wespeaker-resnet34.onnx}" \
+  https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/f0c48c298fd835726c27956a5d617bad7115627e/voxceleb_resnet34_LM.onnx \
+  7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068
+'''

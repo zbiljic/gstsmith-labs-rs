@@ -1,0 +1,25 @@
+[tasks.build]
+description = "Build the diarization plugin"
+depends = []
+dir = "{{config_root}}/../.."
+run = "cargo build --locked -p gst-plugin-diarization"
+
+[tasks.smoke]
+description = "Run the opt-in tests with the real speaker model"
+depends = ["//:diarization:models"]
+dir = "{{config_root}}/../.."
+run = '''
+export DIARIZATION_WESPEAKER_MODEL="$(realpath "${DIARIZATION_WESPEAKER_MODEL:-target/models/wespeaker-resnet34.onnx}")"
+cargo test --release --locked -p gst-plugin-diarization --test models -- --ignored --nocapture --test-threads=1
+'''
+
+[tasks.references]
+description = "Print the test reference values from kaldi-native-fbank and ONNX Runtime"
+depends = ["//:diarization:models"]
+dir = "{{config_root}}/../.."
+run = '''
+uv run --no-project --python 3.12 \
+  --with kaldi-native-fbank==1.23.1 --with onnxruntime==1.28.0 --with numpy==2.4.6 \
+  python analytics/diarization/scripts/reference.py \
+  "${DIARIZATION_WESPEAKER_MODEL:-target/models/wespeaker-resnet34.onnx}"
+'''

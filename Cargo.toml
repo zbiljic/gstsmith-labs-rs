@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "analytics/cactus",
+    "analytics/diarization",
     "analytics/nalsense",
     "analytics/relationmeta",
     "analytics/usls",

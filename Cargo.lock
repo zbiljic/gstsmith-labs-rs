@@ -1320,6 +1320,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gst-plugin-diarization"
+version = "0.1.0"
+dependencies = [
+ "gst-plugin-version-helper",
+ "gstreamer",
+ "ort",
+ "sha2",
+]
+
+[[package]]
 name = "gst-plugin-jsontap"
 version = "0.1.0"
 dependencies = [
