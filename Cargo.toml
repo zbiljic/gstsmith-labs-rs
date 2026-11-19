@@ -50,6 +50,7 @@ pangocairo = "0.22.9"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 sha2 = "0.11.1"
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 usls = { git = "https://github.com/jamjamjon/usls", rev = "c15ad77c1879dbf1117376d34d3022a325cd9cdc", default-features = false, features = ["vision", "ort-download-binaries", "ort-api-28"] }
 

@@ -480,14 +480,14 @@ fn latency_and_rules_follow_the_properties() -> Result<()> {
 }
 
 #[test]
-fn every_model_profile_value_is_a_builtin_profile() -> Result<()> {
+fn every_named_model_profile_value_is_a_builtin_profile() -> Result<()> {
     gst::init()?;
     let class = glib::EnumClass::with_type(ModelProfile::static_type()).context("enum")?;
     let nicks: Vec<_> = class
         .values()
         .iter()
         .map(|value| value.nick().to_owned())
-        .filter(|nick| nick != "auto")
+        .filter(|nick| !profile::RESERVED.contains(&nick.as_str()))
         .collect();
     let builtin: Vec<_> = profile::builtin().into_iter().map(|p| p.name).collect();
     ensure!(nicks == builtin, "{nicks:?} against {builtin:?}");

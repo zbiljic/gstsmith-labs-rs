@@ -28,7 +28,9 @@ analytics-meta = { path = "../../utils/analytics-meta" }
 gst = { workspace = true, features = ["v1_28"] }
 gst-analytics = { workspace = true }
 ort = { workspace = true, features = ["download-binaries", "tls-rustls", "copy-dylibs"] }
+serde = { workspace = true }
 sha2 = { workspace = true }
+toml = { workspace = true }
 
 [features]
 default = []

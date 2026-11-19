@@ -124,7 +124,8 @@ playing:
 | Property | Default | Notes |
 | --- | --- | --- |
 | `model-file` | none | The speaker model ONNX file. Required |
-| `model-profile` | `auto` | `auto` recognizes a qualified model file by its SHA-256 and refuses any other |
+| `model-profile` | `auto` | `auto` recognizes a qualified model file by its SHA-256 and refuses any other; `custom` reads `model-config` |
+| `model-config` | none | A TOML file with the profile for `model-profile=custom`; see [Other models](#other-models). Empty is unset |
 | `threads` | 0 | ONNX Runtime threads; 0 lets ONNX Runtime choose, which takes every core it finds |
 | `match-threshold` | 0 | 0 uses the profile's (0.4 for `wespeaker-resnet34`) |
 | `min-new-duration` | 1000 | Milliseconds |
@@ -134,7 +135,7 @@ playing:
 | `label-format` | `"{label}: "` | Placeholders `{label}` (the name, or `S{n}`), `{name}`, `{n}`, `{id}`, `{confidence}`. Can be set while playing |
 | `label-mode` | `on-change` | `always` or `on-change`. Can be set while playing |
 | `unknown-label` | `""` | The prefix of a cue with an unknown speaker. Can be set while playing |
-| `audio-buffer-duration` | 60000 | Milliseconds; up to an hour, for a transcriber that only produces cues at the end. Audio takes about 230 MB per hour |
+| `audio-buffer-duration` | 60000 | Milliseconds; up to an hour, for a transcriber that only produces cues at the end. Audio takes about 230 MB per hour at 16 kHz |
 
 ### Measured
 
@@ -159,6 +160,57 @@ SHA-256, or a profile can be named.
 | Profile | Model | License | Embedding |
 | --- | --- | --- | --- |
 | `wespeaker-resnet34` | [WeSpeaker ResNet34-LM](https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM), trained on VoxCeleb | CC-BY-4.0 | 256 values |
+
+### Other models
+
+A model that takes Kaldi filterbank features and returns one embedding runs
+with `model-profile=custom` and a `model-config` file. The filterbank is
+the one described below, with a Povey window and no dither; the config sets
+its sizes, frequencies and scaling, not its window. This one runs the model
+above the way the built-in profile does:
+
+```toml
+name = "wespeaker-copy"
+input = "feats"
+output = "embs"
+min-duration = 500
+max-duration = 10000
+match-threshold = 0.4
+sha256 = ["7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068"]
+
+[front-end]
+kind = "kaldi-fbank"
+sample-rate = 16000
+frame-length = 25
+frame-shift = 10
+mel-bins = 80
+low-freq = 20
+high-freq = 0
+preemphasis = 0.97
+input-scale = 32768
+mean-normalize = true
+```
+
+- `name` goes into the `x-speaker` document's `model`. It is up to 64
+  lowercase letters, digits, `.`, `_` and `-`, starting with a letter or
+  digit, and not `auto`, `custom` or a built-in profile's name.
+- `input` and `output` name the model's tensors. The input is
+  `(1, frames, mel-bins)`; the output is one vector, `(1, D)` or `(D)`.
+- `min-duration` and `max-duration` are in milliseconds. Shorter cues get an
+  unknown speaker, and longer ones are embedded in parts. `max-duration`
+  must be at least four times `min-duration`.
+- `match-threshold` is the cosine at which a cue belongs to a speaker.
+  Measure it on the model's own scores: each model spreads them
+  differently.
+- `sha256` is optional. When given, a model file that is not listed is
+  used with a warning.
+- In `[front-end]`, `kind` is `kaldi-fbank`, the only one so far, and the
+  other keys may be left out. Without them the values are those shown,
+  except `mean-normalize`, which subtracts each bin's mean over the segment
+  and is off by default. `frame-length` and `frame-shift` are milliseconds,
+  `low-freq` and `high-freq` Hz, and `input-scale` multiplies the samples
+  first. A `high-freq` of zero or less counts down from the Nyquist
+  frequency. The audio pad takes `sample-rate`, up to 384 kHz.
 
 No model is stored in this repository. `mise run diarization:models` downloads
 the pinned file to `target/models/` and checks its SHA-256.

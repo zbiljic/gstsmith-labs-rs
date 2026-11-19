@@ -4,7 +4,8 @@
 //! - [`speakers`]: online clustering of cue embeddings, numbers, merges and
 //!   labels.
 //! - [`embedder`], [`fbank`], [`profile`]: the speaker models, a
-//!   Kaldi-compatible filterbank front-end and the qualified model profiles.
+//!   Kaldi-compatible filterbank front-end, the qualified model profiles and
+//!   `custom` ones read from TOML.
 
 use gst::glib;
 

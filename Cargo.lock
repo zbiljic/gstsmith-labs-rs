@@ -1331,7 +1331,9 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-check",
  "ort",
+ "serde",
  "sha2",
+ "toml",
 ]
 
 [[package]]

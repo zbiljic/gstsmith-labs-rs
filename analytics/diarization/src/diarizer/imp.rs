@@ -11,6 +11,7 @@ use gst::subclass::prelude::*;
 
 use super::ring::Ring;
 use crate::embedder::{Embedder, SegmentEmbedder};
+use crate::profile;
 use crate::speakers::{self, Fields, Names, Outcome, Registry, Rules};
 
 #[cfg(test)]
@@ -58,12 +59,15 @@ pub enum ModelProfile {
         nick = "wespeaker-resnet34"
     )]
     WespeakerResnet34,
+    #[enum_value(name = "Read from model-config", nick = "custom")]
+    Custom,
 }
 
 impl ModelProfile {
+    /// The built-in profile's name.
     fn name(self) -> Option<&'static str> {
         match self {
-            Self::Auto => None,
+            Self::Auto | Self::Custom => None,
             Self::WespeakerResnet34 => Some("wespeaker-resnet34"),
         }
     }
@@ -87,6 +91,7 @@ pub enum LabelMode {
 struct Settings {
     model_file: Option<String>,
     model_profile: ModelProfile,
+    model_config: Option<String>,
     threads: u32,
     match_threshold: f64,
     min_new_duration: u32,
@@ -104,6 +109,7 @@ impl Default for Settings {
         Self {
             model_file: None,
             model_profile: ModelProfile::Auto,
+            model_config: None,
             threads: 0,
             match_threshold: 0.0,
             min_new_duration: 1000,
@@ -352,7 +358,12 @@ impl ObjectImpl for Diarizer {
                     .build(),
                 glib::ParamSpecEnum::builder_with_default("model-profile", defaults.model_profile)
                     .nick("Model profile")
-                    .blurb("How to run model-file; auto recognizes a qualified model file by its SHA-256 and refuses any other")
+                    .blurb("How to run model-file; auto recognizes a qualified model file by its SHA-256 and refuses any other; custom reads model-config")
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecString::builder("model-config")
+                    .nick("Model config")
+                    .blurb("Path of a TOML file with the profile for model-profile=custom")
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecUInt::builder("threads")
@@ -478,6 +489,7 @@ impl ObjectImpl for Diarizer {
             "model-profile" => {
                 settings.model_profile = value.get().unwrap_or(settings.model_profile);
             }
+            "model-config" => settings.model_config = text().filter(|path| !path.is_empty()),
             "threads" => settings.threads = number(settings.threads),
             "match-threshold" => {
                 settings.match_threshold = value.get().unwrap_or(settings.match_threshold);
@@ -506,6 +518,7 @@ impl ObjectImpl for Diarizer {
         match pspec.name() {
             "model-file" => settings.model_file.to_value(),
             "model-profile" => settings.model_profile.to_value(),
+            "model-config" => settings.model_config.to_value(),
             "threads" => settings.threads.to_value(),
             "match-threshold" => settings.match_threshold.to_value(),
             "min-new-duration" => settings.min_new_duration.to_value(),
@@ -604,14 +617,38 @@ impl Diarizer {
             gst::error_msg!(gst::ResourceError::NotFound, ["model-file is required"])
         })?;
         let threads = usize::try_from(settings.threads).unwrap_or(0);
-        let embedder = Embedder::load(Path::new(&path), settings.model_profile.name(), threads)
-            .map_err(|err| match err {
-                crate::embedder::Error::Io { .. } => {
-                    gst::error_msg!(gst::ResourceError::OpenRead, ["{err}"])
-                }
-                _ => gst::error_msg!(gst::LibraryError::Init, ["{path}: {err}"]),
-            })?;
-        if !embedder.is_qualified() {
+        let loaded = match (settings.model_profile, settings.model_config.as_deref()) {
+            (ModelProfile::Custom, Some(config)) => {
+                let text = std::fs::read_to_string(config).map_err(|err| {
+                    gst::error_msg!(gst::ResourceError::OpenRead, ["reading {config}: {err}"])
+                })?;
+                let profile = profile::from_toml(&text).map_err(|err| {
+                    gst::error_msg!(gst::ResourceError::Settings, ["{config}: {err}"])
+                })?;
+                Embedder::new(Path::new(&path), profile, threads)
+            }
+            (ModelProfile::Custom, None) => {
+                return Err(gst::error_msg!(
+                    gst::ResourceError::Settings,
+                    ["model-profile=custom needs model-config"]
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(gst::error_msg!(
+                    gst::ResourceError::Settings,
+                    ["model-config is only read with model-profile=custom"]
+                ));
+            }
+            (profile, None) => Embedder::load(Path::new(&path), profile.name(), threads),
+        };
+        let embedder = loaded.map_err(|err| match err {
+            crate::embedder::Error::Io { .. } => {
+                gst::error_msg!(gst::ResourceError::OpenRead, ["{err}"])
+            }
+            _ => gst::error_msg!(gst::LibraryError::Init, ["{path}: {err}"]),
+        })?;
+        // A custom profile without checksums names no model file to check.
+        if !embedder.profile().checksums.is_empty() && !embedder.is_qualified() {
             gst::warning!(
                 CAT,
                 imp = self,

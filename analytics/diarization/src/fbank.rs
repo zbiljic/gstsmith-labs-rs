@@ -113,6 +113,15 @@ impl Fbank {
                 config.preemphasis, config.input_scale
             ));
         }
+        // An FFT bin lies in at most two filters, so more filters than bins
+        // leave one empty; refusing them first keeps a huge count from
+        // being built.
+        if config.mel_bins > padded {
+            return Err(format!(
+                "{} mel bins are more than the frame's {padded} FFT bins; use fewer bins or longer frames",
+                config.mel_bins
+            ));
+        }
         let filters = mel_filters(config.mel_bins, padded, rate, low, high);
         if let Some(empty) = filters.iter().position(|filter| filter.weights.is_empty()) {
             return Err(format!(
@@ -517,6 +526,7 @@ mod tests {
             |c| c.input_scale = f32::INFINITY,
             // 128 bins at 16 kHz with 25 ms frames leave a filter empty.
             |c| c.mel_bins = 128,
+            |c| c.mel_bins = usize::MAX,
         ] {
             config(change).expect_err("unusable");
         }

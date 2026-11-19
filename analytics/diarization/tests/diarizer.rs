@@ -56,9 +56,74 @@ fn registers_with_documented_defaults() -> Result<()> {
         .map(|template| template.name_template().to_string())
         .collect();
     ensure!(names == ["audio_sink", "text_sink", "src"], "{names:?}");
+    ensure!(element.property::<Option<String>>("model-config").is_none());
     // No model: the element refuses to start.
     ensure!(element.set_state(gst::State::Paused).is_err());
     element.set_state(gst::State::Null)?;
+    Ok(())
+}
+
+/// The detail of the error `diarizer` posts when it fails to start with
+/// `properties`.
+fn start_error(properties: &[(&str, &str)]) -> Result<String> {
+    init()?;
+    let pipeline = gst::Pipeline::new();
+    let element = gst::ElementFactory::make("diarizer")
+        .property("model-file", "no-such-model.onnx")
+        .build()?;
+    for (name, value) in properties {
+        element.set_property_from_str(name, value);
+    }
+    pipeline.add(&element)?;
+    ensure!(pipeline.set_state(gst::State::Paused).is_err(), "started");
+    // Read before stopping: going to NULL flushes the bus.
+    let bus = pipeline.bus().context("bus")?;
+    let message = bus.pop_filtered(&[gst::MessageType::Error]);
+    pipeline.set_state(gst::State::Null)?;
+    let message = message.context("no error message")?;
+    let gst::MessageView::Error(error) = message.view() else {
+        anyhow::bail!("not an error");
+    };
+    Ok(error
+        .debug()
+        .map(|debug| debug.to_string())
+        .unwrap_or_default())
+}
+
+#[test]
+fn model_config_is_only_read_by_the_custom_profile() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("diarizer-config-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let broken = dir.join("broken.toml");
+    std::fs::write(&broken, "name = \"x\"\n")?;
+    let broken = broken.to_string_lossy().into_owned();
+    let missing = dir.join("missing.toml").to_string_lossy().into_owned();
+    let results = [
+        start_error(&[("model-profile", "custom")]),
+        start_error(&[("model-profile", "custom"), ("model-config", "")]),
+        start_error(&[("model-config", &broken)]),
+        start_error(&[("model-profile", "custom"), ("model-config", &broken)]),
+        start_error(&[("model-profile", "custom"), ("model-config", &missing)]),
+    ];
+    std::fs::remove_dir_all(&dir)?;
+    let [no_config, empty_config, not_custom, unusable, unreadable] = results;
+    for no_config in [no_config?, empty_config?] {
+        ensure!(no_config.contains("needs model-config"), "{no_config}");
+    }
+    let not_custom = not_custom?;
+    ensure!(not_custom.contains("only read with"), "{not_custom}");
+    let unusable = unusable?;
+    ensure!(
+        unusable.contains("broken.toml")
+            && unusable.contains("missing field `input`")
+            && !unusable.contains("line 1"),
+        "{unusable}"
+    );
+    let unreadable = unreadable?;
+    ensure!(
+        unreadable.contains("reading") && unreadable.contains("missing.toml"),
+        "{unreadable}"
+    );
     Ok(())
 }
 
@@ -269,7 +334,11 @@ fn clock(seconds: f64) -> gst::ClockTime {
 }
 
 /// Runs the conversation through `diarizer` and returns each cue's speaker.
-fn diarize(conversation: &Conversation, model: &Path) -> Result<Vec<schema::Speaker>> {
+fn diarize(
+    conversation: &Conversation,
+    model: &Path,
+    properties: &[(&str, &str)],
+) -> Result<Vec<schema::Speaker>> {
     init()?;
     let pipeline = gst::Pipeline::new();
     let audio = gst_app::AppSrc::builder()
@@ -296,6 +365,9 @@ fn diarize(conversation: &Conversation, model: &Path) -> Result<Vec<schema::Spea
         .property("threads", 4_u32)
         .property("audio-buffer-duration", 3_600_000_u32)
         .build()?;
+    for (name, value) in properties {
+        diarizer.set_property_from_str(name, value);
+    }
     let sink = gst_app::AppSink::builder().sync(false).build();
     pipeline.add_many([
         audio.upcast_ref(),
@@ -376,7 +448,7 @@ fn score(cues: &[Turn], found: &[schema::Speaker]) -> (f64, usize, usize) {
 
 fn check(conversation: &Conversation, min_accuracy: f64, extra_speakers: usize) -> Result<()> {
     let model = path("DIARIZATION_WESPEAKER_MODEL")?;
-    let found = diarize(conversation, &model)?;
+    let found = diarize(conversation, &model, &[])?;
     let (accuracy, speakers, truth) = score(&conversation.cues, &found);
     let unknown = found.iter().filter(|s| s.n.is_none()).count();
     for (cue, speaker) in conversation.cues.iter().zip(&found) {
@@ -426,6 +498,44 @@ fn speakers_of_several_recordings() -> Result<()> {
         conversation("dev00.wav", "debug.development.rttm", "dev00")?,
     ];
     check(&mixed(&parts), 0.9, 1)
+}
+
+/// The example `custom` profile in the README: the built-in
+/// `wespeaker-resnet34` profile written out.
+fn readme_config() -> Result<String> {
+    let readme = include_str!("../README.md");
+    let (_, rest) = readme.split_once("```toml\n").context("a toml block")?;
+    let (config, _) = rest.split_once("```").context("its end")?;
+    Ok(config.to_owned())
+}
+
+#[test]
+#[ignore = "needs the speaker model and samples: mise run //analytics/diarization:smoke"]
+fn a_custom_profile_runs_the_model_like_the_builtin_one() -> Result<()> {
+    init()?;
+    let model = path("DIARIZATION_WESPEAKER_MODEL")?;
+    let config = std::env::temp_dir().join(format!("diarizer-custom-{}.toml", std::process::id()));
+    std::fs::write(&config, readme_config()?)?;
+    let conversation = conversation("sample.wav", "sample.rttm", "sample")?;
+    let builtin = diarize(&conversation, &model, &[]);
+    let custom = diarize(
+        &conversation,
+        &model,
+        &[
+            ("model-profile", "custom"),
+            ("model-config", &config.to_string_lossy()),
+        ],
+    );
+    std::fs::remove_file(&config)?;
+    let (builtin, custom) = (builtin?, custom?);
+    for (one, other) in builtin.iter().zip(&custom) {
+        ensure!(one.model == "wespeaker-resnet34" && other.model == "wespeaker-copy");
+        ensure!(
+            one.n == other.n && one.confidence == other.confidence,
+            "{one:?} against {other:?}"
+        );
+    }
+    Ok(())
 }
 
 #[test]
