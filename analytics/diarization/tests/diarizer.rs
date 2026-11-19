@@ -38,7 +38,7 @@ fn registers_with_documented_defaults() -> Result<()> {
     ensure!(nick("label-mode")? == "on-change");
     ensure!(element.property::<u32>("threads") == 0);
     ensure!(element.property::<f64>("match-threshold").abs() < f64::EPSILON);
-    ensure!(element.property::<u32>("min-new-duration") == 1000);
+    ensure!(element.property::<u32>("min-new-duration") == 1500);
     ensure!(element.property::<u32>("min-update-duration") == 1000);
     ensure!(element.property::<u32>("max-speakers") == 0);
     ensure!(element.property::<u32>("audio-buffer-duration") == 60_000);

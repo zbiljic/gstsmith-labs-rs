@@ -222,6 +222,7 @@ fn names_label_modes_and_merges() -> Result<()> {
         ("label-mode", LabelMode::Always.to_value()),
         ("label-format", "[{label}] ".to_value()),
         ("unknown-label", "? ".to_value()),
+        ("min-new-duration", 1000_u32.to_value()),
     ])?;
     conversation(&mut f.audio)?;
     let (one, first) = cue(&mut f.text, 200, 1500, "one")?;
@@ -270,7 +271,10 @@ fn names_label_modes_and_merges() -> Result<()> {
 
 #[test]
 fn lost_audio_and_ended_audio_give_unknown_speakers() -> Result<()> {
-    let mut f = diarizer(&[("audio-buffer-duration", 1000_u32.to_value())])?;
+    let mut f = diarizer(&[
+        ("audio-buffer-duration", 1000_u32.to_value()),
+        ("min-new-duration", 1000_u32.to_value()),
+    ])?;
     push_audio(&mut f.audio, 0, 10_000, A)?;
     let (text, document) = cue(&mut f.text, 200, 2800, "early")?;
     ensure!(text == "early" && document.n.is_none(), "{document:?}");

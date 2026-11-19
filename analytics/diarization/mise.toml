@@ -33,3 +33,21 @@ uv run --no-project --python 3.12 \
   python analytics/diarization/scripts/reference.py \
   "${DIARIZATION_WESPEAKER_MODEL:-target/models/wespeaker-resnet34.onnx}"
 '''
+
+[tasks.evaluate]
+description = "Label 44 broadcast recordings through cactuswhistle ! diarizer and score them (about 40 minutes)"
+depends = ["//:cactus:weights", "//:diarization:models", "//:diarization:voxconverse"]
+dir = "{{config_root}}/../.."
+raw_args = true
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+cargo build --release --locked -p gst-plugin-cactus -p gst-plugin-diarization
+export GST_PLUGIN_PATH="$PWD/target/release${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+uv run --no-project --python 3.12 --with numpy==2.4.6 --with scipy==1.18.1 \
+  python analytics/diarization/scripts/voxconverse.py evaluate \
+  "${DIARIZATION_VOXCONVERSE:-.cache/diarization/voxconverse}" \
+  "$(realpath "${CACTUS_WHISTLE_WEIGHTS:-target/models/whistle.cact}")" \
+  "$(realpath "${DIARIZATION_WESPEAKER_MODEL:-target/models/wespeaker-resnet34.onnx}")" \
+  "$@"
+'''

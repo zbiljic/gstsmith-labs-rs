@@ -128,7 +128,7 @@ playing:
 | `model-config` | none | A TOML file with the profile for `model-profile=custom`; see [Other models](#other-models). Empty is unset |
 | `threads` | 0 | ONNX Runtime threads; 0 lets ONNX Runtime choose, which takes every core it finds |
 | `match-threshold` | 0 | 0 uses the profile's (0.4 for `wespeaker-resnet34`) |
-| `min-new-duration` | 1000 | Milliseconds |
+| `min-new-duration` | 1500 | Milliseconds |
 | `min-update-duration` | 1000 | Milliseconds |
 | `max-speakers` | 0 | 0 is unlimited |
 | `speaker-names` | empty | Can be set while playing |
@@ -147,6 +147,8 @@ On short labelled conversations, cut into cues of one speaker each
 | Two-person recording (30 s) | 2 | 91% | 2 |
 | AMI meeting excerpts (2 × 30 s) | 2 each | 100% and 97% | 2 each |
 | Turns of both, interleaved | 4 | 96% | 4 |
+
+Results on transcribed broadcast audio are [below](#on-broadcast-audio).
 
 ## Speaker models
 
@@ -237,6 +239,32 @@ audio. On clips of read speech, same-speaker pairs reach a median cosine of
 the two-person recording reach 0.49, which is why the profile matches no
 lower than 0.4.
 
+### On broadcast audio
+
+`mise run //analytics/diarization:evaluate` runs 44 recordings of the
+VoxConverse dev set through `cactuswhistle language=en ! diarizer` with the
+default settings, and scores each cue against the human-labelled turns; a
+cue belongs to whoever talks most during it. VoxConverse, by the Visual
+Geometry Group at the University of Oxford, is news, debates and panel
+shows from online video, offered for research under CC-BY-4.0; the audio's
+copyright stays with the videos' owners.
+
+| Recordings | Cues correct | Unknown | Speakers found |
+| --- | --- | --- | --- |
+| 44, which chose the defaults | 94.6% | 2.9% | 221 for 209 |
+
+The totals hide errors both ways: on these recordings, 19 found
+speakers were a second speaker for a voice already found (`merge-speakers`
+folds one back), and 7 people never got one of their own. About 4% of cue
+speech belongs to someone other than the cue's speaker, where a turn
+changes within a cue or two people talk at once; labelling whole cues
+cannot get that right.
+
+Raising `min-new-duration` trades more unknown cues for fewer extra
+speakers, but in conversations of short turns a second voice can be
+absorbed by the first. When the number of speakers is known,
+`max-speakers` caps it.
+
 ## Tests
 
 `cargo test -p gst-plugin-diarization` runs the unit tests: the filterbank
@@ -248,3 +276,11 @@ the embeddings against the reference pipeline, and runs the conversations
 through `diarizer`. `mise run //analytics/diarization:references` prints the
 reference values again, from pinned versions of `kaldi-native-fbank` and
 ONNX Runtime; it needs `uv`.
+
+`mise run //analytics/diarization:evaluate` scores real broadcast audio, as
+[above](#on-broadcast-audio). It downloads the speaker model, the Cactus
+weights and a 485 MB VoxConverse shard from a pinned Hugging Face mirror,
+builds both plugins, and takes about 40 minutes on a laptop CPU; it needs
+`uv`. Arguments after `--` choose recordings (`--only ID,ID`), parallel
+runs (`--jobs N`, default 3), and `diarizer` properties
+(`min-new-duration=2000`).

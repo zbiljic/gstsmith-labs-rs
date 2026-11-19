@@ -112,7 +112,7 @@ impl Default for Settings {
             model_config: None,
             threads: 0,
             match_threshold: 0.0,
-            min_new_duration: 1000,
+            min_new_duration: 1500,
             min_update_duration: 1000,
             max_speakers: 0,
             names: Names::new(),

@@ -51,3 +51,35 @@ fetch "$dir/dev01.wav" "$base/tests/data/dev01.wav" \
 fetch "$dir/debug.development.rttm" "$base/tests/data/debug.development.rttm" \
   9667a672072f7d0ad5b647cfaed987d8c52209a4e1ddc252fed06d0b955e7aeb
 '''
+
+[tasks."diarization:voxconverse"]
+description = "Download a pinned VoxConverse shard (44 labelled broadcast recordings, 485 MB) and extract it to .cache/diarization"
+run = '''
+set -eu
+digest() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+dir="${DIARIZATION_VOXCONVERSE:-.cache/diarization/voxconverse}"
+# VoxConverse dev set (Visual Geometry Group, University of Oxford): offered
+# for research under CC-BY-4.0, with the audio's copyright kept by the
+# videos' owners. Parquet from the diarizers-community mirror, the first of
+# five dev shards; the official download needs a login.
+url=https://huggingface.co/datasets/diarizers-community/voxconverse/resolve/3acfa1b45ca4b7419aee999d67d94c617f9c9d47/data/dev-00000-of-00005.parquet
+expected=f36c54412f0ac9cfe7ec2682e27f70f3e3df63d8e2b8f288d4f62341a595917d
+shard="$dir/dev-00000-of-00005.parquet"
+if [ -f "$dir/.extracted" ]; then
+  if [ "$(cat "$dir/.extracted")" = "$expected" ]; then echo "$dir"; exit 0; fi
+  echo "$dir holds the recordings of another shard; empty it or set DIARIZATION_VOXCONVERSE to another directory" >&2
+  exit 1
+fi
+if [ ! -f "$shard" ] || [ "$(digest "$shard")" != "$expected" ]; then
+  mkdir -p "$dir"
+  partial="$shard.partial.$$"
+  curl --fail --location --silent --show-error --retry 3 --output "$partial" "$url" || { rm -f "$partial"; exit 1; }
+  actual="$(digest "$partial")"
+  if [ "$actual" != "$expected" ]; then rm -f "$partial"; echo "$url has SHA-256 $actual, expected $expected" >&2; exit 1; fi
+  mv "$partial" "$shard"
+fi
+uv run --no-project --python 3.12 --with pyarrow==22.0.0 \
+  python analytics/diarization/scripts/voxconverse.py extract "$shard" "$dir"
+echo "$expected" >"$dir/.extracted"
+rm "$shard"
+'''
