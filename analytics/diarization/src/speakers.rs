@@ -12,6 +12,10 @@ use crate::embedder::cosine;
 pub struct Rules {
     /// A cue at least this close to a speaker is that speaker.
     pub matching: f32,
+    /// A cue too short to start a speaker goes to the closest one if it is
+    /// at least this close, without refining it. At `matching` or above,
+    /// short cues match like any other.
+    pub short_matching: f32,
     /// A cue that matches no speaker starts one if it is at least this long.
     pub min_new_ms: u64,
     /// A matched cue refines its speaker if it is at least this long.
@@ -45,7 +49,8 @@ pub enum Outcome {
         confidence: Option<f32>,
         new: bool,
     },
-    /// No speaker: the cue matched none and was too short to start one.
+    /// No speaker: the cue matched none, not even as a short cue, and was
+    /// too short to start one.
     /// `confidence` is the closest speaker's cosine, if there is one.
     Unknown { confidence: Option<f32> },
 }
@@ -197,7 +202,8 @@ impl Registry {
         if let Some((index, score)) = best {
             let full = self.rules.max_speakers > 0
                 && self.speakers.len() >= usize::try_from(self.rules.max_speakers).unwrap_or(0);
-            if score >= self.rules.matching || full {
+            let short = duration_ms < self.rules.min_new_ms && score >= self.rules.short_matching;
+            if score >= self.rules.matching || full || short {
                 let refine =
                     score >= self.rules.matching && duration_ms >= self.rules.min_update_ms;
                 let Some(speaker) = self.speakers.get_mut(index) else {
@@ -352,6 +358,7 @@ mod tests {
 
     const RULES: Rules = Rules {
         matching: 0.5,
+        short_matching: 0.2,
         min_new_ms: 1000,
         min_update_ms: 1000,
         max_speakers: 0,
@@ -427,6 +434,75 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|id| id.len() == 8), "{ids:?}");
         assert_ne!(ids.first(), ids.get(1));
+    }
+
+    #[test]
+    fn short_cues_join_a_closer_speaker_without_refining_it() {
+        let mut registry = Registry::new(RULES);
+        registry.assign(&voice(0, 0.0), 2000);
+        // Cosine 0.3 to S1: below matching, above short_matching.
+        let near = normalized(&[0.3, 0.0, 0.0, 0.954]);
+        let Outcome::Speaker {
+            n: 1,
+            confidence: Some(score),
+            new: false,
+        } = registry.assign(&near, 800)
+        else {
+            panic!("a short cue joins the closest speaker");
+        };
+        assert!((score - 0.3).abs() < 0.01, "{score}");
+        assert_eq!(
+            registry.speaker(1).map(|s| (s.cues, s.ms)),
+            Some((1, 2000)),
+            "without refining it"
+        );
+        assert!(
+            matches!(
+                registry.assign(&normalized(&[0.1, 0.0, 0.0, 0.995]), 800),
+                Outcome::Unknown { .. }
+            ),
+            "below short_matching"
+        );
+        assert!(
+            matches!(
+                registry.assign(&near, 1000),
+                Outcome::Speaker {
+                    n: 2,
+                    new: true,
+                    ..
+                }
+            ),
+            "a cue long enough to start a speaker does"
+        );
+        let mut strict = Registry::new(Rules {
+            short_matching: 0.5,
+            ..RULES
+        });
+        strict.assign(&voice(0, 0.0), 2000);
+        assert!(
+            matches!(strict.assign(&near, 800), Outcome::Unknown { .. }),
+            "short_matching at matching turns it off"
+        );
+        // Long enough to refine, too short to start a speaker: only the
+        // match below `matching` keeps it from refining.
+        let mut defaults = Registry::new(Rules {
+            min_new_ms: 1500,
+            ..RULES
+        });
+        defaults.assign(&voice(0, 0.0), 2000);
+        assert!(matches!(
+            defaults.assign(&near, 1200),
+            Outcome::Speaker {
+                n: 1,
+                new: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            defaults.speaker(1).map(|s| (s.cues, s.ms)),
+            Some((1, 2000)),
+            "a short match never refines"
+        );
     }
 
     #[test]

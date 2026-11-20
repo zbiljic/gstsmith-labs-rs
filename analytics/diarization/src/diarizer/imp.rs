@@ -94,6 +94,7 @@ struct Settings {
     model_config: Option<String>,
     threads: u32,
     match_threshold: f64,
+    short_match_threshold: f64,
     min_new_duration: u32,
     min_update_duration: u32,
     max_speakers: u32,
@@ -112,6 +113,7 @@ impl Default for Settings {
             model_config: None,
             threads: 0,
             match_threshold: 0.0,
+            short_match_threshold: 0.0,
             min_new_duration: 1500,
             min_update_duration: 1000,
             max_speakers: 0,
@@ -337,6 +339,7 @@ impl ObjectSubclass for Diarizer {
 }
 
 impl ObjectImpl for Diarizer {
+    #[expect(clippy::too_many_lines, reason = "one entry per property")]
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
             let milliseconds = |name, nick, blurb, minimum, maximum, default| {
@@ -380,10 +383,18 @@ impl ObjectImpl for Diarizer {
                     .default_value(defaults.match_threshold)
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecDouble::builder("short-match-threshold")
+                    .nick("Short match threshold")
+                    .blurb("Cosine similarity at which a cue too short to start a speaker goes to the closest one, without refining it; 0 uses the model profile's (0.3 for wespeaker-resnet34); at match-threshold or above, short cues match like any other")
+                    .minimum(0.0)
+                    .maximum(1.0)
+                    .default_value(defaults.short_match_threshold)
+                    .mutable_ready()
+                    .build(),
                 milliseconds(
                     "min-new-duration",
                     "Minimum new-speaker duration",
-                    "A cue that matches no speaker starts a new one if its audio is at least this many milliseconds long; a shorter one gets an unknown speaker",
+                    "A cue that matches no speaker starts a new one if its audio is at least this many milliseconds long; a shorter one goes to the closest speaker at short-match-threshold, or gets an unknown speaker",
                     0,
                     60_000,
                     defaults.min_new_duration,
@@ -494,6 +505,10 @@ impl ObjectImpl for Diarizer {
             "match-threshold" => {
                 settings.match_threshold = value.get().unwrap_or(settings.match_threshold);
             }
+            "short-match-threshold" => {
+                settings.short_match_threshold =
+                    value.get().unwrap_or(settings.short_match_threshold);
+            }
             "min-new-duration" => settings.min_new_duration = number(settings.min_new_duration),
             "min-update-duration" => {
                 settings.min_update_duration = number(settings.min_update_duration);
@@ -521,6 +536,7 @@ impl ObjectImpl for Diarizer {
             "model-config" => settings.model_config.to_value(),
             "threads" => settings.threads.to_value(),
             "match-threshold" => settings.match_threshold.to_value(),
+            "short-match-threshold" => settings.short_match_threshold.to_value(),
             "min-new-duration" => settings.min_new_duration.to_value(),
             "min-update-duration" => settings.min_update_duration.to_value(),
             "max-speakers" => settings.max_speakers.to_value(),
@@ -673,13 +689,13 @@ impl Diarizer {
         let embedder = self.load(&settings)?;
         let profile = embedder.profile().clone();
         #[expect(clippy::cast_possible_truncation, reason = "a threshold in 0..1")]
-        let matching = if settings.match_threshold > 0.0 {
-            settings.match_threshold as f32
-        } else {
-            profile.thresholds.matching
-        };
+        let threshold = |set: f64, profile: f32| if set > 0.0 { set as f32 } else { profile };
         let rules = Rules {
-            matching,
+            matching: threshold(settings.match_threshold, profile.thresholds.matching),
+            short_matching: threshold(
+                settings.short_match_threshold,
+                profile.thresholds.short_matching,
+            ),
             min_new_ms: u64::from(settings.min_new_duration),
             min_update_ms: u64::from(settings.min_update_duration),
             max_speakers: settings.max_speakers,

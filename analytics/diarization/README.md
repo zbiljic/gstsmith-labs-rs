@@ -64,9 +64,10 @@ audio branch is not counted, so keep that branch a plain `queue`.
    `match-threshold` or above, the closest speaker is the cue's; a cue at
    least `min-update-duration` long also refines that speaker.
 3. A cue that matches nobody starts a new speaker if it is at least
-   `min-new-duration` long; a shorter one gets an unknown speaker. Once
-   `max-speakers` exist, it goes to the closest speaker instead, without
-   refining it.
+   `min-new-duration` long. A shorter one goes to the closest speaker if
+   it is at least `short-match-threshold` close, without refining it, and
+   gets an unknown speaker otherwise. Once `max-speakers` exist, a cue
+   that matches nobody goes to the closest speaker, without refining it.
 
 Speakers are numbered `S1`, `S2`, … in order of appearance and keep their
 number for the session. Each also gets a random id.
@@ -87,7 +88,10 @@ number for the session. Each also gets a random id.
   scale; it is unset for the cue that started the speaker. A cue whose
   speaker is unknown still gets a document, with `id`, `n`, `name` and
   `label` set to `null`; its `confidence` is the closest speaker's
-  similarity, if there was one to compare with.
+  similarity, if there was one to compare with. A short cue given a
+  speaker by `short-match-threshold` has a `confidence` below
+  `match-threshold`, so a consumer that would rather show no name than a
+  doubtful one can tell it apart.
 - **Speaker-change event.** Before the first cue of a different speaker, a
   serialized custom downstream event `rstranscribe/speaker-change` carries
   `speaker`, the label. gst-plugins-rs' `speechmatics` transcriber sends the
@@ -128,6 +132,7 @@ playing:
 | `model-config` | none | A TOML file with the profile for `model-profile=custom`; see [Other models](#other-models). Empty is unset |
 | `threads` | 0 | ONNX Runtime threads; 0 lets ONNX Runtime choose, which takes every core it finds |
 | `match-threshold` | 0 | 0 uses the profile's (0.4 for `wespeaker-resnet34`) |
+| `short-match-threshold` | 0 | 0 uses the profile's (0.3 for `wespeaker-resnet34`). At `match-threshold` or above, short cues match like any other, so 1 turns it off |
 | `min-new-duration` | 1500 | Milliseconds |
 | `min-update-duration` | 1000 | Milliseconds |
 | `max-speakers` | 0 | 0 is unlimited |
@@ -178,6 +183,7 @@ output = "embs"
 min-duration = 500
 max-duration = 10000
 match-threshold = 0.4
+short-match-threshold = 0.3
 sha256 = ["7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068"]
 
 [front-end]
@@ -201,9 +207,12 @@ mean-normalize = true
 - `min-duration` and `max-duration` are in milliseconds. Shorter cues get an
   unknown speaker, and longer ones are embedded in parts. `max-duration`
   must be at least four times `min-duration`.
-- `match-threshold` is the cosine at which a cue belongs to a speaker.
-  Measure it on the model's own scores: each model spreads them
-  differently.
+- `match-threshold` is the cosine at which a cue belongs to a speaker, and
+  `short-match-threshold` the one at which a cue too short to start a
+  speaker does. Measure them on the model's own scores: each model spreads
+  them differently. `short-match-threshold` is optional, from 0 up to
+  `match-threshold`; left out, it is `match-threshold`, which turns the
+  short-cue rule off.
 - `sha256` is optional. When given, a model file that is not listed is
   used with a warning.
 - In `[front-end]`, `kind` is `kaldi-fbank`, the only one so far, and the
@@ -251,18 +260,20 @@ copyright stays with the videos' owners.
 
 | Recordings | Cues correct | Unknown | Speakers found |
 | --- | --- | --- | --- |
-| 44, which chose the defaults | 94.6% | 2.9% | 221 for 209 |
+| 44, which chose the defaults | 95.2% | 2.3% | 221 for 209 |
+| 172 more from the other dev shards, held out | 94.3% | 2.4% | 758 for 718 |
 
-The totals hide errors both ways: on these recordings, 19 found
+The totals hide errors both ways: on the held-out recordings, 87 found
 speakers were a second speaker for a voice already found (`merge-speakers`
-folds one back), and 7 people never got one of their own. About 4% of cue
+folds one back), and 47 people never got one of their own. About 4% of cue
 speech belongs to someone other than the cue's speaker, where a turn
 changes within a cue or two people talk at once; labelling whole cues
 cannot get that right.
 
 Raising `min-new-duration` trades more unknown cues for fewer extra
 speakers, but in conversations of short turns a second voice can be
-absorbed by the first. When the number of speakers is known,
+absorbed by the first. Lowering `short-match-threshold` names more short
+cues, more of them wrongly. When the number of speakers is known,
 `max-speakers` caps it.
 
 ## Tests
@@ -279,7 +290,8 @@ ONNX Runtime; it needs `uv`.
 
 `mise run //analytics/diarization:evaluate` scores real broadcast audio, as
 [above](#on-broadcast-audio). It downloads the speaker model, the Cactus
-weights and a 485 MB VoxConverse shard from a pinned Hugging Face mirror,
+weights and a 485 MB VoxConverse shard from a pinned Hugging Face mirror
+(extracted to `.cache/diarization/voxconverse`, or `DIARIZATION_VOXCONVERSE`),
 builds both plugins, and takes about 40 minutes on a laptop CPU; it needs
 `uv`. Arguments after `--` choose recordings (`--only ID,ID`), parallel
 runs (`--jobs N`, default 3), and `diarizer` properties

@@ -464,15 +464,19 @@ fn latency_and_rules_follow_the_properties() -> Result<()> {
         lock(&f.element.imp().state)
             .registry
             .as_ref()
-            .map(|registry| registry.rules().matching)
+            .map(|registry| (registry.rules().matching, registry.rules().short_matching))
     };
-    ensure!(matching(&f) == Some(0.4));
+    ensure!(matching(&f) == Some((0.4, 0.3)));
 
     let mut f = diarizer(&[
         ("match-threshold", 0.7_f64.to_value()),
+        ("short-match-threshold", 0.25_f64.to_value()),
         ("max-speakers", 1_u32.to_value()),
     ])?;
-    ensure!(matching(&f).is_some_and(|m| (m - 0.7).abs() < 1e-6));
+    ensure!(
+        matching(&f)
+            .is_some_and(|(m, short)| (m - 0.7).abs() < 1e-6 && (short - 0.25).abs() < 1e-6)
+    );
     conversation(&mut f.audio)?;
     ensure!(cue(&mut f.text, 200, 2800, "one")?.0 == "S1: one");
     let (two, document) = cue(&mut f.text, 3200, 5800, "two")?;

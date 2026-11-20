@@ -34,6 +34,9 @@ pub enum FrontEnd {
 pub struct Thresholds {
     /// A cue at least this close to a speaker is that speaker.
     pub matching: f32,
+    /// A cue too short to start a speaker, at least this close to one, is
+    /// that speaker.
+    pub short_matching: f32,
     /// A session speaker at least this close to a stored profile is that
     /// profile's speaker.
     pub bind: f32,
@@ -89,9 +92,13 @@ pub fn wespeaker_resnet34() -> Profile {
         // Matching was measured on cue clustering: 0.35 merged two speakers
         // of a two-person recording whose different-speaker cosines reach
         // 0.49, while 0.40 kept read-speech conversations as they were.
-        // Recalibrated on more real audio before they are relied on.
+        // Broadcast audio (stage 3) kept 0.40. Short
+        // matching was measured on broadcast audio: at 0.3, 85% of the
+        // short cues it names get the right speaker; at 0.2 it names twice
+        // as many, but only 62% right.
         thresholds: Thresholds {
             matching: 0.4,
+            short_matching: 0.3,
             bind: 0.6,
             update: 0.6,
         },
@@ -140,6 +147,7 @@ struct Config {
     min_duration: u32,
     max_duration: u32,
     match_threshold: f32,
+    short_match_threshold: Option<f32>,
     #[serde(default)]
     sha256: Vec<String>,
     front_end: FrontEndConfig,
@@ -198,6 +206,7 @@ impl FrontEndConfig {
 /// min-duration = 500
 /// max-duration = 10000
 /// match-threshold = 0.4
+/// short-match-threshold = 0.3
 ///
 /// [front-end]
 /// kind = "kaldi-fbank"
@@ -251,6 +260,14 @@ pub fn from_toml(text: &str) -> Result<Profile, String> {
             config.match_threshold
         ));
     }
+    let short_matching = config
+        .short_match_threshold
+        .unwrap_or(config.match_threshold);
+    if !(0.0..=config.match_threshold).contains(&short_matching) {
+        return Err(format!(
+            "short-match-threshold {short_matching} is not in [0, match-threshold]"
+        ));
+    }
     let mut checksums = Vec::with_capacity(config.sha256.len());
     for checksum in config.sha256 {
         let checksum = checksum.to_ascii_lowercase();
@@ -292,6 +309,7 @@ pub fn from_toml(text: &str) -> Result<Profile, String> {
         max_samples,
         thresholds: Thresholds {
             matching: config.match_threshold,
+            short_matching,
             bind: f32::INFINITY,
             update: f32::INFINITY,
         },
@@ -328,6 +346,7 @@ output = "embs"
 min-duration = 500
 max-duration = 10000
 match-threshold = 0.4
+short-match-threshold = 0.3
 sha256 = ["7BB2F06E9DF17CDF1EF14EE8A15AB08ED28E8D0EF5054EE135741560DF2EC068"]
 
 [front-end]
@@ -358,6 +377,10 @@ mean-normalize = true
             (builtin.min_samples, builtin.max_samples)
         );
         assert!((custom.thresholds.matching - builtin.thresholds.matching).abs() < f32::EPSILON);
+        assert!(
+            (custom.thresholds.short_matching - builtin.thresholds.short_matching).abs()
+                < f32::EPSILON
+        );
         assert!(custom.thresholds.bind.is_infinite() && custom.thresholds.update.is_infinite());
         assert_eq!(custom.checksums, builtin.checksums);
     }
@@ -382,6 +405,10 @@ front-end = { kind = "kaldi-fbank" }
         assert!(!mean_normalize);
         assert_eq!((profile.min_samples, profile.max_samples), (4_800, 96_000));
         assert_eq!(profile.checksums, Vec::<String>::new());
+        assert!(
+            (profile.thresholds.short_matching - 0.5).abs() < f32::EPSILON,
+            "short cues match like any other"
+        );
     }
 
     #[test]
@@ -436,6 +463,10 @@ front-end.mean-normalize = true
         assert_eq!(custom.name, "wespeaker-copy");
         let builtin = wespeaker_resnet34();
         assert!((custom.thresholds.matching - builtin.thresholds.matching).abs() < f32::EPSILON);
+        assert!(
+            (custom.thresholds.short_matching - builtin.thresholds.short_matching).abs()
+                < f32::EPSILON
+        );
         // The rest is the built-in profile's, field for field.
         custom.name.clone_from(&builtin.name);
         custom.thresholds = builtin.thresholds;
@@ -463,8 +494,10 @@ front-end.mean-normalize = true
             ("input = \"feats\"\n", "", "input"),
             ("mel-bins", "mel-bands", "mel-bands"),
             ("kaldi-fbank", "nemo-mel", "nemo-mel"),
-            ("= 0.4", "= 0", "match-threshold"),
-            ("= 0.4", "= 1.5", "match-threshold"),
+            ("= 0.4", "= 0", "match-threshold 0 is"),
+            ("= 0.4", "= 1.5", "match-threshold 1.5 is"),
+            ("= 0.3", "= 0.5", "short-match-threshold"),
+            ("= 0.3", "= -0.1", "short-match-threshold"),
             ("7BB2F06E", "7BB2F06", "sha256"),
             (
                 "min-duration = 500",
