@@ -6,7 +6,7 @@ config_roots = ["analytics/*", "tools/*"]
 [tools]
 "cargo:cargo-c" = "0.10.26"
 "cargo:cargo-deny" = "0.22.0"
-"cargo:cargo-sort" = "2.1.4"
+"cargo:cargo-sort" = "2.1.5"
 rust = { version = "1.100.0", profile = "minimal", components = [
   "rustfmt",
   "clippy",
