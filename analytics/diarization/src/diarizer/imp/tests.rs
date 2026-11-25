@@ -554,3 +554,68 @@ fn a_shown_unknown_label_is_followed_by_a_label() -> Result<()> {
     );
     Ok(())
 }
+
+/// Fails as a model would on segments shorter than `below`.
+struct Picky {
+    fake: Fake,
+    below: usize,
+}
+
+impl SegmentEmbedder for Picky {
+    fn profile(&self) -> &Profile {
+        self.fake.profile()
+    }
+
+    fn embed(&mut self, pcm: &[f32]) -> Result<Vec<f32>, Error> {
+        if pcm.len() < self.below {
+            return Err(Error::Model("cannot run on this length".to_owned()));
+        }
+        self.fake.embed(pcm)
+    }
+}
+
+#[test]
+fn halves_report_a_failing_model_but_not_a_short_half() -> Result<()> {
+    let two = |samples: usize| {
+        let mut pcm = vec![A; samples / 2];
+        pcm.resize(samples, B);
+        pcm
+    };
+    let mut picky = Picky {
+        fake: Fake {
+            profile: profile::wespeaker_resnet34(),
+        },
+        below: 20_000,
+    };
+    let pcm = two(24_000);
+    ensure!(matches!(
+        halves_agree(&mut picky, &pcm, 0.2),
+        Err(Error::Model(_))
+    ));
+    ensure!(matches!(halves_agree(&mut picky, &pcm, -1.0), Ok(true)));
+    picky.below = 0;
+    ensure!(matches!(halves_agree(&mut picky, &pcm, 0.2), Ok(false)));
+    // Halves under the profile's minimum cannot tell two voices apart.
+    ensure!(matches!(
+        halves_agree(&mut picky, &two(15_000), 0.2),
+        Ok(true)
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_cue_of_two_voices_starts_no_speaker() -> Result<()> {
+    // The profile's 0.2, then the check turned off.
+    for (threshold, bar, both, one) in [(0.0, 0.2, None, 1), (-1.0, -1.0, Some(1), 2)] {
+        let mut f = diarizer(&[("halves-threshold", threshold.to_value())])?;
+        ensure!((lock(&f.element.imp().state).halves - bar).abs() < 1e-6);
+        conversation(&mut f.audio)?;
+        // A for its first half, B for its second.
+        let (_, document) = cue(&mut f.text, 1500, 4500, "both")?;
+        ensure!(document.n == both, "{threshold}: {:?}", document.n);
+        // A cue of one voice starts a speaker either way.
+        let (_, document) = cue(&mut f.text, 6200, 8800, "one")?;
+        ensure!(document.n == Some(one) && document.new);
+    }
+    Ok(())
+}

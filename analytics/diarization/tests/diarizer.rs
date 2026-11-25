@@ -39,6 +39,7 @@ fn registers_with_documented_defaults() -> Result<()> {
     ensure!(element.property::<u32>("threads") == 0);
     ensure!(element.property::<f64>("match-threshold").abs() < f64::EPSILON);
     ensure!(element.property::<f64>("short-match-threshold").abs() < f64::EPSILON);
+    ensure!(element.property::<f64>("halves-threshold").abs() < f64::EPSILON);
     ensure!(element.property::<u32>("min-new-duration") == 1500);
     ensure!(element.property::<u32>("min-update-duration") == 1000);
     ensure!(element.property::<u32>("max-speakers") == 0);

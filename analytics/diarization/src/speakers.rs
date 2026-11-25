@@ -192,6 +192,18 @@ impl Registry {
 
     /// Assigns a unit-length cue embedding of `duration_ms` to a speaker.
     pub fn assign(&mut self, embedding: &[f32], duration_ms: u64) -> Outcome {
+        self.assign_checked(embedding, duration_ms, || true)
+    }
+
+    /// Like [`assign`](Self::assign), but a cue that would start a speaker
+    /// does so only if `may_start` agrees, and is unknown otherwise.
+    /// `may_start` runs only then, so it can be costly.
+    pub fn assign_checked(
+        &mut self,
+        embedding: &[f32],
+        duration_ms: u64,
+        may_start: impl FnOnce() -> bool,
+    ) -> Outcome {
         let best = self
             .speakers
             .iter()
@@ -224,7 +236,7 @@ impl Registry {
                 };
             }
         }
-        if duration_ms < self.rules.min_new_ms {
+        if duration_ms < self.rules.min_new_ms || !may_start() {
             return Outcome::Unknown { confidence };
         }
         let n = self.next_n;
@@ -434,6 +446,47 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|id| id.len() == 8), "{ids:?}");
         assert_ne!(ids.first(), ids.get(1));
+    }
+
+    #[test]
+    fn a_vetoed_cue_starts_no_speaker() {
+        let mut registry = Registry::new(RULES);
+        let mut asked = 0;
+        let outcome = registry.assign_checked(&voice(0, 0.0), 2000, || {
+            asked += 1;
+            false
+        });
+        assert!(matches!(outcome, Outcome::Unknown { confidence: None }));
+        assert_eq!((asked, registry.speakers().len()), (1, 0));
+        registry.assign(&voice(0, 0.0), 2000);
+        // A match, or a cue too short to start one, never asks.
+        let outcome = registry.assign_checked(&voice(0, 0.0), 2000, || {
+            asked += 1;
+            true
+        });
+        assert!(matches!(
+            outcome,
+            Outcome::Speaker {
+                n: 1,
+                new: false,
+                ..
+            }
+        ));
+        let outcome = registry.assign_checked(&voice(1, 0.0), 800, || {
+            asked += 1;
+            true
+        });
+        assert!(matches!(outcome, Outcome::Unknown { .. }));
+        assert_eq!(asked, 1);
+        let outcome = registry.assign_checked(&voice(1, 0.0), 2000, || true);
+        assert!(matches!(
+            outcome,
+            Outcome::Speaker {
+                n: 2,
+                new: true,
+                ..
+            }
+        ));
     }
 
     #[test]

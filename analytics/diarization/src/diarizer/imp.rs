@@ -10,7 +10,7 @@ use gst::prelude::*;
 use gst::subclass::prelude::*;
 
 use super::ring::Ring;
-use crate::embedder::{Embedder, SegmentEmbedder};
+use crate::embedder::{Embedder, SegmentEmbedder, cosine};
 use crate::profile;
 use crate::speakers::{self, Fields, Names, Outcome, Registry, Rules};
 
@@ -95,6 +95,7 @@ struct Settings {
     threads: u32,
     match_threshold: f64,
     short_match_threshold: f64,
+    halves_threshold: f64,
     min_new_duration: u32,
     min_update_duration: u32,
     max_speakers: u32,
@@ -114,6 +115,7 @@ impl Default for Settings {
             threads: 0,
             match_threshold: 0.0,
             short_match_threshold: 0.0,
+            halves_threshold: 0.0,
             min_new_duration: 1500,
             min_update_duration: 1000,
             max_speakers: 0,
@@ -192,6 +194,8 @@ struct State {
     embedder: Option<Box<dyn SegmentEmbedder>>,
     model: String,
     registry: Option<Registry>,
+    /// A cue starts a speaker only if its halves are this close.
+    halves: f32,
     segment: Option<gst::FormattedSegment<gst::ClockTime>>,
     caps: bool,
     /// The speaker of the last cue with a known speaker.
@@ -228,6 +232,33 @@ fn audio_caps(rate: Option<u32>) -> gst::Caps {
         None => builder.field("rate", gst::IntRange::new(1, i32::MAX)),
     };
     builder.field("channels", 1_i32).build()
+}
+
+/// Whether the two halves of `pcm` sound like one voice: their embeddings
+/// are at least `bar` close. Halves that cannot be compared, too short or
+/// silent, count as one voice.
+fn halves_agree(
+    embedder: &mut dyn SegmentEmbedder,
+    pcm: &[f32],
+    bar: f32,
+) -> Result<bool, crate::embedder::Error> {
+    if bar <= -1.0 {
+        return Ok(true);
+    }
+    let (first, second) = pcm.split_at(pcm.len() / 2);
+    if rms(first) < SILENCE_RMS || rms(second) < SILENCE_RMS {
+        return Ok(true);
+    }
+    // A half the model cannot embed says nothing; a model that fails does.
+    let mut half = |pcm| match embedder.embed(pcm) {
+        Ok(embedding) => Ok(Some(embedding)),
+        Err(err) if err.is_segment_error() => Ok(None),
+        Err(err) => Err(err),
+    };
+    let (Some(a), Some(b)) = (half(first)?, half(second)?) else {
+        return Ok(true);
+    };
+    Ok(cosine(&a, &b).is_none_or(|score| score >= bar))
 }
 
 fn rms(pcm: &[f32]) -> f32 {
@@ -391,6 +422,14 @@ impl ObjectImpl for Diarizer {
                     .default_value(defaults.short_match_threshold)
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecDouble::builder("halves-threshold")
+                    .nick("Halves threshold")
+                    .blurb("Cosine similarity the two halves of a cue need for the cue to start a speaker, so that a cue of two voices does not; 0 uses the model profile's (0.2 for wespeaker-resnet34), -1 turns the check off")
+                    .minimum(-1.0)
+                    .maximum(1.0)
+                    .default_value(defaults.halves_threshold)
+                    .mutable_ready()
+                    .build(),
                 milliseconds(
                     "min-new-duration",
                     "Minimum new-speaker duration",
@@ -509,6 +548,9 @@ impl ObjectImpl for Diarizer {
                 settings.short_match_threshold =
                     value.get().unwrap_or(settings.short_match_threshold);
             }
+            "halves-threshold" => {
+                settings.halves_threshold = value.get().unwrap_or(settings.halves_threshold);
+            }
             "min-new-duration" => settings.min_new_duration = number(settings.min_new_duration),
             "min-update-duration" => {
                 settings.min_update_duration = number(settings.min_update_duration);
@@ -537,6 +579,7 @@ impl ObjectImpl for Diarizer {
             "threads" => settings.threads.to_value(),
             "match-threshold" => settings.match_threshold.to_value(),
             "short-match-threshold" => settings.short_match_threshold.to_value(),
+            "halves-threshold" => settings.halves_threshold.to_value(),
             "min-new-duration" => settings.min_new_duration.to_value(),
             "min-update-duration" => settings.min_update_duration.to_value(),
             "max-speakers" => settings.max_speakers.to_value(),
@@ -700,11 +743,18 @@ impl Diarizer {
             min_update_ms: u64::from(settings.min_update_duration),
             max_speakers: settings.max_speakers,
         };
+        #[expect(clippy::cast_possible_truncation, reason = "a threshold in -1..1")]
+        let halves = if settings.halves_threshold == 0.0 {
+            profile.thresholds.halves
+        } else {
+            settings.halves_threshold as f32
+        };
         let rate = profile.sample_rate();
         *lock(&self.state) = State {
             embedder: Some(embedder),
             model: profile.name,
             registry: Some(Registry::new(rules)),
+            halves,
             ..State::default()
         };
         *lock(&self.audio) = Audio {
@@ -994,6 +1044,7 @@ impl Diarizer {
         let State {
             embedder,
             registry,
+            halves,
             model,
             previous,
             unknown_shown,
@@ -1014,7 +1065,28 @@ impl Diarizer {
                 Outcome::Unknown { confidence: None }
             }
             Some(pcm) => match embedder.embed(pcm) {
-                Ok(embedding) => registry.assign(&embedding, pcm.len() as u64 * 1000 / rate),
+                Ok(embedding) => {
+                    let mut failed = None;
+                    let outcome =
+                        registry.assign_checked(&embedding, pcm.len() as u64 * 1000 / rate, || {
+                            match halves_agree(&mut **embedder, pcm, *halves) {
+                                Ok(true) => true,
+                                Ok(false) => {
+                                    let why = "two voices in a cue; it starts no speaker";
+                                    gst::debug!(CAT, imp = self, "{why}");
+                                    false
+                                }
+                                Err(err) => {
+                                    failed = Some(err);
+                                    false
+                                }
+                            }
+                        });
+                    if let Some(err) = failed {
+                        return Err(self.error(&format!("speaker model failed: {err}")));
+                    }
+                    outcome
+                }
                 Err(err) if err.is_segment_error() => {
                     gst::debug!(CAT, imp = self, "no speaker for the cue: {err}");
                     Outcome::Unknown { confidence: None }

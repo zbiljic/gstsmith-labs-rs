@@ -64,10 +64,13 @@ audio branch is not counted, so keep that branch a plain `queue`.
    `match-threshold` or above, the closest speaker is the cue's; a cue at
    least `min-update-duration` long also refines that speaker.
 3. A cue that matches nobody starts a new speaker if it is at least
-   `min-new-duration` long. A shorter one goes to the closest speaker if
-   it is at least `short-match-threshold` close, without refining it, and
-   gets an unknown speaker otherwise. Once `max-speakers` exist, a cue
-   that matches nobody goes to the closest speaker, without refining it.
+   `min-new-duration` long, unless its two halves sound like two people:
+   each half is embedded too, and if they are less than
+   `halves-threshold` close, the cue gets an unknown speaker. A shorter one
+   goes to the closest speaker if it is at least `short-match-threshold`
+   close, without refining it, and gets an unknown speaker otherwise. Once
+   `max-speakers` exist, a cue that matches nobody goes to the closest
+   speaker, without refining it.
 
 Speakers are numbered `S1`, `S2`, … in order of appearance and keep their
 number for the session. Each also gets a random id.
@@ -133,6 +136,7 @@ playing:
 | `threads` | 0 | ONNX Runtime threads; 0 lets ONNX Runtime choose, which takes every core it finds |
 | `match-threshold` | 0 | 0 uses the profile's (0.4 for `wespeaker-resnet34`) |
 | `short-match-threshold` | 0 | 0 uses the profile's (0.3 for `wespeaker-resnet34`). At `match-threshold` or above, short cues match like any other, so 1 turns it off |
+| `halves-threshold` | 0 | 0 uses the profile's (0.2 for `wespeaker-resnet34`); -1 turns the check off |
 | `min-new-duration` | 1500 | Milliseconds |
 | `min-update-duration` | 1000 | Milliseconds |
 | `max-speakers` | 0 | 0 is unlimited |
@@ -184,6 +188,7 @@ min-duration = 500
 max-duration = 10000
 match-threshold = 0.4
 short-match-threshold = 0.3
+halves-threshold = 0.2
 sha256 = ["7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068"]
 
 [front-end]
@@ -212,7 +217,9 @@ mean-normalize = true
   speaker does. Measure them on the model's own scores: each model spreads
   them differently. `short-match-threshold` is optional, from 0 up to
   `match-threshold`; left out, it is `match-threshold`, which turns the
-  short-cue rule off.
+  short-cue rule off. `halves-threshold` is the cosine the two halves of
+  a cue need for the cue to start a speaker. It is optional, from -1 to
+  1; left out, it is -1, which turns the check off.
 - `sha256` is optional. When given, a model file that is not listed is
   used with a warning.
 - In `[front-end]`, `kind` is `kaldi-fbank`, the only one so far, and the
@@ -260,21 +267,21 @@ copyright stays with the videos' owners.
 
 | Recordings | Cues correct | Unknown | Speakers found |
 | --- | --- | --- | --- |
-| 44, which chose the defaults | 95.2% | 2.3% | 221 for 209 |
-| 172 more from the other dev shards, held out | 94.3% | 2.4% | 758 for 718 |
+| 44, which chose the defaults | 94.9% | 2.8% | 210 for 210 |
+| 172 more from the other dev shards, held out | 94.2% | 2.9% | 705 for 718 |
 
-The totals hide errors both ways: on the held-out recordings, 87 found
+The totals hide errors both ways: on the held-out recordings, 38 found
 speakers were a second speaker for a voice already found (`merge-speakers`
-folds one back), and 47 people never got one of their own. About 4% of cue
+folds one back), and 51 people never got one of their own. About 4% of cue
 speech belongs to someone other than the cue's speaker, where a turn
 changes within a cue or two people talk at once; labelling whole cues
 cannot get that right.
 
-Raising `min-new-duration` trades more unknown cues for fewer extra
-speakers, but in conversations of short turns a second voice can be
-absorbed by the first. Lowering `short-match-threshold` names more short
-cues, more of them wrongly. When the number of speakers is known,
-`max-speakers` caps it.
+Raising `min-new-duration` or `halves-threshold` trades more unknown cues
+for fewer extra speakers; with a higher `min-new-duration`, in
+conversations of short turns a second voice can be absorbed by the first.
+Lowering `short-match-threshold` names more short cues, more of them
+wrongly. When the number of speakers is known, `max-speakers` caps it.
 
 ## Tests
 

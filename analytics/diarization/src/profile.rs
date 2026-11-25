@@ -37,6 +37,9 @@ pub struct Thresholds {
     /// A cue too short to start a speaker, at least this close to one, is
     /// that speaker.
     pub short_matching: f32,
+    /// A cue that would start a speaker does so only if the embeddings of
+    /// its two halves are at least this close; -1 or less always does.
+    pub halves: f32,
     /// A session speaker at least this close to a stored profile is that
     /// profile's speaker.
     pub bind: f32,
@@ -93,12 +96,15 @@ pub fn wespeaker_resnet34() -> Profile {
         // of a two-person recording whose different-speaker cosines reach
         // 0.49, while 0.40 kept read-speech conversations as they were.
         // Broadcast audio (stage 3) kept 0.40. Short
-        // matching was measured on broadcast audio: at 0.3, 85% of the
-        // short cues it names get the right speaker; at 0.2 it names twice
-        // as many, but only 62% right.
+        // matching was measured on broadcast audio: at 0.3, 79% of the
+        // short cues it names get the right speaker; at 0.2 it names nearly
+        // twice as many, but only 69% right. Halves were measured on broadcast
+        // audio too: at 0.2, held-out recordings got 38 extra speakers
+        // instead of 87, for 0.2 point of cues.
         thresholds: Thresholds {
             matching: 0.4,
             short_matching: 0.3,
+            halves: 0.2,
             bind: 0.6,
             update: 0.6,
         },
@@ -148,6 +154,7 @@ struct Config {
     max_duration: u32,
     match_threshold: f32,
     short_match_threshold: Option<f32>,
+    halves_threshold: Option<f32>,
     #[serde(default)]
     sha256: Vec<String>,
     front_end: FrontEndConfig,
@@ -207,6 +214,7 @@ impl FrontEndConfig {
 /// max-duration = 10000
 /// match-threshold = 0.4
 /// short-match-threshold = 0.3
+/// halves-threshold = 0.2
 ///
 /// [front-end]
 /// kind = "kaldi-fbank"
@@ -254,20 +262,7 @@ pub fn from_toml(text: &str) -> Result<Profile, String> {
             config.name
         ));
     }
-    if !(config.match_threshold > 0.0 && config.match_threshold <= 1.0) {
-        return Err(format!(
-            "match-threshold {} is not in (0, 1]",
-            config.match_threshold
-        ));
-    }
-    let short_matching = config
-        .short_match_threshold
-        .unwrap_or(config.match_threshold);
-    if !(0.0..=config.match_threshold).contains(&short_matching) {
-        return Err(format!(
-            "short-match-threshold {short_matching} is not in [0, match-threshold]"
-        ));
-    }
+    let thresholds = thresholds(&config)?;
     let mut checksums = Vec::with_capacity(config.sha256.len());
     for checksum in config.sha256 {
         let checksum = checksum.to_ascii_lowercase();
@@ -307,13 +302,38 @@ pub fn from_toml(text: &str) -> Result<Profile, String> {
         output: config.output,
         min_samples,
         max_samples,
-        thresholds: Thresholds {
-            matching: config.match_threshold,
-            short_matching,
-            bind: f32::INFINITY,
-            update: f32::INFINITY,
-        },
+        thresholds,
         checksums,
+    })
+}
+
+/// The thresholds of a `custom` profile; the stored-profile ones are
+/// infinite.
+fn thresholds(config: &Config) -> Result<Thresholds, String> {
+    if !(config.match_threshold > 0.0 && config.match_threshold <= 1.0) {
+        return Err(format!(
+            "match-threshold {} is not in (0, 1]",
+            config.match_threshold
+        ));
+    }
+    let short_matching = config
+        .short_match_threshold
+        .unwrap_or(config.match_threshold);
+    if !(0.0..=config.match_threshold).contains(&short_matching) {
+        return Err(format!(
+            "short-match-threshold {short_matching} is not in [0, match-threshold]"
+        ));
+    }
+    let halves = config.halves_threshold.unwrap_or(-1.0);
+    if !(-1.0..=1.0).contains(&halves) {
+        return Err(format!("halves-threshold {halves} is not in [-1, 1]"));
+    }
+    Ok(Thresholds {
+        matching: config.match_threshold,
+        short_matching,
+        halves,
+        bind: f32::INFINITY,
+        update: f32::INFINITY,
     })
 }
 
@@ -347,6 +367,7 @@ min-duration = 500
 max-duration = 10000
 match-threshold = 0.4
 short-match-threshold = 0.3
+halves-threshold = 0.2
 sha256 = ["7BB2F06E9DF17CDF1EF14EE8A15AB08ED28E8D0EF5054EE135741560DF2EC068"]
 
 [front-end]
@@ -381,6 +402,7 @@ mean-normalize = true
             (custom.thresholds.short_matching - builtin.thresholds.short_matching).abs()
                 < f32::EPSILON
         );
+        assert!((custom.thresholds.halves - builtin.thresholds.halves).abs() < f32::EPSILON);
         assert!(custom.thresholds.bind.is_infinite() && custom.thresholds.update.is_infinite());
         assert_eq!(custom.checksums, builtin.checksums);
     }
@@ -408,6 +430,10 @@ front-end = { kind = "kaldi-fbank" }
         assert!(
             (profile.thresholds.short_matching - 0.5).abs() < f32::EPSILON,
             "short cues match like any other"
+        );
+        assert!(
+            (profile.thresholds.halves + 1.0).abs() < f32::EPSILON,
+            "halves are not compared"
         );
     }
 
@@ -467,6 +493,7 @@ front-end.mean-normalize = true
             (custom.thresholds.short_matching - builtin.thresholds.short_matching).abs()
                 < f32::EPSILON
         );
+        assert!((custom.thresholds.halves - builtin.thresholds.halves).abs() < f32::EPSILON);
         // The rest is the built-in profile's, field for field.
         custom.name.clone_from(&builtin.name);
         custom.thresholds = builtin.thresholds;
@@ -498,6 +525,8 @@ front-end.mean-normalize = true
             ("= 0.4", "= 1.5", "match-threshold 1.5 is"),
             ("= 0.3", "= 0.5", "short-match-threshold"),
             ("= 0.3", "= -0.1", "short-match-threshold"),
+            ("= 0.2", "= 1.5", "halves-threshold"),
+            ("= 0.2", "= -2", "halves-threshold"),
             ("7BB2F06E", "7BB2F06", "sha256"),
             (
                 "min-duration = 500",
