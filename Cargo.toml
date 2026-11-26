@@ -28,7 +28,7 @@ rust-version = "1.96.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-anyhow = "1.0.104"
+anyhow = "1.0.105"
 atomic_refcell = "0.1.14"
 cairo-rs = "0.22.11"
 cc = "1.11.3"
